@@ -1,14 +1,14 @@
 use crate::crypto::aesccm::aes128_ccm_encrypt;
-use crate::device::xiaomi::packet::v2::layer2::L2Packet;
-use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
 use crate::device::xiaomi::XiaomiDevice;
+use crate::device::xiaomi::packet::v2::layer2::L2Packet;
+use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};
 use anyhow::anyhow;
 use hmac::{Hmac, Mac};
-use pb::pb::protocol::WearPacket;
+use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
 use sha2::Sha256;
 
@@ -55,10 +55,12 @@ impl L2PbExt for AuthSystem {
         log::info!("on_pb_packet: {}", serde_json::to_string(&payload).unwrap());
         if let Some(pkt) = payload.payload {
             match pkt {
-                pb::pb::protocol::wear_packet::Payload::Account(acc) => {
+                pb::xiaomi::protocol::wear_packet::Payload::Account(acc) => {
                     if let Some(acc_payload) = acc.payload {
                         match acc_payload {
-                            pb::pb::protocol::account::Payload::AuthDeviceVerify(verify_pkt) => {
+                            pb::xiaomi::protocol::account::Payload::AuthDeviceVerify(
+                                verify_pkt,
+                            ) => {
                                 let this: &mut dyn System = self;
 
                                 if let Ok(verify_ret) = build_auth_step_2(this, &verify_pkt) {
@@ -116,23 +118,25 @@ impl AuthComponent {
 
 impl_logic_component!(AuthComponent, meta);
 
-fn build_auth_step_1(nonce: &[u8]) -> pb::pb::protocol::WearPacket {
-    let account_payload = pb::pb::protocol::auth::AppVerify {
+fn build_auth_step_1(nonce: &[u8]) -> pb::xiaomi::protocol::WearPacket {
+    let account_payload = pb::xiaomi::protocol::auth::AppVerify {
         app_random: nonce.to_vec(),
         app_device_id: None,
         check_dynamic_code: None,
     };
 
-    let pkt_payload = pb::pb::protocol::Account {
-        payload: Some(pb::pb::protocol::account::Payload::AuthAppVerify(
+    let pkt_payload = pb::xiaomi::protocol::Account {
+        payload: Some(pb::xiaomi::protocol::account::Payload::AuthAppVerify(
             account_payload,
         )),
     };
 
-    let pkt = pb::pb::protocol::WearPacket {
-        r#type: pb::pb::protocol::wear_packet::Type::Account as i32,
-        id: pb::pb::protocol::account::AccountId::AuthVerify as u32,
-        payload: Some(pb::pb::protocol::wear_packet::Payload::Account(pkt_payload)),
+    let pkt = pb::xiaomi::protocol::WearPacket {
+        r#type: pb::xiaomi::protocol::wear_packet::Type::Account as i32,
+        id: pb::xiaomi::protocol::account::AccountId::AuthVerify as u32,
+        payload: Some(pb::xiaomi::protocol::wear_packet::Payload::Account(
+            pkt_payload,
+        )),
     };
 
     pkt
@@ -140,8 +144,8 @@ fn build_auth_step_1(nonce: &[u8]) -> pb::pb::protocol::WearPacket {
 
 fn build_auth_step_2(
     this: &mut (dyn System + 'static),
-    device_verify: &pb::pb::protocol::auth::DeviceVerify,
-) -> anyhow::Result<pb::pb::protocol::WearPacket> {
+    device_verify: &pb::xiaomi::protocol::auth::DeviceVerify,
+) -> anyhow::Result<pb::xiaomi::protocol::WearPacket> {
     let w_random = device_verify.device_random.clone();
     let w_sign = device_verify.device_sign.clone();
 
@@ -198,12 +202,12 @@ fn build_auth_step_2(
     let encrypted_signs = mac2.finalize().into_bytes().to_vec(); // 32 B
 
     // 设备类型
-    let mut device_type = pb::pb::protocol::companion_device::DeviceType::Android as i32;
+    let mut device_type = pb::xiaomi::protocol::companion_device::DeviceType::Android as i32;
     if cfg!(target_os = "ios") && !force_android {
-        device_type = pb::pb::protocol::companion_device::DeviceType::Ios as i32;
+        device_type = pb::xiaomi::protocol::companion_device::DeviceType::Ios as i32;
     }
 
-    let proto_companion_device = pb::pb::protocol::CompanionDevice {
+    let proto_companion_device = pb::xiaomi::protocol::CompanionDevice {
         device_type,
         system_version: None,
         device_name: "AstroBox".to_string(),
@@ -225,21 +229,23 @@ fn build_auth_step_2(
 
     let encrypted_device_info = aes128_ccm_encrypt(enc_key_arr, nonce_arr, &[], &companion_device);
 
-    let account_payload = pb::pb::protocol::auth::AppConfirm {
+    let account_payload = pb::xiaomi::protocol::auth::AppConfirm {
         app_sign: encrypted_signs,
         encrypt_companion_device: encrypted_device_info,
     };
 
-    let pkt_payload = pb::pb::protocol::Account {
-        payload: Some(pb::pb::protocol::account::Payload::AuthAppConfirm(
+    let pkt_payload = pb::xiaomi::protocol::Account {
+        payload: Some(pb::xiaomi::protocol::account::Payload::AuthAppConfirm(
             account_payload,
         )),
     };
 
-    let pkt = pb::pb::protocol::WearPacket {
-        r#type: pb::pb::protocol::wear_packet::Type::Account as i32,
-        id: pb::pb::protocol::account::AccountId::AuthConfirm as u32,
-        payload: Some(pb::pb::protocol::wear_packet::Payload::Account(pkt_payload)),
+    let pkt = pb::xiaomi::protocol::WearPacket {
+        r#type: pb::xiaomi::protocol::wear_packet::Type::Account as i32,
+        id: pb::xiaomi::protocol::account::AccountId::AuthConfirm as u32,
+        payload: Some(pb::xiaomi::protocol::wear_packet::Payload::Account(
+            pkt_payload,
+        )),
     };
 
     let enc_key_to_set = enc_key;

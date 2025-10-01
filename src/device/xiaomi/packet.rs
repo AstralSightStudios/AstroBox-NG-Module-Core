@@ -1,7 +1,12 @@
 use crate::{
-    device::xiaomi::{components::auth::AuthComponent, packet::v2::layer2::L2Cipher, XiaomiDevice},
+    device::xiaomi::{
+        XiaomiDevice,
+        components::auth::AuthComponent,
+        packet::v2::layer2::{L2Cipher, L2Packet},
+    },
     ecs::entity::{Entity, EntityExt},
 };
+use pb::xiaomi::protocol;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock, RwLock},
@@ -62,6 +67,32 @@ pub fn ensure_l2_cipher_blocking(device: &str, sar_version: u32) -> Option<Share
     crate::asyncrt::universal_block_on(|| async {
         ensure_l2_cipher(&device_name, sar_version).await
     })
+}
+
+pub fn encode_pb_packet(
+    dev: &XiaomiDevice,
+    packet: protocol::WearPacket,
+    log_ctx: &str,
+) -> Vec<u8> {
+    match ensure_l2_cipher_blocking(&dev.name, dev.sar_version) {
+        Some(cipher) => match L2Packet::pb_write_enc(packet.clone(), cipher.as_ref()) {
+            Ok(pkt) => pkt.to_bytes(),
+            Err(err) => {
+                log::error!(
+                    "[{}] pb_write_enc failed, fallback to plain write: {}",
+                    log_ctx,
+                    err
+                );
+                L2Packet::pb_write(packet).to_bytes()
+            }
+        },
+        None => L2Packet::pb_write(packet).to_bytes(),
+    }
+}
+
+pub fn enqueue_pb_packet(dev: &mut XiaomiDevice, packet: protocol::WearPacket, log_ctx: &str) {
+    let bytes = encode_pb_packet(dev, packet, log_ctx);
+    dev.sar.enqueue(bytes);
 }
 
 pub fn on_packet(tk_handle: Handle, device_name: String, data: Vec<u8>) {

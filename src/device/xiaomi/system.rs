@@ -1,4 +1,4 @@
-use pb::pb::protocol::WearPacket;
+use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
 use std::{
     any::TypeId,
@@ -24,7 +24,7 @@ where
 {
     fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
         if channel == L2Channel::Pb {
-            if let Ok(wp) = pb::pb::protocol::WearPacket::decode(Cursor::new(&payload)) {
+            if let Ok(wp) = pb::xiaomi::protocol::WearPacket::decode(Cursor::new(&payload)) {
                 self.on_pb_packet(wp);
             }
         }

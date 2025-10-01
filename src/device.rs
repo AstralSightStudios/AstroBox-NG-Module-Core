@@ -1,8 +1,8 @@
+use crate::device::xiaomi::SendError;
+use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
-use crate::device::xiaomi::SendError;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::ecs::component::Component;
 use crate::ecs::entity::EntityExt;
 use std::future::Future;

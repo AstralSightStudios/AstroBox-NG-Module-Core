@@ -1,7 +1,7 @@
-use crate::asyncrt::{sleep, timeout, Duration};
-use anyhow::{bail, Context, Result};
+use crate::asyncrt::{Duration, sleep, timeout};
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, WriteBytesExt};
-use pb::pb::protocol;
+use pb::xiaomi::protocol;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::mem;
@@ -13,14 +13,14 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
+use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::config::MassConfig;
 use crate::device::xiaomi::packet::{
     self,
     mass::{MassDataType, MassPacket},
     v2::layer2::{L2Channel, L2OpCode, L2Packet},
 };
-use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
-use crate::device::xiaomi::XiaomiDevice;
+use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::entity::EntityExt;
 use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::SysMeta;
@@ -195,24 +195,18 @@ where
         move |rt| {
             if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
                 let prepare_pkt = build_mass_prepare_request(data_type, &file_md5_clone, file_len);
-                // 有加密就优先加密打包，失败则降级明文
-                let bytes = match packet::ensure_l2_cipher_blocking(&dev.name, dev.sar_version) {
-                    Some(cipher) => match L2Packet::pb_write_enc(prepare_pkt.clone(), cipher.as_ref()) {
-                        Ok(pkt) => pkt.to_bytes(),
-                        Err(err) => {
-                            log::error!("pb_write_enc failed in mass prepare, fallback to plain write: {:?}", err);
-                            L2Packet::pb_write(prepare_pkt).to_bytes()
-                        }
-                    },
-                    None => L2Packet::pb_write(prepare_pkt).to_bytes(),
-                };
-                dev.sar.enqueue(bytes);
+                packet::enqueue_pb_packet(
+                    dev,
+                    prepare_pkt,
+                    "MassSystem::send_file_for_owner.prepare",
+                );
                 dev.addr.clone()
             } else {
                 String::new()
             }
         }
-    }).await;
+    })
+    .await;
 
     log::info!("Waiting for prepare response...");
 

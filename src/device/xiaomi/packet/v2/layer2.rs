@@ -1,5 +1,5 @@
 use core::convert::TryFrom;
-use pb::pb::protocol::WearPacket;
+use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
 use std::fmt;
 

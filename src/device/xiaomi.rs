@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use crate::{
     asyncrt::universal_block_on,
     device::xiaomi::{
-        components::{auth::AuthComponent, install::InstallComponent, mass::MassComponent},
+        components::{auth::AuthComponent, info::InfoComponent, install::InstallComponent, mass::MassComponent},
         config::XiaomiDeviceConfig,
         r#type::ConnectType,
     },
@@ -92,6 +92,7 @@ impl XiaomiDevice {
         let auth_comp = AuthComponent::new(authkey.clone());
         let install_comp = InstallComponent::new();
         let mass_comp = MassComponent::new();
+        let info_comp = InfoComponent::new();
 
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
         if connect_type == ConnectType::SPP {
@@ -123,6 +124,7 @@ impl XiaomiDevice {
         dev.add_component(Box::new(auth_comp));
         dev.add_component(Box::new(install_comp));
         dev.add_component(Box::new(mass_comp));
+        dev.add_component(Box::new(info_comp));
         dev
     }
 

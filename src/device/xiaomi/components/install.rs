@@ -1,16 +1,16 @@
-use pb::pb::protocol::{self, WearPacket};
+use pb::xiaomi::protocol::{self, WearPacket};
 
 use crate::device::xiaomi::config::ResConfig;
-use crate::device::xiaomi::packet::{self, mass::MassDataType, v2::layer2::L2Packet};
-use crate::device::xiaomi::{resutils, XiaomiDevice};
+use crate::device::xiaomi::packet::{self, mass::MassDataType};
+use crate::device::xiaomi::{XiaomiDevice, resutils};
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::impl_logic_component;
 
-use crate::device::xiaomi::components::mass::{send_file_for_owner, SendMassCallbackData};
-use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
+use crate::device::xiaomi::components::mass::{SendMassCallbackData, send_file_for_owner};
+use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use std::sync::Arc;
 
 pub struct InstallSystem {
@@ -86,17 +86,7 @@ impl InstallSystem {
 
         FastLane::with_entity_mut::<(), _>(this, move |ent| {
             let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            let bytes = match packet::ensure_l2_cipher_blocking(&dev.name, dev.sar_version) {
-                Some(cipher) => match L2Packet::pb_write_enc(req.clone(), cipher.as_ref()) {
-                    Ok(pkt) => pkt.to_bytes(),
-                    Err(err) => {
-                        log::error!("pb_write_enc failed, fallback to plain write: {:?}", err);
-                        L2Packet::pb_write(req).to_bytes()
-                    }
-                },
-                None => L2Packet::pb_write(req).to_bytes(),
-            };
-            dev.sar.enqueue(bytes);
+            packet::enqueue_pb_packet(dev, req, "InstallSystem::send_install_request");
             Ok(())
         })
         .unwrap();
