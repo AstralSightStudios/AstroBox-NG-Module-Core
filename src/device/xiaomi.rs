@@ -107,7 +107,7 @@ impl XiaomiDevice {
 
         let mut dev = Self {
             meta: EntityMeta {
-                id: name.clone(),
+                id: addr.clone(),
                 components: vec![],
                 comp_index: std::collections::HashMap::new(),
             },
