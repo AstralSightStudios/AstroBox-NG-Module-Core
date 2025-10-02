@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod xiaomi;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DeviceConnectionInfo {
     pub name: String,
     pub addr: String,
