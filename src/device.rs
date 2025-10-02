@@ -1,14 +1,22 @@
-use crate::device::xiaomi::SendError;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
+use crate::device::xiaomi::SendError;
+use crate::device::xiaomi::XiaomiDevice;
 use crate::ecs::component::Component;
 use crate::ecs::entity::EntityExt;
+use anyhow::Context;
 use std::future::Future;
 use tokio::runtime::Handle;
+use serde::{Deserialize, Serialize};
 
 pub mod xiaomi;
+
+#[derive(Serialize, Deserialize)]
+pub struct DeviceConnectionInfo {
+    pub name: String,
+    pub addr: String,
+}
 
 pub async fn create_miwear_device<F, Fut>(
     tk_handle: Handle,
@@ -19,7 +27,8 @@ pub async fn create_miwear_device<F, Fut>(
     connect_type: ConnectType,
     force_android: bool,
     sender: F,
-) where
+) -> anyhow::Result<DeviceConnectionInfo>
+where
     F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
@@ -45,23 +54,30 @@ pub async fn create_miwear_device<F, Fut>(
     })
     .await;
 
-    let _ = crate::asyncrt::spawn_with_handle(
-        async move {
-            crate::ecs::with_rt_mut(move |rt| {
-                if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_auth) {
-                    dev.get_component_as_mut::<AuthComponent>(AuthComponent::ID)
-                        .unwrap()
-                        .as_logic_component_mut()
-                        .unwrap()
-                        .system_mut()
-                        .as_any_mut()
-                        .downcast_mut::<AuthSystem>()
-                        .unwrap()
-                        .start_auth();
-                }
-            })
-            .await;
-        },
-        tk_handle,
-    );
+    let auth_rx = crate::ecs::with_rt_mut(move |rt| {
+        if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_auth) {
+            dev.get_component_as_mut::<AuthComponent>(AuthComponent::ID)
+                .unwrap()
+                .as_logic_component_mut()
+                .unwrap()
+                .system_mut()
+                .as_any_mut()
+                .downcast_mut::<AuthSystem>()
+                .unwrap()
+                .prepare_auth()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+    .await?;
+
+    if let Some(rx) = auth_rx {
+        rx.await.context("Auth await response not received")?;
+    }
+
+    Ok(DeviceConnectionInfo {
+        name: name.clone(),
+        addr: addr.clone(),
+    })
 }

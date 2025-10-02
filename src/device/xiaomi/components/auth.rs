@@ -1,19 +1,21 @@
 use crate::crypto::aesccm::aes128_ccm_encrypt;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
-use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
+use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
+use crate::device::xiaomi::XiaomiDevice;
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use hmac::{Hmac, Mac};
 use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
 use sha2::Sha256;
+use tokio::sync::oneshot;
 
 pub struct AuthSystem {
     meta: SysMeta,
+    auth_wait: Option<oneshot::Sender<()>>,
 }
 
 impl Default for AuthSystem {
@@ -21,12 +23,13 @@ impl Default for AuthSystem {
         register_xiaomi_system_ext_on_l2packet::<Self>();
         Self {
             meta: SysMeta::default(),
+            auth_wait: None,
         }
     }
 }
 
 impl AuthSystem {
-    pub fn start_auth(&mut self) {
+    pub fn prepare_auth(&mut self) -> anyhow::Result<oneshot::Receiver<()>> {
         let nonce = crate::tools::generate_random_bytes(16);
 
         let this: &mut dyn System = self;
@@ -47,6 +50,17 @@ impl AuthSystem {
             Ok(())
         })
         .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        self.auth_wait = Some(tx);
+
+        Ok(rx)
+    }
+
+    pub async fn start_auth(&mut self) -> anyhow::Result<()> {
+        let rx = self.prepare_auth()?;
+        rx.await.context("Auth await response not received")?;
+        Ok(())
     }
 }
 
@@ -57,12 +71,12 @@ impl L2PbExt for AuthSystem {
             match pkt {
                 pb::xiaomi::protocol::wear_packet::Payload::Account(acc) => {
                     if let Some(acc_payload) = acc.payload {
+                        let this: &mut dyn System = self;
+
                         match acc_payload {
                             pb::xiaomi::protocol::account::Payload::AuthDeviceVerify(
                                 verify_pkt,
                             ) => {
-                                let this: &mut dyn System = self;
-
                                 if let Ok(verify_ret) = build_auth_step_2(this, &verify_pkt) {
                                     FastLane::with_entity_mut::<(), _>(this, move |ent| {
                                         let dev = ent
@@ -75,6 +89,20 @@ impl L2PbExt for AuthSystem {
                                         Ok(())
                                     })
                                     .unwrap();
+                                }
+                            }
+                            pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_dc) => {
+                                FastLane::with_component_mut::<AuthComponent, (), _>(
+                                    this,
+                                    AuthComponent::ID,
+                                    |comp| {
+                                        comp.is_authed = true;
+                                    },
+                                )
+                                .unwrap();
+
+                                if let Some(aw_sender) = self.auth_wait.take() {
+                                    let _ = aw_sender.send(());
                                 }
                             }
                             _ => {}

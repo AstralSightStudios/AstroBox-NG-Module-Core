@@ -3,7 +3,10 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use crate::{
     asyncrt::universal_block_on,
     device::xiaomi::{
-        components::{auth::AuthComponent, info::InfoComponent, install::InstallComponent, mass::MassComponent},
+        components::{
+            auth::AuthComponent, info::InfoComponent, install::InstallComponent,
+            mass::MassComponent,
+        },
         config::XiaomiDeviceConfig,
         r#type::ConnectType,
     },

@@ -1,5 +1,5 @@
-use crate::asyncrt::{Duration, sleep, timeout};
-use anyhow::{Context, Result, bail};
+use crate::asyncrt::{sleep, timeout, Duration};
+use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use pb::xiaomi::protocol;
 use serde::Serialize;
@@ -13,14 +13,14 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::config::MassConfig;
 use crate::device::xiaomi::packet::{
     self,
     mass::{MassDataType, MassPacket},
     v2::layer2::{L2Channel, L2OpCode, L2Packet},
 };
-use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
+use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
+use crate::device::xiaomi::XiaomiDevice;
 use crate::ecs::entity::EntityExt;
 use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::SysMeta;

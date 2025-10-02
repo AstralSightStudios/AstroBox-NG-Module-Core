@@ -1,8 +1,8 @@
 use crate::{
     device::xiaomi::{
-        XiaomiDevice,
         components::auth::AuthComponent,
         packet::v2::layer2::{L2Cipher, L2Packet},
+        XiaomiDevice,
     },
     ecs::entity::{Entity, EntityExt},
 };

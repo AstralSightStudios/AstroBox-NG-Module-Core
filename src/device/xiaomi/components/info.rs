@@ -4,9 +4,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     device::xiaomi::{
-        XiaomiDevice,
         packet::{self, v2::layer2::L2Packet},
-        system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
+        system::{register_xiaomi_system_ext_on_l2packet, L2PbExt},
+        XiaomiDevice,
     },
     ecs::{
         fastlane::FastLane,
