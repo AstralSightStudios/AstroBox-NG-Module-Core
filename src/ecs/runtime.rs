@@ -4,8 +4,8 @@ use std::collections::HashMap;
 // ECS运行时环境，相当于World
 // 存放了多个Entity和System，在AstroBox中一般一个设备一个Entity
 pub struct Runtime {
-    entities: HashMap<String, Box<dyn Entity>>,
-    systems: HashMap<String, Box<dyn System>>,
+    pub entities: HashMap<String, Box<dyn Entity>>,
+    pub systems: HashMap<String, Box<dyn System>>,
 }
 
 impl Runtime {
