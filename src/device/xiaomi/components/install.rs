@@ -2,15 +2,15 @@ use pb::xiaomi::protocol::{self, WearPacket};
 
 use crate::device::xiaomi::config::ResConfig;
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
-use crate::device::xiaomi::{resutils, XiaomiDevice};
+use crate::device::xiaomi::{XiaomiDevice, resutils};
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::impl_logic_component;
 
-use crate::device::xiaomi::components::mass::{send_file_for_owner, SendMassCallbackData};
-use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
+use crate::device::xiaomi::components::mass::{SendMassCallbackData, send_file_for_owner};
+use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use std::sync::Arc;
 
 pub struct InstallSystem {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
 
-use crate::asyncrt::{sleep, spawn_with_handle, TaskHandle};
+use crate::asyncrt::{TaskHandle, sleep, spawn_with_handle};
 use tokio::runtime::Handle;
 
 use super::SendFn;

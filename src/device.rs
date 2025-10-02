@@ -1,14 +1,14 @@
+use crate::device::xiaomi::SendError;
+use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
-use crate::device::xiaomi::SendError;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::ecs::component::Component;
 use crate::ecs::entity::EntityExt;
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::runtime::Handle;
-use serde::{Deserialize, Serialize};
 
 pub mod xiaomi;
 

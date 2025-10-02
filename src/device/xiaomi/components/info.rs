@@ -37,30 +37,48 @@ impl Default for InfoSystem {
 
 impl InfoSystem {
     pub async fn get_device_info(&mut self) -> anyhow::Result<DeviceInfo> {
-        self.request_with_wait(
-            |this, tx| this.device_info_wait = Some(tx),
-            || Self::build_system_packet(protocol::system::SystemId::GetDeviceInfo),
+        Self::await_response(
+            self.request_device_info(),
             "Device info response not received",
         )
         .await
     }
 
     pub async fn get_device_status(&mut self) -> anyhow::Result<DeviceStatus> {
-        self.request_with_wait(
-            |this, tx| this.device_status_wait = Some(tx),
-            || Self::build_system_packet(protocol::system::SystemId::GetDeviceStatus),
+        Self::await_response(
+            self.request_device_status(),
             "Device status response not received",
         )
         .await
     }
 
     pub async fn get_device_storage_info(&mut self) -> anyhow::Result<protocol::StorageInfo> {
-        self.request_with_wait(
-            |this, tx| this.device_storage_wait = Some(tx),
-            || Self::build_system_packet(protocol::system::SystemId::GetStorageInfo),
+        Self::await_response(
+            self.request_device_storage(),
             "Device storage info response not received",
         )
         .await
+    }
+
+    pub fn request_device_info(&mut self) -> oneshot::Receiver<DeviceInfo> {
+        self.request_receiver(
+            |this, tx| this.device_info_wait = Some(tx),
+            || Self::build_system_packet(protocol::system::SystemId::GetDeviceInfo),
+        )
+    }
+
+    pub fn request_device_status(&mut self) -> oneshot::Receiver<DeviceStatus> {
+        self.request_receiver(
+            |this, tx| this.device_status_wait = Some(tx),
+            || Self::build_system_packet(protocol::system::SystemId::GetDeviceStatus),
+        )
+    }
+
+    pub fn request_device_storage(&mut self) -> oneshot::Receiver<protocol::StorageInfo> {
+        self.request_receiver(
+            |this, tx| this.device_storage_wait = Some(tx),
+            || Self::build_system_packet(protocol::system::SystemId::GetStorageInfo),
+        )
     }
 
     fn enqueue_request(&mut self, request: protocol::WearPacket) {
@@ -81,12 +99,11 @@ impl InfoSystem {
         .unwrap();
     }
 
-    async fn request_with_wait<T, Store, Build>(
+    fn request_receiver<T, Store, Build>(
         &mut self,
         store_waiter: Store,
         build_packet: Build,
-        err_ctx: &'static str,
-    ) -> anyhow::Result<T>
+    ) -> oneshot::Receiver<T>
     where
         T: Send + 'static,
         Store: FnOnce(&mut Self, oneshot::Sender<T>),
@@ -95,6 +112,13 @@ impl InfoSystem {
         let (tx, rx) = oneshot::channel();
         store_waiter(self, tx);
         self.enqueue_request(build_packet());
+        rx
+    }
+
+    async fn await_response<T>(rx: oneshot::Receiver<T>, err_ctx: &'static str) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
         let resp = rx.await.context(err_ctx)?;
         Ok(resp)
     }
