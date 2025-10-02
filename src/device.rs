@@ -23,15 +23,17 @@ pub async fn create_miwear_device<F, Fut>(
     F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
-    let name_for_auth = name.clone();
+    let device_id_for_auth = addr.clone();
+    let addr_for_entity = addr.clone();
+    let name_for_entity = name.clone();
     let tk_handle_clone = tk_handle.clone();
 
     crate::ecs::with_rt_mut(move |rt| {
         let device_config = XiaomiDeviceConfig::default();
         let dev = XiaomiDevice::new(
             tk_handle_clone.clone(),
-            name.clone(),
-            addr,
+            name_for_entity.clone(),
+            addr_for_entity.clone(),
             authkey,
             sar_version,
             connect_type,
@@ -46,7 +48,7 @@ pub async fn create_miwear_device<F, Fut>(
     let _ = crate::asyncrt::spawn_with_handle(
         async move {
             crate::ecs::with_rt_mut(move |rt| {
-                if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&name_for_auth) {
+                if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_auth) {
                     dev.get_component_as_mut::<AuthComponent>(AuthComponent::ID)
                         .unwrap()
                         .as_logic_component_mut()

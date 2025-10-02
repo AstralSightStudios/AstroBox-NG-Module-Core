@@ -103,7 +103,7 @@ impl XiaomiDevice {
             });
         }
         let sar =
-            sar::SarController::new(tk_handle, sender.clone(), name.clone(), config.sar.clone());
+            sar::SarController::new(tk_handle, sender.clone(), addr.clone(), config.sar.clone());
 
         let mut dev = Self {
             meta: EntityMeta {

@@ -68,7 +68,7 @@ impl InfoSystem {
 
         FastLane::with_entity_mut::<(), _>(this, move |ent| {
             let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            let cipher = packet::ensure_l2_cipher_blocking(&dev.name, dev.sar_version).unwrap();
+            let cipher = packet::ensure_l2_cipher_blocking(&dev.addr, dev.sar_version).unwrap();
 
             dev.sar.enqueue(
                 L2Packet::pb_write_enc(request, cipher.as_ref())

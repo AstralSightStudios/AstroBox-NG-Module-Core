@@ -24,48 +24,48 @@ fn cipher_registry() -> &'static RwLock<HashMap<String, SharedL2Cipher>> {
     GLOBAL_L2_CIPHERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub fn register_l2_cipher(device: String, cipher: SharedL2Cipher) {
+pub fn register_l2_cipher(device_id: String, cipher: SharedL2Cipher) {
     match cipher_registry().write() {
         Ok(mut guard) => {
-            guard.insert(device, cipher);
+            guard.insert(device_id, cipher);
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
-            guard.insert(device, cipher);
+            guard.insert(device_id, cipher);
         }
     }
 }
 
-pub fn get_l2_cipher(device: &str) -> Option<SharedL2Cipher> {
+pub fn get_l2_cipher(device_id: &str) -> Option<SharedL2Cipher> {
     match cipher_registry().read() {
-        Ok(guard) => guard.get(device).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(device).cloned(),
+        Ok(guard) => guard.get(device_id).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(device_id).cloned(),
     }
 }
 
-pub async fn ensure_l2_cipher(device: &str, sar_version: u32) -> Option<SharedL2Cipher> {
-    if let Some(existing) = get_l2_cipher(device) {
+pub async fn ensure_l2_cipher(device_id: &str, sar_version: u32) -> Option<SharedL2Cipher> {
+    if let Some(existing) = get_l2_cipher(device_id) {
         return Some(existing);
     }
 
     match sar_version {
-        2 => V2L2Cipher::new(device.to_string()).await.map(|raw| {
+        2 => V2L2Cipher::new(device_id.to_string()).await.map(|raw| {
             let cipher: SharedL2Cipher = Arc::new(raw);
-            register_l2_cipher(device.to_string(), cipher.clone());
+            register_l2_cipher(device_id.to_string(), cipher.clone());
             cipher
         }),
         _ => None,
     }
 }
 
-pub fn ensure_l2_cipher_blocking(device: &str, sar_version: u32) -> Option<SharedL2Cipher> {
-    if let Some(existing) = get_l2_cipher(device) {
+pub fn ensure_l2_cipher_blocking(device_id: &str, sar_version: u32) -> Option<SharedL2Cipher> {
+    if let Some(existing) = get_l2_cipher(device_id) {
         return Some(existing);
     }
 
-    let device_name = device.to_string();
+    let device_id_owned = device_id.to_string();
     crate::asyncrt::universal_block_on(|| async {
-        ensure_l2_cipher(&device_name, sar_version).await
+        ensure_l2_cipher(&device_id_owned, sar_version).await
     })
 }
 
@@ -74,7 +74,7 @@ pub fn encode_pb_packet(
     packet: protocol::WearPacket,
     log_ctx: &str,
 ) -> Vec<u8> {
-    match ensure_l2_cipher_blocking(&dev.name, dev.sar_version) {
+    match ensure_l2_cipher_blocking(&dev.addr, dev.sar_version) {
         Some(cipher) => match L2Packet::pb_write_enc(packet.clone(), cipher.as_ref()) {
             Ok(pkt) => pkt.to_bytes(),
             Err(err) => {
@@ -95,19 +95,19 @@ pub fn enqueue_pb_packet(dev: &mut XiaomiDevice, packet: protocol::WearPacket, l
     dev.sar.enqueue(bytes);
 }
 
-pub fn on_packet(tk_handle: Handle, device_name: String, data: Vec<u8>) {
+pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
     crate::asyncrt::spawn_with_handle(
         async move {
             let sar_version = crate::ecs::with_rt_mut({
-                let device_name_clone = device_name.clone();
+                let device_id_clone = device_id.clone();
                 move |rt| {
-                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_name_clone)
+                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_clone)
                         .map(|dev| dev.sar_version)
                 }
             })
             .await;
             let shared_cipher = match sar_version {
-                Some(version) => ensure_l2_cipher(&device_name, version).await,
+                Some(version) => ensure_l2_cipher(&device_id, version).await,
                 None => None,
             };
 
@@ -141,10 +141,12 @@ pub fn on_packet(tk_handle: Handle, device_name: String, data: Vec<u8>) {
                     };
 
                 let deliver_up = crate::ecs::with_rt_mut({
-                    let device_name2 = device_name.clone();
+                    let device_id_lookup = device_id.clone();
                     let l1_clone = l1.clone();
                     move |rt| {
-                        if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_name2) {
+                        if let Some(dev) =
+                            rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_lookup)
+                        {
                             if dev.sar_version == 2 {
                                 return dev.sar.on_l1_packet(&l1_clone);
                             }
@@ -164,10 +166,10 @@ pub fn on_packet(tk_handle: Handle, device_name: String, data: Vec<u8>) {
                         let payload = l2p.payload;
 
                         crate::ecs::with_rt_mut({
-                            let device_name3 = device_name.clone();
+                            let device_id_dispatch = device_id.clone();
                             move |rt| {
                                 if let Some(dev) =
-                                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_name3)
+                                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_dispatch)
                                 {
                                     if dev.sar_version == 2 {
                                         for comp in dev.components() {
@@ -199,10 +201,10 @@ pub struct V2L2Cipher {
 }
 
 impl V2L2Cipher {
-    pub async fn new(device_name: String) -> Option<Self> {
-        let device_name_clone = device_name.clone();
+    pub async fn new(device_id: String) -> Option<Self> {
+        let device_id_clone = device_id.clone();
         let keys = crate::ecs::with_rt_mut(move |rt| {
-            if let Some(device) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_name_clone) {
+            if let Some(device) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_clone) {
                 if let Ok(auth_comp) =
                     device.get_component_as_mut::<AuthComponent>(AuthComponent::ID)
                 {
@@ -219,7 +221,7 @@ impl V2L2Cipher {
         } else {
             log::debug!(
                 "ensure_l2_cipher: device {} missing auth keys (enc={}, dec={})",
-                device_name,
+                device_id,
                 enc_key.len(),
                 dec_key.len()
             );
