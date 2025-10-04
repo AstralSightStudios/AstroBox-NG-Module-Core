@@ -5,7 +5,7 @@ use crate::{
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
     ecs::{
         fastlane::FastLane,
-        logic_component::{LogicCompMeta, LogicComponent},
+        logic_component::LogicCompMeta,
         system::{SysMeta, System},
     },
     impl_has_sys_meta, impl_logic_component,

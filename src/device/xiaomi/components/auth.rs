@@ -1,10 +1,8 @@
-use super::thirdparty::{ThirdpartyAppComponent, ThirdpartyAppSystem};
 use crate::crypto::aesccm::aes128_ccm_encrypt;
 use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::fastlane::FastLane;
-use crate::ecs::logic_component::LogicComponent;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};

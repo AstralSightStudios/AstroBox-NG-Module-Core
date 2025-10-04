@@ -135,7 +135,7 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
 
                 let should_remove = buffer.is_empty();
                 if should_remove {
-                    drop(buffer);
+                    let _ = buffer;
                     registry.remove(&device_id);
                 }
             }
