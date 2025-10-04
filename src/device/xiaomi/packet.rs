@@ -19,9 +19,14 @@ pub mod v2;
 pub type SharedL2Cipher = Arc<dyn L2Cipher + Send + Sync>;
 
 static GLOBAL_L2_CIPHERS: OnceLock<RwLock<HashMap<String, SharedL2Cipher>>> = OnceLock::new();
+static RECV_BUFFERS: OnceLock<RwLock<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 fn cipher_registry() -> &'static RwLock<HashMap<String, SharedL2Cipher>> {
     GLOBAL_L2_CIPHERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn recv_buffer_registry() -> &'static RwLock<HashMap<String, Vec<u8>>> {
+    RECV_BUFFERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 pub fn register_l2_cipher(device_id: String, cipher: SharedL2Cipher) {
@@ -98,6 +103,47 @@ pub fn enqueue_pb_packet(dev: &mut XiaomiDevice, packet: protocol::WearPacket, l
 pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
     crate::asyncrt::spawn_with_handle(
         async move {
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            {
+                let mut registry = recv_buffer_registry()
+                    .write()
+                    .expect("poisoned MiWear recv buffer registry");
+                let buffer = registry.entry(device_id.clone()).or_insert_with(Vec::new);
+                buffer.extend_from_slice(&data);
+
+                let mut idx = 0usize;
+                while idx + 8 <= buffer.len() {
+                    if !(buffer[idx] == 0xa5 && buffer[idx + 1] == 0xa5) {
+                        idx = idx.saturating_add(1);
+                        continue;
+                    }
+
+                    let declared_len =
+                        u16::from_le_bytes([buffer[idx + 4], buffer[idx + 5]]) as usize;
+                    let total = 8 + declared_len;
+                    if idx + total > buffer.len() {
+                        break;
+                    }
+
+                    frames.push(buffer[idx..idx + total].to_vec());
+                    idx += total;
+                }
+
+                if idx > 0 {
+                    buffer.drain(0..idx);
+                }
+
+                let should_remove = buffer.is_empty();
+                if should_remove {
+                    drop(buffer);
+                    registry.remove(&device_id);
+                }
+            }
+
+            if frames.is_empty() {
+                return;
+            }
+
             let sar_version = crate::ecs::with_rt_mut({
                 let device_id_clone = device_id.clone();
                 move |rt| {
@@ -111,31 +157,12 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                 None => None,
             };
 
-            let mut i = 0usize;
-            while i + 8 <= data.len() {
-                if !(data[i] == 0xa5 && data[i + 1] == 0xa5) {
-                    if let Some(pos) = data[i + 1..].windows(2).position(|w| w == [0xa5, 0xa5]) {
-                        i += 1 + pos;
-                        continue;
-                    } else {
-                        break;
-                    }
-                }
-
-                let declared_len = u16::from_le_bytes([data[i + 4], data[i + 5]]) as usize;
-                let total = 8 + declared_len;
-                if i + total > data.len() {
-                    break;
-                }
-
-                let l1_bytes = &data[i..i + total];
+            for frame in frames {
                 let l1 =
-                    match crate::device::xiaomi::packet::v2::layer1::L1Packet::from_bytes(l1_bytes)
-                    {
+                    match crate::device::xiaomi::packet::v2::layer1::L1Packet::from_bytes(&frame) {
                         Ok(p) => p,
                         Err(err) => {
                             log::warn!("Decode L1 Packet Err: {}", err.to_string());
-                            i += 2;
                             continue;
                         }
                     };
@@ -187,8 +214,6 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                         .await;
                     }
                 }
-
-                i += total;
             }
         },
         tk_handle,

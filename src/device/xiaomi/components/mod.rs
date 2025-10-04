@@ -4,3 +4,4 @@ pub mod install;
 pub mod mass;
 pub mod resource;
 mod shared;
+pub mod thirdparty;
