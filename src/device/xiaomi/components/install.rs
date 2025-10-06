@@ -3,16 +3,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
 use crate::asyncrt::universal_block_on;
-use crate::device::xiaomi::components::mass::{send_file_for_owner, SendMassCallbackData};
+use crate::device::xiaomi::components::mass::{SendMassCallbackData, send_file_for_owner};
 use crate::device::xiaomi::config::ResConfig;
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
-use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
-use crate::device::xiaomi::{resutils, XiaomiDevice};
+use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
+use crate::device::xiaomi::{XiaomiDevice, resutils};
 use crate::ecs::entity::EntityExt;
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::logic_component::LogicCompMeta;

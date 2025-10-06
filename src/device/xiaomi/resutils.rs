@@ -20,14 +20,18 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     Some(digits)
 }
 
-#[derive(Clone, Copy,Serialize,PartialEq)]
-pub enum FileType{
+#[derive(Clone, Copy, Serialize, PartialEq)]
+pub enum FileType {
     WatchFace = MassDataType::Watchface as isize,
     Firmware = MassDataType::Firmare as isize,
     ThirdPartyApp = MassDataType::ThirdPartyApp as isize,
-    Text,Zip,Binary,Null,Abp
+    Text,
+    Zip,
+    Binary,
+    Null,
+    Abp,
 }
-pub fn get_file_type(data:&Vec<u8>) -> FileType {
+pub fn get_file_type(data: &Vec<u8>) -> FileType {
     if data.is_empty() {
         return FileType::Null;
     }
