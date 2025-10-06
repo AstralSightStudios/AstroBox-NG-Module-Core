@@ -92,7 +92,7 @@ mod wasm {
 
     pub fn init_runtime_with<F>(make_rt: F)
     where
-        F: FnOnce() -> Runtime + Send + 'static,
+        F: FnOnce() -> Runtime + 'static,
     {
         RT.with(|cell| {
             *cell.borrow_mut() = Some(make_rt());
@@ -108,8 +108,8 @@ mod wasm {
 
     pub async fn with_rt_mut<F, R>(f: F) -> R
     where
-        F: FnOnce(&mut Runtime) -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(&mut Runtime) -> R + 'static,
+        R: 'static,
     {
         RT.with(|cell| {
             // SAFETY: 因为WASM实际上他妈是个单线程环境，因此获取可变指针是完全安全的

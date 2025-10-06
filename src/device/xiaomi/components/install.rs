@@ -20,6 +20,10 @@ use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::impl_logic_component;
 
+#[cfg(target_arch = "wasm32")]
+type InstallFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
 type InstallFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 pub struct InstallSystem {
