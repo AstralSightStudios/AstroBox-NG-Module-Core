@@ -64,12 +64,12 @@ impl InstallSystem {
         .unwrap();
 
         let req: WearPacket = match r#type {
-            MassDataType::WATCHFACE => {
+            MassDataType::Watchface => {
                 let id = resutils::get_watchface_id(&file_data, &res_config)
                     .expect("invalid watchface id");
                 build_watchface_install_request(&id, file_data.len())
             }
-            MassDataType::FIRMWARE => build_firmware_install_request(
+            MassDataType::Firmare => build_firmware_install_request(
                 "99.99.99".to_string(),
                 &crate::tools::calc_md5(&file_data),
                 "AstroBox Firmware Update".to_string(),
@@ -77,7 +77,7 @@ impl InstallSystem {
             MassDataType::NotificationIcon => {
                 build_notification_icon_request(package_name.expect("package_name is required"))
             }
-            MassDataType::ThirdpartyApp => build_thirdparty_app_install_request(
+            MassDataType::ThirdPartyApp => build_thirdparty_app_install_request(
                 package_name.expect("package_name is required"),
                 114514,
                 file_data.len(),
@@ -157,7 +157,7 @@ impl L2PbExt for InstallSystem {
                 Some(protocol::watch_face::Payload::PrepareStatus(status))
                     if status == protocol::PrepareStatus::Ready as i32 =>
                 {
-                    Some(MassDataType::WATCHFACE)
+                    Some(MassDataType::Watchface)
                 }
                 _ => None,
             },
@@ -165,7 +165,7 @@ impl L2PbExt for InstallSystem {
                 Some(protocol::thirdparty_app::Payload::InstallResponse(resp))
                     if resp.prepare_status == protocol::PrepareStatus::Ready as i32 =>
                 {
-                    Some(MassDataType::ThirdpartyApp)
+                    Some(MassDataType::ThirdPartyApp)
                 }
                 _ => None,
             },
@@ -173,7 +173,7 @@ impl L2PbExt for InstallSystem {
                 Some(protocol::system::Payload::PrepareOtaResponse(resp))
                     if resp.prepare_status == protocol::PrepareStatus::Ready as i32 =>
                 {
-                    Some(MassDataType::FIRMWARE)
+                    Some(MassDataType::Firmare)
                 }
                 _ => None,
             },

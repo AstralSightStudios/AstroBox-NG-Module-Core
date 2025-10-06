@@ -1,4 +1,6 @@
-use crate::device::xiaomi::config::ResConfig;
+use serde::{Deserialize, Serialize};
+
+use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
 
 pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     let offset = config.watchface_id_offset;
@@ -16,4 +18,50 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
         .collect();
 
     Some(digits)
+}
+
+#[derive(Clone, Copy,Serialize,PartialEq)]
+pub enum FileType{
+    WatchFace = MassDataType::Watchface as isize,
+    Firmware = MassDataType::Firmare as isize,
+    ThirdPartyApp = MassDataType::ThirdPartyApp as isize,
+    Text,Zip,Binary,Null,Abp
+}
+pub fn get_file_type(data:&Vec<u8>) -> FileType {
+    if data.is_empty() {
+        return FileType::Null;
+    }
+    // 1. 检查是不是 ZIP 格式
+    if data.len() >= 4 && &data[..4] == [0x50, 0x4B, 0x03, 0x04] {
+        /* // 检查扩展名 abp
+        if let Some(ext) = filename.extension() {
+            if ext == "abp" {
+                return Ok("abp".to_string());
+            }
+        } */
+        // 检查尾部是否包含 quickapp 字样
+        let tail = if data.len() > 256 {
+            &data[data.len() - 256..]
+        } else {
+            &data[..]
+        };
+        if String::from_utf8_lossy(tail).contains("toolkit") {
+            return FileType::ThirdPartyApp;
+        } else {
+            return FileType::Zip;
+        }
+    }
+
+    // 2. 检查是不是文本（utf8）
+    if std::str::from_utf8(&data).is_ok() {
+        return FileType::Text;
+    }
+
+    // 3. 检查小米表盘魔数 5a a5 34 12
+    if data.len() >= 4 && &data[..4] == [0x5a, 0xa5, 0x34, 0x12] {
+        return FileType::WatchFace;
+    }
+
+    // 4. 其它都认为是二进制
+    FileType::Binary
 }

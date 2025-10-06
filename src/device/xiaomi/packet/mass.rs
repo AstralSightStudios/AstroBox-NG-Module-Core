@@ -9,10 +9,10 @@ use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum MassDataType {
-    WATCHFACE = 16,
-    FIRMWARE = 32,
+    Watchface = 16,
+    Firmare = 32,
     NotificationIcon = 50,
-    ThirdpartyApp = 64,
+    ThirdPartyApp = 64,
 }
 
 impl From<MassDataType> for u8 {
@@ -26,10 +26,10 @@ impl TryFrom<u8> for MassDataType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            16 => Ok(MassDataType::WATCHFACE),
-            32 => Ok(MassDataType::FIRMWARE),
+            16 => Ok(MassDataType::Watchface),
+            32 => Ok(MassDataType::Firmare),
             50 => Ok(MassDataType::NotificationIcon),
-            64 => Ok(MassDataType::ThirdpartyApp),
+            64 => Ok(MassDataType::ThirdPartyApp),
             _ => Err("invalid MassDataType value"),
         }
     }
