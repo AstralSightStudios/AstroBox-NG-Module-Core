@@ -22,8 +22,10 @@ impl Log for WasmLogger {
 static LOGGER: WasmLogger = WasmLogger;
 
 pub fn init_logger() {
-    let _ = log::set_logger(&LOGGER).map(|()| {
-        log::set_max_level(LevelFilter::Debug);
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(LevelFilter::Trace);
         log::info!("WASM Logger initialized.");
-    });
+    } else {
+        log::set_max_level(LevelFilter::Trace);
+    }
 }
