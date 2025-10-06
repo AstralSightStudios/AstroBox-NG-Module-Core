@@ -1,20 +1,41 @@
-use pb::xiaomi::protocol::{self, WearPacket};
+use std::convert::TryFrom;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use anyhow::{anyhow, bail, Context, Result};
+use pb::xiaomi::protocol::{self, WearPacket};
+use tokio::sync::oneshot;
+
+use crate::asyncrt::universal_block_on;
+use crate::device::xiaomi::components::mass::{send_file_for_owner, SendMassCallbackData};
 use crate::device::xiaomi::config::ResConfig;
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
-use crate::device::xiaomi::{XiaomiDevice, resutils};
+use crate::device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt};
+use crate::device::xiaomi::{resutils, XiaomiDevice};
+use crate::ecs::entity::EntityExt;
 use crate::ecs::fastlane::FastLane;
 use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::impl_logic_component;
 
-use crate::device::xiaomi::components::mass::{SendMassCallbackData, send_file_for_owner};
-use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
-use std::sync::Arc;
+type InstallFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 pub struct InstallSystem {
     meta: SysMeta,
+}
+
+struct InstallWaiters {
+    data_type: MassDataType,
+    prepare_tx: Option<oneshot::Sender<i32>>,
+    result_tx: Option<oneshot::Sender<InstallResultEvent>>,
+}
+
+enum InstallResultEvent {
+    ThirdpartyApp(protocol::app_installer::Result),
+    Watchface(protocol::InstallResult),
+    Firmware(protocol::prepare_ota::Response),
 }
 
 impl Default for InstallSystem {
@@ -32,8 +53,8 @@ impl InstallSystem {
         r#type: MassDataType,
         file_data: Vec<u8>,
         package_name: Option<&str>,
-    ) {
-        self.send_install_request_with_progress(r#type, file_data, package_name, Arc::new(|_| {}));
+    ) -> Result<InstallFuture> {
+        self.send_install_request_with_progress(r#type, file_data, package_name, Arc::new(|_| {}))
     }
 
     pub fn send_install_request_with_progress(
@@ -42,162 +63,277 @@ impl InstallSystem {
         file_data: Vec<u8>,
         package_name: Option<&str>,
         progress_cb: Arc<dyn Fn(SendMassCallbackData) + Send + Sync>,
-    ) {
-        let this: &mut dyn System = self;
-
-        let file_data_cl = file_data.clone();
-        let cb_arc = progress_cb.clone();
-        FastLane::with_component_mut::<InstallComponent, (), _>(
-            this,
-            InstallComponent::ID,
-            move |comp| {
-                comp.install_data = Some(file_data_cl);
-                comp.progress_cb = Some(cb_arc);
-            },
-        )
-        .unwrap();
-
-        let res_config = FastLane::with_entity_mut::<ResConfig, _>(this, |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            Ok(dev.config.res.clone())
-        })
-        .unwrap();
-
-        let req: WearPacket = match r#type {
-            MassDataType::Watchface => {
-                let id = resutils::get_watchface_id(&file_data, &res_config)
-                    .expect("invalid watchface id");
-                build_watchface_install_request(&id, file_data.len())
-            }
-            MassDataType::Firmare => build_firmware_install_request(
-                "99.99.99".to_string(),
-                &crate::tools::calc_md5(&file_data),
-                "AstroBox Firmware Update".to_string(),
-            ),
-            MassDataType::NotificationIcon => {
-                build_notification_icon_request(package_name.expect("package_name is required"))
-            }
-            MassDataType::ThirdPartyApp => build_thirdparty_app_install_request(
-                package_name.expect("package_name is required"),
-                114514,
-                file_data.len(),
-            ),
-        };
-
-        FastLane::with_entity_mut::<(), _>(this, move |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            packet::enqueue_pb_packet(dev, req, "InstallSystem::send_install_request");
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[inline]
-    fn on_prepare_ready(&mut self, r#type: MassDataType) {
+    ) -> Result<InstallFuture> {
         let this: &mut dyn System = self;
         let owner = this.owner().unwrap_or("").to_string();
 
-        let (file_data_opt, cb_opt) = FastLane::with_component_mut::<
-            InstallComponent,
-            (
-                Option<Vec<u8>>,
-                Option<Arc<dyn Fn(SendMassCallbackData) + Send + Sync>>,
-            ),
-            _,
-        >(this, InstallComponent::ID, move |comp| {
-            (comp.install_data.take(), comp.progress_cb.take())
-        })
-        .unwrap();
-
-        if let Some(file_data) = file_data_opt {
-            let owner_id = owner.clone();
-            let progress_cb = cb_opt.unwrap_or_else(|| Arc::new(|_| {}));
-            let runtime_handle =
-                FastLane::with_entity_mut::<tokio::runtime::Handle, _>(this, move |ent| {
-                    let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-                    Ok(dev.sar.runtime_handle())
-                })
-                .ok();
-
-            if let Some(handle) = runtime_handle {
-                crate::asyncrt::spawn_with_handle(
-                    {
-                        let cb_arc = progress_cb.clone();
-                        let owner_for_send = owner_id.clone();
-                        async move {
-                            log::info!("Starting install resource...");
-                            if let Err(err) =
-                                send_file_for_owner(owner_for_send, file_data, r#type, move |d| {
-                                    (cb_arc)(d)
-                                })
-                                .await
-                            {
-                                log::error!("Failed to send MASS payload: {:?}", err);
-                            }
-                        }
-                    },
-                    handle,
-                );
-            } else {
-                log::error!(
-                    "InstallSystem.on_prepare_ready: missing runtime handle for owner {}",
-                    owner
-                );
+        let (prepare_tx, prepare_rx) = oneshot::channel::<i32>();
+        let (result_tx_opt, result_rx_opt) = match r#type {
+            MassDataType::NotificationIcon => (None, None),
+            _ => {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
             }
-        } else {
-            log::warn!("InstallSystem.on_prepare_ready called but no install_data was set");
+        };
+
+        FastLane::with_component_mut::<InstallComponent, _, _>(
+            this,
+            InstallComponent::ID,
+            move |comp| -> Result<()> {
+                if comp.waiters.is_some() {
+                    bail!("install request is already in progress");
+                }
+                comp.waiters = Some(InstallWaiters {
+                    data_type: r#type,
+                    prepare_tx: Some(prepare_tx),
+                    result_tx: result_tx_opt,
+                });
+                Ok(())
+            },
+        )
+        .map_err(|err| anyhow!("failed to access install component: {:?}", err))??;
+
+        let req_result: Result<WearPacket> = (|| {
+            Ok(match r#type {
+                MassDataType::Watchface => {
+                    let res_config = FastLane::with_entity_mut::<ResConfig, _>(this, |ent| {
+                        let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
+                        Ok(dev.config.res.clone())
+                    })
+                    .map_err(|err| anyhow!("failed to access resource config: {:?}", err))?;
+                    let id = resutils::get_watchface_id(&file_data, &res_config)
+                        .context("invalid watchface id")?;
+                    build_watchface_install_request(&id, file_data.len())
+                }
+                MassDataType::Firmare => build_firmware_install_request(
+                    "99.99.99".to_string(),
+                    &crate::tools::calc_md5(&file_data),
+                    "AstroBox Firmware Update".to_string(),
+                ),
+                MassDataType::NotificationIcon => {
+                    let pkg =
+                        package_name.context("package_name is required for notification icon")?;
+                    build_notification_icon_request(pkg)
+                }
+                MassDataType::ThirdPartyApp => {
+                    let pkg =
+                        package_name.context("package_name is required for third-party app")?;
+                    build_thirdparty_app_install_request(pkg, 114514, file_data.len())
+                }
+            })
+        })();
+
+        let req = match req_result {
+            Ok(req) => req,
+            Err(err) => {
+                let owner_for_cleanup = owner.clone();
+                universal_block_on(|| clear_install_waiters(owner_for_cleanup.clone()));
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = FastLane::with_entity_mut::<(), _>(this, move |ent| {
+            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
+            packet::enqueue_pb_packet(
+                dev,
+                req,
+                "InstallSystem::send_install_request_with_progress",
+            );
+            Ok(())
+        }) {
+            let owner_for_cleanup = owner.clone();
+            universal_block_on(|| clear_install_waiters(owner_for_cleanup.clone()));
+            return Err(anyhow!("failed to enqueue install request: {:?}", err));
         }
+
+        let owner_for_future = owner.clone();
+        let progress_cb_future = progress_cb.clone();
+
+        let fut = async move {
+            let result = async {
+                let prepare_status = prepare_rx
+                    .await
+                    .map_err(|_| anyhow!("prepare response channel closed unexpectedly"))?;
+
+                let prepare_enum = protocol::PrepareStatus::try_from(prepare_status)
+                    .map_err(|_| anyhow!("unknown prepare status: {prepare_status}"))?;
+
+                if prepare_enum != protocol::PrepareStatus::Ready {
+                    bail!("install prepare failed with status: {:?}", prepare_enum);
+                }
+
+                send_file_for_owner(owner_for_future.clone(), file_data, r#type, move |d| {
+                    (progress_cb_future)(d)
+                })
+                .await
+                .context("failed to send MASS payload")?;
+
+                if let Some(result_rx) = result_rx_opt {
+                    let event = result_rx
+                        .await
+                        .map_err(|_| anyhow!("install result message missing"))?;
+                    handle_install_result(r#type, event)?;
+                }
+
+                Ok(())
+            }
+            .await;
+
+            clear_install_waiters(owner_for_future).await;
+            result
+        };
+
+        Ok(Box::pin(fut))
     }
 }
 
 impl L2PbExt for InstallSystem {
     fn on_pb_packet(&mut self, payload: protocol::WearPacket) {
-        if let Some(next_type) = match payload.payload {
-            Some(protocol::wear_packet::Payload::WatchFace(wf)) => match wf.payload {
-                Some(protocol::watch_face::Payload::PrepareStatus(status))
-                    if status == protocol::PrepareStatus::Ready as i32 =>
-                {
-                    Some(MassDataType::Watchface)
+        let this: &mut dyn System = self;
+        let _ = FastLane::with_component_mut::<InstallComponent, _, _>(
+            this,
+            InstallComponent::ID,
+            move |comp| {
+                if let Some(waiters) = comp.waiters.as_mut() {
+                    match payload.payload {
+                        Some(protocol::wear_packet::Payload::WatchFace(wf)) => {
+                            if let MassDataType::Watchface = waiters.data_type {
+                                match wf.payload {
+                                    Some(protocol::watch_face::Payload::PrepareStatus(status)) => {
+                                        if let Some(tx) = waiters.prepare_tx.take() {
+                                            let _ = tx.send(status);
+                                        }
+                                    }
+                                    Some(protocol::watch_face::Payload::InstallResult(result)) => {
+                                        if let Some(tx) = waiters.result_tx.take() {
+                                            let _ = tx.send(InstallResultEvent::Watchface(result));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(protocol::wear_packet::Payload::ThirdpartyApp(ta)) => {
+                            if let MassDataType::ThirdPartyApp = waiters.data_type {
+                                match ta.payload {
+                                    Some(protocol::thirdparty_app::Payload::InstallResponse(
+                                        resp,
+                                    )) => {
+                                        if let Some(tx) = waiters.prepare_tx.take() {
+                                            let _ = tx.send(resp.prepare_status);
+                                        }
+                                    }
+                                    Some(protocol::thirdparty_app::Payload::InstallResult(
+                                        result,
+                                    )) => {
+                                        if let Some(tx) = waiters.result_tx.take() {
+                                            let _ =
+                                                tx.send(InstallResultEvent::ThirdpartyApp(result));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(protocol::wear_packet::Payload::System(sys)) => {
+                            if let MassDataType::Firmare = waiters.data_type {
+                                if let Some(protocol::system::Payload::PrepareOtaResponse(resp)) =
+                                    sys.payload
+                                {
+                                    if let Some(tx) = waiters.prepare_tx.take() {
+                                        let _ = tx.send(resp.prepare_status);
+                                    } else if let Some(tx) = waiters.result_tx.take() {
+                                        let _ = tx.send(InstallResultEvent::Firmware(resp));
+                                    }
+                                }
+                            }
+                        }
+                        Some(protocol::wear_packet::Payload::Notification(nc)) => {
+                            if let MassDataType::NotificationIcon = waiters.data_type {
+                                if let Some(protocol::notification::Payload::AppIconResponse(
+                                    resp,
+                                )) = nc.payload
+                                {
+                                    if let Some(tx) = waiters.prepare_tx.take() {
+                                        let _ = tx.send(resp.prepare_status);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                _ => None,
             },
-            Some(protocol::wear_packet::Payload::ThirdpartyApp(ta)) => match ta.payload {
-                Some(protocol::thirdparty_app::Payload::InstallResponse(resp))
-                    if resp.prepare_status == protocol::PrepareStatus::Ready as i32 =>
-                {
-                    Some(MassDataType::ThirdPartyApp)
-                }
-                _ => None,
-            },
-            Some(protocol::wear_packet::Payload::System(sys)) => match sys.payload {
-                Some(protocol::system::Payload::PrepareOtaResponse(resp))
-                    if resp.prepare_status == protocol::PrepareStatus::Ready as i32 =>
-                {
-                    Some(MassDataType::Firmare)
-                }
-                _ => None,
-            },
-            Some(protocol::wear_packet::Payload::Notification(nc)) => match nc.payload {
-                Some(protocol::notification::Payload::AppIconResponse(resp))
-                    if resp.prepare_status == protocol::PrepareStatus::Ready as i32 =>
-                {
-                    Some(MassDataType::NotificationIcon)
-                }
-                _ => None,
-            },
-            _ => None,
-        } {
-            self.on_prepare_ready(next_type);
-        }
+        );
     }
 }
 
 impl_has_sys_meta!(InstallSystem, meta);
 
+async fn clear_install_waiters(owner: String) {
+    let _ = crate::ecs::with_rt_mut({
+        let owner = owner.clone();
+        move |rt| {
+            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
+                if let Ok(comp) = dev.get_component_as_mut::<InstallComponent>(InstallComponent::ID)
+                {
+                    comp.waiters = None;
+                }
+            }
+        }
+    })
+    .await;
+}
+
+fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Result<()> {
+    match (r#type, event) {
+        (MassDataType::ThirdPartyApp, InstallResultEvent::ThirdpartyApp(result)) => {
+            use protocol::app_installer::result::Code;
+            let code = Code::try_from(result.code)
+                .map_err(|_| anyhow!("unknown third-party install code: {}", result.code))?;
+            match code {
+                Code::InstallSuccess => Ok(()),
+                Code::InstallFailed | Code::VerifyFailed => {
+                    bail!("third-party app install failed: {:?}", code)
+                }
+            }
+        }
+        (MassDataType::Watchface, InstallResultEvent::Watchface(result)) => {
+            use protocol::install_result::Code;
+            let code = Code::try_from(result.code)
+                .map_err(|_| anyhow!("unknown watchface install code: {}", result.code))?;
+            match code {
+                Code::InstallSuccess | Code::InstallUsed => Ok(()),
+                Code::InstallFailed | Code::VerifyFailed => {
+                    bail!("watchface install failed: {:?}", code)
+                }
+            }
+        }
+        (MassDataType::Firmare, InstallResultEvent::Firmware(resp)) => {
+            let status = protocol::PrepareStatus::try_from(resp.prepare_status)
+                .map_err(|_| anyhow!("unknown firmware prepare status: {}", resp.prepare_status))?;
+            if status != protocol::PrepareStatus::Ready {
+                bail!("firmware install reported status: {:?}", status);
+            }
+            Ok(())
+        }
+        (unexpected_type, unexpected_event) => {
+            bail!(
+                "mismatched install result (type={} event={})",
+                u8::from(unexpected_type),
+                match unexpected_event {
+                    InstallResultEvent::ThirdpartyApp(_) => "thirdparty",
+                    InstallResultEvent::Watchface(_) => "watchface",
+                    InstallResultEvent::Firmware(_) => "firmware",
+                }
+            )
+        }
+    }
+}
+
 pub struct InstallComponent {
     meta: LogicCompMeta,
-    install_data: Option<Vec<u8>>,
-    progress_cb: Option<Arc<dyn Fn(SendMassCallbackData) + Send + Sync>>,
+    waiters: Option<InstallWaiters>,
 }
 
 impl InstallComponent {
@@ -205,8 +341,7 @@ impl InstallComponent {
     pub fn new() -> Self {
         Self {
             meta: LogicCompMeta::new::<InstallSystem>(Self::ID),
-            install_data: None,
-            progress_cb: None,
+            waiters: None,
         }
     }
 }
