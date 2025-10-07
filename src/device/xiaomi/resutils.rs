@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
 
