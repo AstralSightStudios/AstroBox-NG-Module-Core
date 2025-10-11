@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 
 use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum MassDataType {
     Watchface = 16,

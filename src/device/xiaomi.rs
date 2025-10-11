@@ -5,7 +5,8 @@ use crate::{
     device::xiaomi::{
         components::{
             auth::AuthComponent, info::InfoComponent, install::InstallComponent,
-            mass::MassComponent, resource::ResourceComponent, thirdparty::ThirdpartyAppComponent,
+            mass::MassComponent, resource::ResourceComponent,
+            thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent,
         },
         config::XiaomiDeviceConfig,
         r#type::ConnectType,
@@ -98,6 +99,7 @@ impl XiaomiDevice {
         let info_comp = InfoComponent::new();
         let thirdparty_comp = ThirdpartyAppComponent::new();
         let resource_comp = ResourceComponent::new();
+        let watchface_comp = WatchfaceComponent::new();
 
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
         if connect_type == ConnectType::SPP {
@@ -132,6 +134,7 @@ impl XiaomiDevice {
         dev.add_component(Box::new(info_comp));
         dev.add_component(Box::new(thirdparty_comp));
         dev.add_component(Box::new(resource_comp));
+        dev.add_component(Box::new(watchface_comp));
         dev
     }
 

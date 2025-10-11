@@ -8,14 +8,17 @@ use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
 use crate::asyncrt::universal_block_on;
-use crate::device::xiaomi::components::mass::{SendMassCallbackData, send_file_for_owner};
+use crate::device::xiaomi::components::{
+    mass::{SendMassCallbackData, send_file_for_owner},
+    resource::{ResourceComponent, ResourceSystem},
+};
 use crate::device::xiaomi::config::ResConfig;
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::device::xiaomi::{XiaomiDevice, resutils};
 use crate::ecs::entity::EntityExt;
 use crate::ecs::fastlane::FastLane;
-use crate::ecs::logic_component::LogicCompMeta;
+use crate::ecs::logic_component::{LogicCompMeta, LogicComponent};
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::impl_logic_component;
@@ -177,6 +180,9 @@ impl InstallSystem {
                         .await
                         .map_err(|_| anyhow!("install result message missing"))?;
                     handle_install_result(r#type, event)?;
+                    if r#type == MassDataType::ThirdPartyApp {
+                        refresh_quick_app_list(owner_for_future.clone()).await;
+                    }
                 }
 
                 Ok(())
@@ -282,6 +288,27 @@ async fn clear_install_waiters(owner: String) {
                 if let Ok(comp) = dev.get_component_as_mut::<InstallComponent>(InstallComponent::ID)
                 {
                     comp.waiters = None;
+                }
+            }
+        }
+    })
+    .await;
+}
+
+async fn refresh_quick_app_list(owner: String) {
+    let _ = crate::ecs::with_rt_mut({
+        move |rt| {
+            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
+                if let Ok(comp) =
+                    dev.get_component_as_mut::<ResourceComponent>(ResourceComponent::ID)
+                {
+                    if let Some(system) = comp
+                        .system_mut()
+                        .as_any_mut()
+                        .downcast_mut::<ResourceSystem>()
+                    {
+                        let _ = system.request_quick_app_list();
+                    }
                 }
             }
         }
