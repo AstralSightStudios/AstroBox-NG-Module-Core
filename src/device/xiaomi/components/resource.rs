@@ -122,7 +122,9 @@ impl L2PbExt for ResourceSystem {
 
 impl_has_sys_meta!(ResourceSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct ResourceComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
     pub watchfaces: Vec<protocol::WatchFaceItem>,
     pub quick_apps: Vec<protocol::AppItem>,

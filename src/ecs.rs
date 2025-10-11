@@ -1,6 +1,7 @@
 pub mod component;
 pub mod entity;
 pub mod fastlane;
+pub mod graph;
 pub mod logic_component;
 pub mod runtime;
 pub mod system;

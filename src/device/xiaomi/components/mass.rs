@@ -26,7 +26,7 @@ use crate::ecs::logic_component::LogicCompMeta;
 use crate::ecs::system::SysMeta;
 use crate::{impl_has_sys_meta, impl_logic_component};
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct ResumeState {
     device_addr: String,
     mass_id: Vec<u8>,
@@ -106,8 +106,11 @@ impl L2PbExt for MassSystem {
 
 impl_has_sys_meta!(MassSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct MassComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
+    #[serde(skip_serializing)]
     prepare_wait: Option<oneshot::Sender<protocol::PrepareResponse>>, // 等 Prepare 回包的单次通道
     resume_state: Option<ResumeState>, // 断点续传需要的“我现在传到哪了”
 }

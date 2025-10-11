@@ -1,4 +1,5 @@
 use crate::ecs::component::Component;
+use erased_serde::serialize_trait_object;
 use std::any::{Any, type_name};
 use std::collections::HashMap;
 
@@ -17,7 +18,7 @@ pub enum LookupError {
     },
 }
 
-pub trait Entity: Any {
+pub trait Entity: Any + erased_serde::Serialize {
     fn id(&self) -> &str;
     fn components(&mut self) -> &mut Vec<Box<dyn Component>>;
 
@@ -81,12 +82,14 @@ pub trait EntityExt: Entity {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct EntityMeta {
     pub id: String,
+    #[serde(skip_serializing)]
     pub components: Vec<Box<dyn Component>>,
     // 组件索引：id -> 下标 保持与components一致，便于O(1)索引
     // 用于针对ESP32等神笔低性能设备进行优化
+    #[serde(skip_serializing)]
     pub comp_index: HashMap<String, usize>,
 }
 
@@ -97,7 +100,7 @@ pub trait HasEntityMeta {
 
 impl<T> Entity for T
 where
-    T: Any + HasEntityMeta + 'static,
+    T: Any + HasEntityMeta + erased_serde::Serialize + 'static,
 {
     fn id(&self) -> &str {
         self.meta().id.as_str()
@@ -215,3 +218,5 @@ macro_rules! impl_has_entity_meta {
 }
 
 impl<E: Entity + ?Sized> EntityExt for E {}
+
+serialize_trait_object!(Entity);

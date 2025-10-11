@@ -13,7 +13,7 @@ pub trait System {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SysMeta {
     pub id: String,
     pub owner: Option<String>,

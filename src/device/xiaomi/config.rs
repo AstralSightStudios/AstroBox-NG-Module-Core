@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TransportConfig {
     pub chunk_size_spp: usize,
     pub chunk_size_ble: usize,
@@ -13,7 +13,7 @@ impl Default for TransportConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SarConfig {
     pub tx_win_overrun_allowance: u8,
 }
@@ -26,7 +26,7 @@ impl Default for SarConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MassConfig {
     pub ack_wait_timeout_secs: u64,
     pub ack_poll_interval_ms: u64,
@@ -55,7 +55,7 @@ impl Default for MassConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ResConfig {
     pub watchface_id_offset: usize,
     pub watchface_id_field_len: usize,
@@ -70,7 +70,7 @@ impl Default for ResConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct XiaomiDeviceConfig {
     pub transport: TransportConfig,
     pub sar: SarConfig,

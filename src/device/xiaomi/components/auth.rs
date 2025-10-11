@@ -117,7 +117,9 @@ impl L2PbExt for AuthSystem {
 
 impl_has_sys_meta!(AuthSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct AuthComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
     pub authkey: String,
     pub is_authed: bool,

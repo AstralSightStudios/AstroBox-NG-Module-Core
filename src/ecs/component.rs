@@ -1,8 +1,9 @@
 use std::any::Any;
 
 use crate::ecs::logic_component::LogicComponent;
+use erased_serde::serialize_trait_object;
 
-pub trait Component {
+pub trait Component: erased_serde::Serialize {
     fn id(&self) -> &str;
 
     fn as_any(&self) -> &dyn Any;
@@ -18,7 +19,7 @@ pub trait Component {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct CompMeta {
     pub id: String,
     pub owner: Option<String>,
@@ -42,6 +43,8 @@ macro_rules! impl_has_comp_meta {
         }
     };
 }
+
+serialize_trait_object!(Component);
 
 #[macro_export]
 macro_rules! impl_component {

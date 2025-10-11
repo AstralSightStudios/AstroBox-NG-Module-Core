@@ -151,12 +151,15 @@ impl L2PbExt for InfoSystem {
 
 impl_has_sys_meta!(InfoSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct StorageInfo {
     pub total: u64,
     pub free: u64,
 }
 
+#[derive(serde::Serialize)]
 pub struct InfoComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
     //codename: String,
     model: String,

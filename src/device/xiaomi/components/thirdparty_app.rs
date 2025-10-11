@@ -98,7 +98,9 @@ impl L2PbExt for ThirdpartyAppSystem {
 
 impl_has_sys_meta!(ThirdpartyAppSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct ThirdpartyAppComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
 }
 

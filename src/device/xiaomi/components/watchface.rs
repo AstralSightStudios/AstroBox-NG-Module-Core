@@ -58,7 +58,9 @@ impl L2PbExt for WatchfaceSystem {
 
 impl_has_sys_meta!(WatchfaceSystem, meta);
 
+#[derive(serde::Serialize)]
 pub struct WatchfaceComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
 }
 

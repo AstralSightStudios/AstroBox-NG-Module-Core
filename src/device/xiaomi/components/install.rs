@@ -362,8 +362,11 @@ fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Res
     }
 }
 
+#[derive(serde::Serialize)]
 pub struct InstallComponent {
+    #[serde(skip_serializing)]
     meta: LogicCompMeta,
+    #[serde(skip_serializing)]
     waiters: Option<InstallWaiters>,
 }
 

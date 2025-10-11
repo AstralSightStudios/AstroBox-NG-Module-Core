@@ -6,8 +6,10 @@ pub trait LogicComponent: Component {
     fn system_mut(&mut self) -> &mut dyn System;
 }
 
+#[derive(serde::Serialize)]
 pub struct LogicCompMeta {
     pub data: CompMeta,
+    #[serde(skip_serializing)]
     pub system: Box<dyn System>,
 }
 

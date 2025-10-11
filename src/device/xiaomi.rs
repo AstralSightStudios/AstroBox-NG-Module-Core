@@ -34,14 +34,18 @@ pub enum SendError {
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>;
 type SendFn = Arc<dyn Fn(Vec<u8>) -> SendFuture + Send + Sync>;
 
+#[derive(serde::Serialize)]
 pub struct XiaomiDevice {
+    #[serde(skip_serializing)]
     meta: EntityMeta,
     pub name: String,
     pub addr: String,
     pub sar_version: u32,
     pub connect_type: ConnectType,
     pub force_android: bool,
+    #[serde(skip_serializing)]
     sender: SendFn,
+    #[serde(skip_serializing)]
     pub sar: sar::SarController,
     pub config: XiaomiDeviceConfig,
 }
