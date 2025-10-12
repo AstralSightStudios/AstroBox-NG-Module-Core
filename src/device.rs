@@ -73,7 +73,8 @@ where
     .await?;
 
     if let Some(rx) = auth_rx {
-        rx.await.context("Auth await response not received")?;
+        let auth_result = rx.await.context("Auth await response not received")?;
+        auth_result?;
     }
 
     Ok(DeviceConnectionInfo {

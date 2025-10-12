@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
@@ -49,13 +50,17 @@ impl ResourceSystem {
         .await
     }
 
-    pub fn request_watchface_list(&mut self) -> oneshot::Receiver<Vec<protocol::WatchFaceItem>> {
+    pub fn request_watchface_list(
+        &mut self,
+    ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::WatchFaceItem>>> {
         let rx = self.watchface_wait.prepare();
         self.enqueue_request(build_watchface_get_installed());
         rx
     }
 
-    pub fn request_quick_app_list(&mut self) -> oneshot::Receiver<Vec<protocol::AppItem>> {
+    pub fn request_quick_app_list(
+        &mut self,
+    ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::AppItem>>> {
         let rx = self.quick_app_wait.prepare();
         self.enqueue_request(build_thirdparty_app_get_installed());
         rx
@@ -74,21 +79,38 @@ impl L2PbExt for ResourceSystem {
                     return;
                 }
 
-                if let Some(protocol::watch_face::Payload::WatchFaceList(list)) = watch_face.payload
-                {
-                    let items = list.list.clone();
-                    let comp_items = items.clone();
-                    let this: &mut dyn System = self;
-                    FastLane::with_component_mut::<ResourceComponent, (), _>(
-                        this,
-                        ResourceComponent::ID,
-                        move |comp| {
-                            comp.watchfaces = comp_items;
-                        },
-                    )
-                    .unwrap();
+                match watch_face.payload {
+                    Some(protocol::watch_face::Payload::WatchFaceList(list)) => {
+                        let items = list.list.clone();
+                        let comp_items = items.clone();
+                        let this: &mut dyn System = self;
+                        let update_res = FastLane::with_component_mut::<ResourceComponent, (), _>(
+                            this,
+                            ResourceComponent::ID,
+                            move |comp| {
+                                comp.watchfaces = comp_items;
+                            },
+                        );
 
-                    self.watchface_wait.fulfill(items);
+                        match update_res {
+                            Ok(_) => self.watchface_wait.fulfill(items),
+                            Err(err) => {
+                                let anyhow_err = anyhow!(
+                                    "failed to update watchface list in component: {err:?}"
+                                );
+                                log::error!("{anyhow_err:?}");
+                                self.watchface_wait.fail(anyhow_err);
+                            }
+                        }
+                    }
+                    unexpected => {
+                        let anyhow_err = anyhow!(
+                            "unexpected watchface payload for installed list: {:?}",
+                            unexpected
+                        );
+                        log::warn!("{anyhow_err:?}");
+                        self.watchface_wait.fail(anyhow_err);
+                    }
                 }
             }
             Some(protocol::wear_packet::Payload::ThirdpartyApp(thirdparty_app)) => {
@@ -97,22 +119,38 @@ impl L2PbExt for ResourceSystem {
                     return;
                 }
 
-                if let Some(protocol::thirdparty_app::Payload::AppItemList(list)) =
-                    thirdparty_app.payload
-                {
-                    let items = list.list.clone();
-                    let comp_items = items.clone();
-                    let this: &mut dyn System = self;
-                    FastLane::with_component_mut::<ResourceComponent, (), _>(
-                        this,
-                        ResourceComponent::ID,
-                        move |comp| {
-                            comp.quick_apps = comp_items;
-                        },
-                    )
-                    .unwrap();
+                match thirdparty_app.payload {
+                    Some(protocol::thirdparty_app::Payload::AppItemList(list)) => {
+                        let items = list.list.clone();
+                        let comp_items = items.clone();
+                        let this: &mut dyn System = self;
+                        let update_res = FastLane::with_component_mut::<ResourceComponent, (), _>(
+                            this,
+                            ResourceComponent::ID,
+                            move |comp| {
+                                comp.quick_apps = comp_items;
+                            },
+                        );
 
-                    self.quick_app_wait.fulfill(items);
+                        match update_res {
+                            Ok(_) => self.quick_app_wait.fulfill(items),
+                            Err(err) => {
+                                let anyhow_err = anyhow!(
+                                    "failed to update quick app list in component: {err:?}"
+                                );
+                                log::error!("{anyhow_err:?}");
+                                self.quick_app_wait.fail(anyhow_err);
+                            }
+                        }
+                    }
+                    unexpected => {
+                        let anyhow_err = anyhow!(
+                            "unexpected third-party app payload for installed list: {:?}",
+                            unexpected
+                        );
+                        log::warn!("{anyhow_err:?}");
+                        self.quick_app_wait.fail(anyhow_err);
+                    }
                 }
             }
             _ => {}

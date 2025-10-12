@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use pb::xiaomi::protocol;
 use tokio::sync::oneshot;
 
@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub struct RequestSlot<T> {
-    waiter: Option<oneshot::Sender<T>>,
+    waiter: Option<oneshot::Sender<Result<T>>>,
 }
 
 impl<T> RequestSlot<T> {
@@ -16,25 +16,38 @@ impl<T> RequestSlot<T> {
         Self { waiter: None }
     }
 
-    pub fn prepare(&mut self) -> oneshot::Receiver<T> {
+    pub fn prepare(&mut self) -> oneshot::Receiver<Result<T>> {
         let (tx, rx) = oneshot::channel();
         self.waiter = Some(tx);
         rx
     }
 
     pub fn fulfill(&mut self, value: T) {
+        self.fulfill_result(Ok(value));
+    }
+
+    pub fn fail(&mut self, err: anyhow::Error) {
+        self.fulfill_result(Err(err));
+    }
+
+    fn fulfill_result(&mut self, result: Result<T>) {
         if let Some(tx) = self.waiter.take() {
-            let _ = tx.send(value);
+            if tx.send(result).is_err() {
+                log::debug!("request slot receiver dropped before fulfillment");
+            }
         }
     }
 }
 
-pub async fn await_response<T>(rx: oneshot::Receiver<T>, err_ctx: &'static str) -> anyhow::Result<T>
+pub async fn await_response<T>(
+    rx: oneshot::Receiver<Result<T>>,
+    err_ctx: &'static str,
+) -> anyhow::Result<T>
 where
     T: Send + 'static,
 {
     let resp = rx.await.context(err_ctx)?;
-    Ok(resp)
+    resp
 }
 
 pub trait SystemRequestExt {

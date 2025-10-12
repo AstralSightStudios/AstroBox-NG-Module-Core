@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use pb::xiaomi::protocol::{self, DeviceInfo, DeviceStatus, device_status::Battery};
 use tokio::sync::oneshot;
 
@@ -57,7 +58,7 @@ impl InfoSystem {
         .await
     }
 
-    pub fn request_device_info(&mut self) -> oneshot::Receiver<DeviceInfo> {
+    pub fn request_device_info(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceInfo>> {
         let rx = self.device_info_wait.prepare();
         self.enqueue_request(Self::build_system_packet(
             protocol::system::SystemId::GetDeviceInfo,
@@ -65,7 +66,7 @@ impl InfoSystem {
         rx
     }
 
-    pub fn request_device_status(&mut self) -> oneshot::Receiver<DeviceStatus> {
+    pub fn request_device_status(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceStatus>> {
         let rx = self.device_status_wait.prepare();
         self.enqueue_request(Self::build_system_packet(
             protocol::system::SystemId::GetDeviceStatus,
@@ -73,7 +74,9 @@ impl InfoSystem {
         rx
     }
 
-    pub fn request_device_storage(&mut self) -> oneshot::Receiver<protocol::StorageInfo> {
+    pub fn request_device_storage(
+        &mut self,
+    ) -> oneshot::Receiver<anyhow::Result<protocol::StorageInfo>> {
         let rx = self.device_storage_wait.prepare();
         self.enqueue_request(Self::build_system_packet(
             protocol::system::SystemId::GetStorageInfo,
@@ -102,45 +105,74 @@ impl L2PbExt for InfoSystem {
             if let Some(sys_payload) = sys.payload {
                 match sys_payload {
                     pb::xiaomi::protocol::system::Payload::DeviceInfo(dev_info) => {
-                        let dev_info_cl = dev_info.clone();
-                        FastLane::with_component_mut::<InfoComponent, (), _>(
+                        let dev_info_for_slot = dev_info.clone();
+                        let model = dev_info.model.clone();
+                        let serial_number = dev_info.serial_number.clone();
+                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
                             this,
                             InfoComponent::ID,
                             move |comp| {
-                                comp.model = dev_info.model;
-                                comp.sn = dev_info.serial_number;
+                                comp.model = model;
+                                comp.sn = serial_number;
                             },
-                        )
-                        .unwrap();
+                        );
 
-                        self.device_info_wait.fulfill(dev_info_cl)
+                        match update_res {
+                            Ok(_) => self.device_info_wait.fulfill(dev_info_for_slot),
+                            Err(err) => {
+                                let anyhow_err = anyhow!(
+                                    "failed to update info component with device info: {err:?}"
+                                );
+                                log::error!("{anyhow_err:?}");
+                                self.device_info_wait.fail(anyhow_err);
+                            }
+                        }
                     }
                     pb::xiaomi::protocol::system::Payload::DeviceStatus(dev_status) => {
-                        let dev_status_cl = dev_status.clone();
-                        FastLane::with_component_mut::<InfoComponent, (), _>(
+                        let dev_status_for_slot = dev_status.clone();
+                        let battery = dev_status.battery;
+                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
                             this,
                             InfoComponent::ID,
                             move |comp| {
-                                comp.battery = Some(dev_status.battery);
+                                comp.battery = Some(battery);
                             },
-                        )
-                        .unwrap();
+                        );
 
-                        self.device_status_wait.fulfill(dev_status_cl)
+                        match update_res {
+                            Ok(_) => self.device_status_wait.fulfill(dev_status_for_slot),
+                            Err(err) => {
+                                let anyhow_err = anyhow!(
+                                    "failed to update info component with device status: {err:?}"
+                                );
+                                log::error!("{anyhow_err:?}");
+                                self.device_status_wait.fail(anyhow_err);
+                            }
+                        }
                     }
                     pb::xiaomi::protocol::system::Payload::StorageInfo(storage) => {
-                        let dev_storage_cl = storage.clone();
-                        FastLane::with_component_mut::<InfoComponent, (), _>(
+                        let storage_for_slot = storage.clone();
+                        let total = storage.total;
+                        let used = storage.used;
+                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
                             this,
                             InfoComponent::ID,
                             move |comp| {
-                                comp.storage.free = storage.total - storage.used;
-                                comp.storage.total = storage.total;
+                                comp.storage.free = total - used;
+                                comp.storage.total = total;
                             },
-                        )
-                        .unwrap();
+                        );
 
-                        self.device_storage_wait.fulfill(dev_storage_cl)
+                        match update_res {
+                            Ok(_) => self.device_storage_wait.fulfill(storage_for_slot),
+                            Err(err) => {
+                                let anyhow_err = anyhow!(
+                                    "failed to update info component with storage info: {err:?}"
+                                );
+                                log::error!("{anyhow_err:?}");
+                                self.device_storage_wait.fail(anyhow_err);
+                            }
+                        }
                     }
                     _ => {}
                 }

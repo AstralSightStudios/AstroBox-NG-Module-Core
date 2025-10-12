@@ -1,12 +1,13 @@
 use crate::crypto::aesccm::aes128_ccm_encrypt;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
+use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::fastlane::FastLane;
+use crate::ecs::entity::LookupError;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use hmac::{Hmac, Mac};
 use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
@@ -15,7 +16,7 @@ use tokio::sync::oneshot;
 
 pub struct AuthSystem {
     meta: SysMeta,
-    auth_wait: Option<oneshot::Sender<()>>,
+    auth_wait: Option<oneshot::Sender<anyhow::Result<()>>>,
 }
 
 impl Default for AuthSystem {
@@ -29,7 +30,13 @@ impl Default for AuthSystem {
 }
 
 impl AuthSystem {
-    pub fn prepare_auth(&mut self) -> anyhow::Result<oneshot::Receiver<()>> {
+    pub fn prepare_auth(
+        &mut self,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
+        if self.auth_wait.is_some() {
+            bail!("auth flow already in progress");
+        }
+
         let nonce = crate::tools::generate_random_bytes(16);
 
         let this: &mut dyn System = self;
@@ -41,17 +48,25 @@ impl AuthSystem {
                 comp.random_bytes = nonce_clone;
             },
         )
-        .unwrap();
+        .map_err(|err| anyhow!("failed to update auth component nonce: {err:?}"))?;
 
         FastLane::with_entity_mut::<(), _>(this, move |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
+            let entity_id = ent.id().to_string();
+            let dev = ent
+                .as_any_mut()
+                .downcast_mut::<XiaomiDevice>()
+                .ok_or_else(|| LookupError::TypeMismatch {
+                    id: entity_id,
+                    expected: std::any::type_name::<XiaomiDevice>(),
+                    actual: std::any::type_name::<dyn crate::ecs::entity::Entity>(),
+                })?;
             dev.sar
                 .enqueue(L2Packet::pb_write(build_auth_step_1(&nonce)).to_bytes());
             Ok(())
         })
-        .unwrap();
+        .map_err(|err| anyhow!("failed to send auth step 1 packet: {err:?}"))?;
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
         self.auth_wait = Some(tx);
 
         Ok(rx)
@@ -59,8 +74,8 @@ impl AuthSystem {
 
     pub async fn start_auth(&mut self) -> anyhow::Result<()> {
         let rx = self.prepare_auth()?;
-        rx.await.context("Auth await response not received")?;
-        Ok(())
+        let result = rx.await.context("Auth await response not received")?;
+        result
     }
 }
 
@@ -77,32 +92,81 @@ impl L2PbExt for AuthSystem {
                             pb::xiaomi::protocol::account::Payload::AuthDeviceVerify(
                                 verify_pkt,
                             ) => {
-                                if let Ok(verify_ret) = build_auth_step_2(this, &verify_pkt) {
-                                    FastLane::with_entity_mut::<(), _>(this, move |ent| {
-                                        let dev = ent
-                                            .as_any_mut()
-                                            .downcast_mut::<XiaomiDevice>()
-                                            .unwrap();
+                                match build_auth_step_2(this, &verify_pkt) {
+                                    Ok(verify_ret) => {
+                                        if let Err(err) = FastLane::with_entity_mut::<(), _>(
+                                            this,
+                                            move |ent| {
+                                                let entity_id = ent.id().to_string();
+                                                let dev = ent
+                                                    .as_any_mut()
+                                                    .downcast_mut::<XiaomiDevice>()
+                                                    .ok_or_else(|| LookupError::TypeMismatch {
+                                                        id: entity_id,
+                                                        expected: std::any::type_name::<XiaomiDevice>(),
+                                                        actual: std::any::type_name::<
+                                                            dyn crate::ecs::entity::Entity,
+                                                        >(),
+                                                    })?;
 
-                                        dev.sar.enqueue(L2Packet::pb_write(verify_ret).to_bytes());
+                                                dev.sar.enqueue(
+                                                    L2Packet::pb_write(verify_ret).to_bytes(),
+                                                );
 
-                                        Ok(())
-                                    })
-                                    .unwrap();
+                                                Ok(())
+                                            },
+                                        )
+                                        {
+                                            let anyhow_err = anyhow!(
+                                                "failed to enqueue auth confirm packet: {err:?}"
+                                            );
+                                            log::error!("{anyhow_err:?}");
+                                            if let Some(waiter) = self.auth_wait.take() {
+                                                let _ = waiter.send(Err(anyhow_err));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log::warn!("Auth device verify failed: {err:?}");
+                                        if let Some(waiter) = self.auth_wait.take() {
+                                            let _ = waiter.send(Err(err));
+                                        }
+                                    }
                                 }
                             }
                             pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_dc) => {
-                                FastLane::with_component_mut::<AuthComponent, (), _>(
+                                let update_res = FastLane::with_component_mut::<AuthComponent, (), _>(
                                     this,
                                     AuthComponent::ID,
                                     |comp| {
                                         comp.is_authed = true;
                                     },
-                                )
-                                .unwrap();
+                                );
 
-                                if let Some(aw_sender) = self.auth_wait.take() {
-                                    let _ = aw_sender.send(());
+                                match update_res {
+                                    Ok(_) => {
+                                        if let Some(aw_sender) = self.auth_wait.take() {
+                                            if let Err(err) = aw_sender.send(Ok(())) {
+                                                log::debug!(
+                                                    "Auth completion receiver dropped before delivery: {:?}",
+                                                    err
+                                                );
+                                            }
+                                        } else {
+                                            log::debug!(
+                                                "AuthDeviceConfirm received but no pending waiter present"
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let anyhow_err = anyhow!(
+                                            "failed to mark auth component as authed: {err:?}"
+                                        );
+                                        log::error!("{anyhow_err:?}");
+                                        if let Some(waiter) = self.auth_wait.take() {
+                                            let _ = waiter.send(Err(anyhow_err));
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -222,7 +286,7 @@ fn build_auth_step_2(
     mac.update(&p_random_vec);
     let expect = mac.finalize().into_bytes();
     if w_sign.as_slice() != expect.as_slice() {
-        return Err(anyhow!("Auth HMAC mismatch - wrong auth key?"));
+        return Err(anyhow!("Auth HMAC mismatch, This usually means your AuthKey is wrong."));
     }
 
     // encryptedSigns (HMAC) ---
