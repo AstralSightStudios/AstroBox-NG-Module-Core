@@ -1,5 +1,6 @@
 use crate::crypto::aesccm::aes128_ccm_encrypt;
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
+use crate::device::xiaomi::r#type::ConnectType;
 use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::fastlane::FastLane;
@@ -253,9 +254,9 @@ fn build_auth_step_2(
         })
         .unwrap();
 
-    let force_android = FastLane::with_entity_mut::<bool, _>(this, |ent| {
+    let (force_android, connect_type) = FastLane::with_entity_mut::<(bool, crate::device::xiaomi::ConnectType), _>(this, |ent| {
         let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-        Ok(dev.force_android.clone())
+        Ok((dev.force_android.clone(), dev.connect_type.clone()))
     })
     .unwrap();
 
@@ -297,7 +298,7 @@ fn build_auth_step_2(
 
     // 设备类型
     let mut device_type = pb::xiaomi::protocol::companion_device::DeviceType::Android as i32;
-    if cfg!(target_os = "ios") && !force_android {
+    if connect_type == ConnectType::BLE && !force_android {
         device_type = pb::xiaomi::protocol::companion_device::DeviceType::Ios as i32;
     }
 
