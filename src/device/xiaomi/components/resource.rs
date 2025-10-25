@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
@@ -13,6 +12,7 @@ use crate::{
 };
 
 use super::shared::{RequestSlot, SystemRequestExt, await_response};
+use crate::anyhow_site;
 
 pub struct ResourceSystem {
     meta: SysMeta,
@@ -95,7 +95,7 @@ impl L2PbExt for ResourceSystem {
                         match update_res {
                             Ok(_) => self.watchface_wait.fulfill(items),
                             Err(err) => {
-                                let anyhow_err = anyhow!(
+                                let anyhow_err = anyhow_site!(
                                     "failed to update watchface list in component: {err:?}"
                                 );
                                 log::error!("{anyhow_err:?}");
@@ -104,7 +104,7 @@ impl L2PbExt for ResourceSystem {
                         }
                     }
                     unexpected => {
-                        let anyhow_err = anyhow!(
+                        let anyhow_err = anyhow_site!(
                             "unexpected watchface payload for installed list: {:?}",
                             unexpected
                         );
@@ -135,7 +135,7 @@ impl L2PbExt for ResourceSystem {
                         match update_res {
                             Ok(_) => self.quick_app_wait.fulfill(items),
                             Err(err) => {
-                                let anyhow_err = anyhow!(
+                                let anyhow_err = anyhow_site!(
                                     "failed to update quick app list in component: {err:?}"
                                 );
                                 log::error!("{anyhow_err:?}");
@@ -144,7 +144,7 @@ impl L2PbExt for ResourceSystem {
                         }
                     }
                     unexpected => {
-                        let anyhow_err = anyhow!(
+                        let anyhow_err = anyhow_site!(
                             "unexpected third-party app payload for installed list: {:?}",
                             unexpected
                         );

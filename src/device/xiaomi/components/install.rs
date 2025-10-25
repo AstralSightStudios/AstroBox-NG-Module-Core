@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
+use crate::{anyhow_site, bail_site};
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
@@ -88,7 +89,7 @@ impl InstallSystem {
             InstallComponent::ID,
             move |comp| -> Result<()> {
                 if comp.waiters.is_some() {
-                    bail!("install request is already in progress");
+                    bail_site!("install request is already in progress");
                 }
                 comp.waiters = Some(InstallWaiters {
                     data_type: r#type,
@@ -98,7 +99,7 @@ impl InstallSystem {
                 Ok(())
             },
         )
-        .map_err(|err| anyhow!("failed to access install component: {:?}", err))??;
+        .map_err(|err| anyhow_site!("failed to access install component: {:?}", err))??;
 
         let req_result: Result<WearPacket> = (|| {
             Ok(match r#type {
@@ -107,7 +108,7 @@ impl InstallSystem {
                         let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
                         Ok(dev.config.res.clone())
                     })
-                    .map_err(|err| anyhow!("failed to access resource config: {:?}", err))?;
+                    .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
                     let id = resutils::get_watchface_id(&file_data, &res_config)
                         .context("invalid watchface id")?;
                     build_watchface_install_request(&id, file_data.len())
@@ -150,7 +151,7 @@ impl InstallSystem {
         }) {
             let owner_for_cleanup = owner.clone();
             universal_block_on(|| clear_install_waiters(owner_for_cleanup.clone()));
-            return Err(anyhow!("failed to enqueue install request: {:?}", err));
+            return Err(anyhow_site!("failed to enqueue install request: {:?}", err));
         }
 
         let owner_for_future = owner.clone();
@@ -160,13 +161,13 @@ impl InstallSystem {
             let result = async {
                 let prepare_status = prepare_rx
                     .await
-                    .map_err(|_| anyhow!("prepare response channel closed unexpectedly"))?;
+                    .map_err(|_| anyhow_site!("prepare response channel closed unexpectedly"))?;
 
                 let prepare_enum = protocol::PrepareStatus::try_from(prepare_status)
-                    .map_err(|_| anyhow!("unknown prepare status: {prepare_status}"))?;
+                    .map_err(|_| anyhow_site!("unknown prepare status: {prepare_status}"))?;
 
                 if prepare_enum != protocol::PrepareStatus::Ready {
-                    bail!("install prepare failed with status: {:?}", prepare_enum);
+                    bail_site!("install prepare failed with status: {:?}", prepare_enum);
                 }
 
                 send_file_for_owner(owner_for_future.clone(), file_data, r#type, move |d| {
@@ -178,7 +179,7 @@ impl InstallSystem {
                 if let Some(result_rx) = result_rx_opt {
                     let event = result_rx
                         .await
-                        .map_err(|_| anyhow!("install result message missing"))?;
+                        .map_err(|_| anyhow_site!("install result message missing"))?;
                     handle_install_result(r#type, event)?;
                     if r#type == MassDataType::ThirdPartyApp {
                         refresh_quick_app_list(owner_for_future.clone()).await;
@@ -321,35 +322,35 @@ fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Res
         (MassDataType::ThirdPartyApp, InstallResultEvent::ThirdpartyApp(result)) => {
             use protocol::app_installer::result::Code;
             let code = Code::try_from(result.code)
-                .map_err(|_| anyhow!("unknown third-party install code: {}", result.code))?;
+                .map_err(|_| anyhow_site!("unknown third-party install code: {}", result.code))?;
             match code {
                 Code::InstallSuccess => Ok(()),
                 Code::InstallFailed | Code::VerifyFailed => {
-                    bail!("third-party app install failed: {:?}", code)
+                    bail_site!("third-party app install failed: {:?}", code)
                 }
             }
         }
         (MassDataType::Watchface, InstallResultEvent::Watchface(result)) => {
             use protocol::install_result::Code;
             let code = Code::try_from(result.code)
-                .map_err(|_| anyhow!("unknown watchface install code: {}", result.code))?;
+                .map_err(|_| anyhow_site!("unknown watchface install code: {}", result.code))?;
             match code {
                 Code::InstallSuccess | Code::InstallUsed => Ok(()),
                 Code::InstallFailed | Code::VerifyFailed => {
-                    bail!("watchface install failed: {:?}", code)
+                    bail_site!("watchface install failed: {:?}", code)
                 }
             }
         }
         (MassDataType::Firmare, InstallResultEvent::Firmware(resp)) => {
             let status = protocol::PrepareStatus::try_from(resp.prepare_status)
-                .map_err(|_| anyhow!("unknown firmware prepare status: {}", resp.prepare_status))?;
+                .map_err(|_| anyhow_site!("unknown firmware prepare status: {}", resp.prepare_status))?;
             if status != protocol::PrepareStatus::Ready {
-                bail!("firmware install reported status: {:?}", status);
+                bail_site!("firmware install reported status: {:?}", status);
             }
             Ok(())
         }
         (unexpected_type, unexpected_event) => {
-            bail!(
+            bail_site!(
                 "mismatched install result (type={} event={})",
                 u8::from(unexpected_type),
                 match unexpected_event {

@@ -1,4 +1,5 @@
 use crate::crypto::aesccm::aes128_ccm_encrypt;
+use crate::{anyhow_site, bail_site};
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
 use crate::device::xiaomi::r#type::ConnectType;
 use crate::device::xiaomi::XiaomiDevice;
@@ -8,7 +9,7 @@ use crate::ecs::entity::LookupError;
 use crate::ecs::system::{SysMeta, System};
 use crate::impl_has_sys_meta;
 use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};
-use anyhow::{Context, anyhow, bail};
+use anyhow::Context;
 use hmac::{Hmac, Mac};
 use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
@@ -35,7 +36,7 @@ impl AuthSystem {
         &mut self,
     ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
         if self.auth_wait.is_some() {
-            bail!("auth flow already in progress");
+            bail_site!("auth flow already in progress");
         }
 
         let nonce = crate::tools::generate_random_bytes(16);
@@ -49,7 +50,7 @@ impl AuthSystem {
                 comp.random_bytes = nonce_clone;
             },
         )
-        .map_err(|err| anyhow!("failed to update auth component nonce: {err:?}"))?;
+        .map_err(|err| anyhow_site!("failed to update auth component nonce: {err:?}"))?;
 
         FastLane::with_entity_mut::<(), _>(this, move |ent| {
             let entity_id = ent.id().to_string();
@@ -65,7 +66,7 @@ impl AuthSystem {
                 .enqueue(L2Packet::pb_write(build_auth_step_1(&nonce)).to_bytes());
             Ok(())
         })
-        .map_err(|err| anyhow!("failed to send auth step 1 packet: {err:?}"))?;
+        .map_err(|err| anyhow_site!("failed to send auth step 1 packet: {err:?}"))?;
 
         let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
         self.auth_wait = Some(tx);
@@ -118,7 +119,7 @@ impl L2PbExt for AuthSystem {
                                             },
                                         )
                                         {
-                                            let anyhow_err = anyhow!(
+                                            let anyhow_err = anyhow_site!(
                                                 "failed to enqueue auth confirm packet: {err:?}"
                                             );
                                             log::error!("{anyhow_err:?}");
@@ -160,7 +161,7 @@ impl L2PbExt for AuthSystem {
                                         }
                                     }
                                     Err(err) => {
-                                        let anyhow_err = anyhow!(
+                                        let anyhow_err = anyhow_site!(
                                             "failed to mark auth component as authed: {err:?}"
                                         );
                                         log::error!("{anyhow_err:?}");
@@ -245,7 +246,7 @@ fn build_auth_step_2(
     let w_sign = device_verify.device_sign.clone();
 
     if w_random.len() != 16 || w_sign.len() != 32 {
-        return Err(anyhow!("nonce/hmac length mismatch"));
+        return Err(anyhow_site!("nonce/hmac length mismatch"));
     }
 
     let authkey =
@@ -267,11 +268,11 @@ fn build_auth_step_2(
     )
     .unwrap();
     if p_random_vec.len() != 16 {
-        return Err(anyhow!("phone nonce length mismatch"));
+        return Err(anyhow_site!("phone nonce length mismatch"));
     }
 
     let block64 = kdf_miwear(
-        &string_to_u8_16(&authkey).ok_or_else(|| anyhow!("invalid authkey hex len"))?,
+        &string_to_u8_16(&authkey).ok_or_else(|| anyhow_site!("invalid authkey hex len"))?,
         (&p_random_vec[..]).try_into().unwrap(), // &[u8;16]
         (&w_random[..]).try_into().unwrap(),     // &[u8;16]
     );
@@ -287,7 +288,9 @@ fn build_auth_step_2(
     mac.update(&p_random_vec);
     let expect = mac.finalize().into_bytes();
     if w_sign.as_slice() != expect.as_slice() {
-        return Err(anyhow!("Auth HMAC mismatch, This usually means your AuthKey is wrong."));
+        return Err(anyhow_site!(
+            "Auth HMAC mismatch, This usually means your AuthKey is wrong."
+        ));
     }
 
     // encryptedSigns (HMAC) ---

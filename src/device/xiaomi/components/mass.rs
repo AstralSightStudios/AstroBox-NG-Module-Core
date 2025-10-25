@@ -1,5 +1,6 @@
 use crate::asyncrt::{Duration, sleep, timeout};
-use anyhow::{Context, Result, bail};
+use crate::bail_site;
+use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use pb::xiaomi::protocol;
 use serde::Serialize;
@@ -216,11 +217,11 @@ where
     // 3) 等设备回能力参数
     let prepare_resp = rx.await.context("Mass prepare response not received")?;
     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
-        bail!("Mass data prepare was not READY");
+        bail_site!("Mass data prepare was not READY");
     }
     let miwear_packet_body_max_len = prepare_resp.expected_slice_length() as usize;
     if miwear_packet_body_max_len == 0 {
-        bail!("Device reported expected_slice_length of 0, cannot proceed.");
+        bail_site!("Device reported expected_slice_length of 0, cannot proceed.");
     }
 
     // 4) 把文件包成 MASS 内部负载，并附带 CRC32（设备端用于校验）
@@ -231,7 +232,7 @@ where
     // 所以真正能放分片的空间要减去上面 1+1+2+2 的头部
     let mass_fragment_max_len = miwear_packet_body_max_len.saturating_sub(1 + 1 + 2 + 2);
     if mass_fragment_max_len == 0 {
-        bail!(
+        bail_site!(
             "Calculated mass_fragment_max_len is 0. Device limit ({}) is too small.",
             miwear_packet_body_max_len
         );
@@ -241,7 +242,7 @@ where
     let total_parts =
         (mass_inner_payload_with_crc32.len() as f32 / mass_fragment_max_len as f32).ceil() as u16;
     if total_parts == 0 && !mass_inner_payload_with_crc32.is_empty() {
-        bail!("Calculated total_parts is 0 for non-empty payload.");
+        bail_site!("Calculated total_parts is 0 for non-empty payload.");
     }
 
     log::info!(
@@ -429,7 +430,7 @@ async fn flush_mass_batch(
 
     let seqs = enqueue_mass_batch(owner_id, payloads).await?;
     if seqs.len() != meta_len {
-        bail!(
+        bail_site!(
             "enqueue_batch returned {} seqs but {} payloads were submitted",
             seqs.len(),
             meta_len
@@ -508,7 +509,7 @@ async fn enqueue_mass_batch(owner_id: &str, payloads: Vec<Vec<u8>>) -> Result<Ve
             if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
                 Ok(dev.sar.enqueue_batch(payloads))
             } else {
-                bail!("Device {} not found when enqueueing MASS batch", owner)
+                bail_site!("Device {} not found when enqueueing MASS batch", owner)
             }
         }
     })

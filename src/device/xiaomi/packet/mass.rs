@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
 use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
+use crate::anyhow_site;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -125,12 +126,12 @@ impl ReverseMassPacket {
 
         if packet.len() < 12 {
             self.error = true;
-            return Err(anyhow!("Invalid reverse mass packet"));
+            return Err(anyhow_site!("Invalid reverse mass packet"));
         }
 
         if packet[0] != 0 {
             self.error = true;
-            return Err(anyhow!("Invalid packet version"));
+            return Err(anyhow_site!("Invalid packet version"));
         }
 
         let total = u16::from_le_bytes(packet[2..4].try_into().unwrap());
@@ -147,7 +148,7 @@ impl ReverseMassPacket {
         } else {
             if total as u32 != self.total_part {
                 self.error = true;
-                return Err(anyhow!("Invalid total {} != {}", total, self.total_part));
+                return Err(anyhow_site!("Invalid total {} != {}", total, self.total_part));
             }
             skip_offset = 6;
         }
@@ -169,7 +170,7 @@ impl ReverseMassPacket {
                     to_hex_string(&check_data)
                 );
                 self.error = true;
-                return Err(anyhow!("Invalid crc32 {} != {}", crc32, data_crc32));
+                return Err(anyhow_site!("Invalid crc32 {} != {}", crc32, data_crc32));
             }
         } else {
             self.file.insert(cur as u32, packet[skip_offset..].to_vec());
@@ -186,7 +187,7 @@ impl ReverseMassPacket {
 
     pub fn file(&self, force: bool) -> Result<Vec<u8>> {
         if !self.complete() && !force {
-            return Err(anyhow!("complete != true"));
+            return Err(anyhow_site!("complete != true"));
         }
 
         let mut result: Vec<u8> = Vec::new();
@@ -194,7 +195,7 @@ impl ReverseMassPacket {
         for key in 1..=total {
             match self.file.get(&key) {
                 Some(vec) => result.extend_from_slice(vec),
-                None => return Err(anyhow!("block {} was not found!", key)),
+                None => return Err(anyhow_site!("block {} was not found!", key)),
             }
         }
         Ok(result)

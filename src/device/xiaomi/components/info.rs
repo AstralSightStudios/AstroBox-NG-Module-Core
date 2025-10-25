@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use pb::xiaomi::protocol::{self, DeviceInfo, DeviceStatus, device_status::Battery};
 use tokio::sync::oneshot;
 
@@ -13,6 +12,7 @@ use crate::{
 };
 
 use super::shared::{RequestSlot, SystemRequestExt, await_response};
+use crate::anyhow_site;
 
 pub struct InfoSystem {
     meta: SysMeta,
@@ -120,7 +120,7 @@ impl L2PbExt for InfoSystem {
                         match update_res {
                             Ok(_) => self.device_info_wait.fulfill(dev_info_for_slot),
                             Err(err) => {
-                                let anyhow_err = anyhow!(
+                                let anyhow_err = anyhow_site!(
                                     "failed to update info component with device info: {err:?}"
                                 );
                                 log::error!("{anyhow_err:?}");
@@ -142,7 +142,7 @@ impl L2PbExt for InfoSystem {
                         match update_res {
                             Ok(_) => self.device_status_wait.fulfill(dev_status_for_slot),
                             Err(err) => {
-                                let anyhow_err = anyhow!(
+                                let anyhow_err = anyhow_site!(
                                     "failed to update info component with device status: {err:?}"
                                 );
                                 log::error!("{anyhow_err:?}");
@@ -166,7 +166,7 @@ impl L2PbExt for InfoSystem {
                         match update_res {
                             Ok(_) => self.device_storage_wait.fulfill(storage_for_slot),
                             Err(err) => {
-                                let anyhow_err = anyhow!(
+                                let anyhow_err = anyhow_site!(
                                     "failed to update info component with storage info: {err:?}"
                                 );
                                 log::error!("{anyhow_err:?}");
