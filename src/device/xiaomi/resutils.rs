@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde_repr::Serialize_repr;
 
 use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
 
@@ -20,16 +20,17 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     Some(digits)
 }
 
-#[derive(Clone, Copy, Serialize, PartialEq)]
+#[derive(Clone, Copy, Serialize_repr, PartialEq)]
+#[repr(u8)]
 pub enum FileType {
-    WatchFace = MassDataType::Watchface as isize,
-    Firmware = MassDataType::Firmare as isize,
-    ThirdPartyApp = MassDataType::ThirdPartyApp as isize,
     Text,
     Zip,
     Binary,
     Null,
-    Abp,
+    Abp = 91,
+    WatchFace = MassDataType::Watchface as u8,
+    Firmware = MassDataType::Firmare as u8,
+    ThirdPartyApp = MassDataType::ThirdPartyApp as u8,
 }
 pub fn get_file_type(data: &[u8]) -> FileType {
     if data.is_empty() {
