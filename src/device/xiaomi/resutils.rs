@@ -31,7 +31,7 @@ pub enum FileType {
     Null,
     Abp,
 }
-pub fn get_file_type(data: &Vec<u8>) -> FileType {
+pub fn get_file_type(data: &[u8]) -> FileType {
     if data.is_empty() {
         return FileType::Null;
     }
@@ -57,7 +57,7 @@ pub fn get_file_type(data: &Vec<u8>) -> FileType {
     }
 
     // 2. 检查是不是文本（utf8）
-    if std::str::from_utf8(&data).is_ok() {
+    if std::str::from_utf8(data).is_ok() {
         return FileType::Text;
     }
 
