@@ -22,14 +22,14 @@ mod native {
         static RT_LOCAL_PTR: Cell<*mut Runtime> = Cell::new(ptr::null_mut());
     }
 
-    pub fn init_runtime_with<F>(make_rt: F)
+    fn init_runtime_internal<F>(make_rt: F, stack_size: Option<usize>)
     where
         F: FnOnce() -> Runtime + Send + 'static,
     {
         let (tx, rx) = flume::unbounded::<Job>();
         let _ = RT_TX.set(tx);
 
-        thread::spawn(move || {
+        let thread_job = move || {
             let mut rt = make_rt();
 
             IN_RT_THREAD.with(|flag| flag.set(true));
@@ -38,14 +38,51 @@ mod native {
             while let Ok(job) = rx.recv() {
                 job(&mut rt);
             }
-        });
+        };
+
+        let builder = thread::Builder::new().name("ecs-runtime".into());
+        let builder = if let Some(size) = stack_size {
+            builder.stack_size(size)
+        } else {
+            builder
+        };
+
+        builder
+            .spawn(thread_job)
+            .expect("Failed to spawn ECS runtime thread");
 
         log::info!("ECS Runtime initialization completed!");
+    }
+
+    pub fn init_runtime_with<F>(make_rt: F)
+    where
+        F: FnOnce() -> Runtime + Send + 'static,
+    {
+        init_runtime_internal(make_rt, None);
+    }
+
+    pub fn init_runtime_with_stack<F>(make_rt: F, stack_size: usize)
+    where
+        F: FnOnce() -> Runtime + Send + 'static,
+    {
+        log::info!(
+            "Initializing ECS with custom stack size ({} bytes)...",
+            stack_size
+        );
+        init_runtime_internal(make_rt, Some(stack_size));
     }
 
     pub fn init_runtime_default() {
         log::info!("Initializing ECS with default configuration...");
         init_runtime_with(Runtime::new);
+    }
+
+    pub fn init_runtime_default_with_stack(stack_size: usize) {
+        log::info!(
+            "Initializing ECS with default configuration and custom stack size ({} bytes)...",
+            stack_size
+        );
+        init_runtime_with_stack(Runtime::new, stack_size);
     }
 
     pub async fn with_rt_mut<F, R>(f: F) -> R
@@ -78,6 +115,8 @@ mod native {
         ret_rx.await.expect("runtime thread dropped the response")
     }
 }
+
+
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
