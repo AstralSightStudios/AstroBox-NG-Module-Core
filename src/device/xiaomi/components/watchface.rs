@@ -1,7 +1,7 @@
 use pb::xiaomi::protocol::{self, WearPacket};
 
 use crate::{
-    device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
+    device::xiaomi::system::{register_xiaomi_system_ext_on_l2packet, L2PbExt},
     ecs::{logic_component::LogicCompMeta, system::SysMeta},
     impl_has_sys_meta, impl_logic_component,
 };

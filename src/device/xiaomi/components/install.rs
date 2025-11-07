@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use crate::{anyhow_site, bail_site};
+use anyhow::{Context, Result};
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
@@ -142,7 +142,7 @@ impl InstallSystem {
 
         if let Err(err) = FastLane::with_entity_mut::<(), _>(this, move |ent| {
             let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            packet::enqueue_pb_packet(
+            packet::cipher::enqueue_pb_packet(
                 dev,
                 req,
                 "InstallSystem::send_install_request_with_progress",
@@ -342,8 +342,9 @@ fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Res
             }
         }
         (MassDataType::Firmare, InstallResultEvent::Firmware(resp)) => {
-            let status = protocol::PrepareStatus::try_from(resp.prepare_status)
-                .map_err(|_| anyhow_site!("unknown firmware prepare status: {}", resp.prepare_status))?;
+            let status = protocol::PrepareStatus::try_from(resp.prepare_status).map_err(|_| {
+                anyhow_site!("unknown firmware prepare status: {}", resp.prepare_status)
+            })?;
             if status != protocol::PrepareStatus::Ready {
                 bail_site!("firmware install reported status: {:?}", status);
             }

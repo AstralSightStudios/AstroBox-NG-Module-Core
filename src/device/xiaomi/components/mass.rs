@@ -199,7 +199,7 @@ where
         move |rt| {
             if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
                 let prepare_pkt = build_mass_prepare_request(data_type, &file_md5_clone, file_len);
-                packet::enqueue_pb_packet(
+                packet::cipher::enqueue_pb_packet(
                     dev,
                     prepare_pkt,
                     "MassSystem::send_file_for_owner.prepare",

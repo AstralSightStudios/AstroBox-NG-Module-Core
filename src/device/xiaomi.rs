@@ -40,9 +40,9 @@ pub struct XiaomiDevice {
     meta: EntityMeta,
     pub name: String,
     pub addr: String,
-    pub sar_version: u32,
-    pub connect_type: ConnectType,
-    pub force_android: bool,
+    pub sar_version: u32,          // SAR 协议版本，对应SPP v?
+    pub connect_type: ConnectType, // 连接类型，SPP or BLE
+    pub force_android: bool, // 安卓人安卓代码安卓生态安卓手表安卓设备安卓pb 在连接设备时强制使用ANDROID作为设备类型
     #[serde(skip_serializing)]
     sender: SendFn,
     #[serde(skip_serializing)]
@@ -66,7 +66,9 @@ impl XiaomiDevice {
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), SendError>> + Send + 'static,
     {
+        // 包装线程安全Sender
         let raw_sender: SendFn = Arc::new(move |data: Vec<u8>| Box::pin(sender(data)));
+        // 上锁防止串串包
         let send_lock = Arc::new(Mutex::new(()));
         let transport_config = config.transport.clone();
         let sender: SendFn = {
@@ -97,6 +99,7 @@ impl XiaomiDevice {
             })
         };
 
+        // 初始化Components
         let auth_comp = AuthComponent::new(authkey.clone());
         let install_comp = InstallComponent::new();
         let mass_comp = MassComponent::new();
@@ -105,7 +108,7 @@ impl XiaomiDevice {
         let resource_comp = ResourceComponent::new();
         let watchface_comp = WatchfaceComponent::new();
 
-        // 创建 SAR 控制器，并传入设备名以便定时任务访问
+        // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
             universal_block_on(|| async {
                 sender(crate::tools::hex_stream_to_bytes("badcfe00c00300000100ef").unwrap())
@@ -113,6 +116,8 @@ impl XiaomiDevice {
                     .unwrap();
             });
         }
+
+        // 创建 SAR 控制器，并传入设备名以便定时任务访问
         let sar =
             sar::SarController::new(tk_handle, sender.clone(), addr.clone(), config.sar.clone());
 
@@ -132,6 +137,7 @@ impl XiaomiDevice {
             config,
         };
 
+        // 挂载Components
         dev.add_component(Box::new(auth_comp));
         dev.add_component(Box::new(install_comp));
         dev.add_component(Box::new(mass_comp));

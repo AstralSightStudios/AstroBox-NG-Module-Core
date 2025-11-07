@@ -6,6 +6,7 @@ pub mod logic_component;
 pub mod runtime;
 pub mod system;
 
+// 非WASM平台支持多线程，采用默认初始化方式
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use crate::ecs::runtime::Runtime;
@@ -15,13 +16,16 @@ mod native {
 
     type Job = Box<dyn FnOnce(&mut Runtime) + Send + 'static>;
 
+    // ECS Runtime 闭包任务发端
     static RT_TX: OnceCell<flume::Sender<Job>> = OnceCell::new();
 
+    // 本地线程 ECS Runtime 指针数据，用于非跨线程状态下的零开销访问
     thread_local! {
         static IN_RT_THREAD: Cell<bool> = Cell::new(false);
         static RT_LOCAL_PTR: Cell<*mut Runtime> = Cell::new(ptr::null_mut());
     }
 
+    /// 使用指定的初始化方法和栈大小初始化 ECS Runtime
     fn init_runtime_internal<F>(make_rt: F, stack_size: Option<usize>)
     where
         F: FnOnce() -> Runtime + Send + 'static,
@@ -29,6 +33,7 @@ mod native {
         let (tx, rx) = flume::unbounded::<Job>();
         let _ = RT_TX.set(tx);
 
+        // 包装初始化任务
         let thread_job = move || {
             let mut rt = make_rt();
 
@@ -47,6 +52,7 @@ mod native {
             builder
         };
 
+        // 将初始化任务spawn到ECS线程中
         builder
             .spawn(thread_job)
             .expect("Failed to spawn ECS runtime thread");
@@ -85,11 +91,14 @@ mod native {
         init_runtime_with_stack(Runtime::new, stack_size);
     }
 
+    /// 将闭包任务扔到ECS线程中执行
     pub async fn with_rt_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Runtime) -> R + Send + 'static,
         R: Send + 'static,
     {
+        // 如果调用方是ECS线程，则直接从thread_local里拿rt
+        // 这样可以避免跨线程传递数据，减少性能开销
         let in_rt = IN_RT_THREAD.with(|flag| flag.get());
         if in_rt {
             return RT_LOCAL_PTR.with(|cell| {
@@ -99,6 +108,7 @@ mod native {
             });
         }
 
+        // 如果调用方不是ECS线程，则将闭包任务扔到ECS线程中执行
         let tx = RT_TX
             .get()
             .expect("RT not initialized. Call ecs::init_runtime_* first.")
@@ -116,11 +126,11 @@ mod native {
     }
 }
 
-
-
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 
+// WASM平台不支持多线程，采用特殊初始化方式，所有RT访问转接到thread_local
+// 由于WASM本身是单线程环境，该操作不会导致任何问题
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use crate::ecs::runtime::Runtime;

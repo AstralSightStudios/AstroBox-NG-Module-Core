@@ -1,3 +1,5 @@
+// asyncrt.rs: 为适配无多线程支持平台制作的条件编译兼容层
+
 pub use std::time::Duration;
 
 use std::future::Future;

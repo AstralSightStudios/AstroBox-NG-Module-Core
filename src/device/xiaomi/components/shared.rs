@@ -63,7 +63,7 @@ where
 
         FastLane::with_entity_mut::<(), _>(sys, move |ent| {
             let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            packet::enqueue_pb_packet(dev, packet, log_ctx);
+            packet::cipher::enqueue_pb_packet(dev, packet, log_ctx);
             Ok(())
         })
         .unwrap();

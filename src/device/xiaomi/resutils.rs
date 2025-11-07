@@ -27,6 +27,7 @@ pub enum FileType {
     Zip,
     Binary,
     Null,
+    // 又接暗广我服了。
     Abp = 91,
     WatchFace = MassDataType::Watchface as u8,
     Firmware = MassDataType::Firmare as u8,
