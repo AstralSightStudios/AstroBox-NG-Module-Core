@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::xiaomi::components::network::NetworkComponent;
 use crate::{
     asyncrt::universal_block_on,
     device::xiaomi::{
@@ -11,7 +13,7 @@ use crate::{
         config::XiaomiDeviceConfig,
         r#type::ConnectType,
     },
-    ecs::entity::{Entity, EntityMeta},
+    ecs::entity::{Entity, EntityExt, EntityMeta},
     impl_has_entity_meta,
 };
 use tokio::runtime::Handle;
@@ -107,6 +109,8 @@ impl XiaomiDevice {
         let thirdparty_comp = ThirdpartyAppComponent::new();
         let resource_comp = ResourceComponent::new();
         let watchface_comp = WatchfaceComponent::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let network_comp = NetworkComponent::new(config.network.clone());
 
         // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
@@ -118,8 +122,12 @@ impl XiaomiDevice {
         }
 
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
-        let sar =
-            sar::SarController::new(tk_handle, sender.clone(), addr.clone(), config.sar.clone());
+        let sar = sar::SarController::new(
+            tk_handle.clone(),
+            sender.clone(),
+            addr.clone(),
+            config.sar.clone(),
+        );
 
         let mut dev = Self {
             meta: EntityMeta {
@@ -145,6 +153,17 @@ impl XiaomiDevice {
         dev.add_component(Box::new(thirdparty_comp));
         dev.add_component(Box::new(resource_comp));
         dev.add_component(Box::new(watchface_comp));
+        #[cfg(not(target_arch = "wasm32"))]
+        dev.add_component(Box::new(network_comp));
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Ok(comp) = dev.get_component_as_mut::<NetworkComponent>(NetworkComponent::ID) {
+                if let Err(err) = comp.ensure_stack(tk_handle.clone()) {
+                    log::warn!("[XiaomiDevice] failed to start network stack: {err:?}");
+                }
+            }
+        }
         dev
     }
 

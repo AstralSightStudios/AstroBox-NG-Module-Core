@@ -46,7 +46,16 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "sync",
     "io-util",
+    "net",
 ] }
+tokio-util = "0.7"
+ipstack = "0.4.0"
+udp-stream = { version = "0.0", default-features = false }
+pcap-file = "2.0.0"
+packet_crafter = "0.2.0"
+dhcproto = "0.13.0"
+etherparse = { version = "0.18", default-features = false, features = ["std"] }
+chrono = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", default-features = false, features = [

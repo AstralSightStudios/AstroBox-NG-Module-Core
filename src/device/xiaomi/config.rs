@@ -76,6 +76,7 @@ pub struct XiaomiDeviceConfig {
     pub sar: SarConfig,
     pub mass: MassConfig,
     pub res: ResConfig,
+    pub network: NetworkConfig,
 }
 
 impl Default for XiaomiDeviceConfig {
@@ -85,6 +86,32 @@ impl Default for XiaomiDeviceConfig {
             sar: SarConfig::default(),
             mass: MassConfig::default(),
             res: ResConfig::default(),
+            network: NetworkConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkConfig {
+    pub mtu: u16,
+    pub ingress_buffer: usize,
+    pub tun_buffer: usize,
+    pub outbound_buffer: usize,
+    pub meter_window_secs: u64,
+    pub enable_capture: bool,
+    pub capture_dir: Option<String>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            mtu: 800,
+            ingress_buffer: 256,
+            tun_buffer: 256,
+            outbound_buffer: 128,
+            meter_window_secs: 5,
+            enable_capture: false,
+            capture_dir: None,
         }
     }
 }

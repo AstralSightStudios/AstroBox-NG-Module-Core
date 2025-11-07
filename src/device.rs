@@ -1,6 +1,8 @@
 use crate::device::xiaomi::SendError;
 use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
+use crate::device::xiaomi::components::network::NetworkComponent;
+use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
 use crate::ecs::component::Component;
@@ -33,6 +35,7 @@ where
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
     let device_id_for_auth = addr.clone();
+    let device_id_for_network = addr.clone();
     let addr_for_entity = addr.clone();
     let name_for_entity = name.clone();
     let tk_handle_clone = tk_handle.clone();
@@ -76,6 +79,26 @@ where
         let auth_result = rx.await.context("Auth await response not received")?;
         auth_result?;
     }
+
+    /*
+    // 在Auth完成后同步网络状态以确保蓝牙联网可用
+    crate::ecs::with_rt_mut(move |rt| {
+        if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_network) {
+            dev.get_component_as_mut::<NetworkComponent>(NetworkComponent::ID)
+                .unwrap()
+                .as_logic_component_mut()
+                .unwrap()
+                .system_mut()
+                .as_any_mut()
+                .downcast_mut::<NetworkSystem>()
+                .unwrap()
+                .sync_network_status()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+    .await?;*/
 
     Ok(DeviceConnectionInfo {
         name: name.clone(),
