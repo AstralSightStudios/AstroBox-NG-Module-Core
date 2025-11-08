@@ -18,24 +18,24 @@ md-5 = "0.10.6"
 aes-gcm = "0.10.3"
 
 once_cell = "1.21.3"
-parking_lot = "0.12.4"
+parking_lot = "0.12.5"
 flume = "0.11.1"
-async-trait = "0.1.88"
-num_enum = "0.7.4"
-anyhow = "1.0.99"
-log = { version = "0.4.27", features = [
+async-trait = "0.1.89"
+num_enum = "0.7.5"
+anyhow = "1.0.100"
+log = { version = "0.4.28", features = [
     "max_level_trace",
     "release_max_level_trace",
 ] }
-serde = "1.0.219"
-serde_json = "1.0.142"
+serde = "1"
+serde_json = "1"
 serde_repr = "0.1"
-erased-serde = "0.3"
+erased-serde = "0.4"
 byteorder = "1.5"
 web-time = "1"
 pb = { path = "../pb" }
-prost = { git = "https://github.com/66hh/prost-astrobox", branch = "master" }
-nanorand = "0.7"
+prost = "0.14.1"
+nanorand = "0.8"
 hex = "0.4.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -49,12 +49,12 @@ tokio = { version = "1", default-features = false, features = [
     "net",
 ] }
 tokio-util = "0.7"
-ipstack = "0.4.0"
+ipstack = { git = "https://github.com/Searchstars/ipstack-astrobox", branch = "main" }
 udp-stream = { version = "0.0", default-features = false }
 pcap-file = "2.0.0"
 packet_crafter = "0.2.0"
-dhcproto = "0.13.0"
-etherparse = { version = "0.18", default-features = false, features = ["std"] }
+dhcproto = "0.14.0"
+etherparse = { version = "0.19", default-features = false, features = ["std"] }
 chrono = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -80,7 +80,6 @@ where
         auth_result?;
     }
 
-    /*
     // 在Auth完成后同步网络状态以确保蓝牙联网可用
     crate::ecs::with_rt_mut(move |rt| {
         if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_network) {
@@ -98,7 +97,7 @@ where
             Ok(None)
         }
     })
-    .await?;*/
+    .await?;
 
     Ok(DeviceConnectionInfo {
         name: name.clone(),
