@@ -1,7 +1,9 @@
 use crate::device::xiaomi::SendError;
 use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::device::xiaomi::components::network::NetworkComponent;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
@@ -80,6 +82,7 @@ where
         auth_result?;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     // 在Auth完成后同步网络状态以确保蓝牙联网可用
     crate::ecs::with_rt_mut(move |rt| {
         if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_for_network) {
