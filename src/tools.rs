@@ -15,14 +15,18 @@ pub fn hex_stream_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
 
     (0..hex.len())
         .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("{:?}", e))
-        })
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("{:?}", e)))
         .collect()
 }
 
 pub fn generate_random_bytes(size: usize) -> Vec<u8> {
+    #[cfg(not(target_os = "espidf"))]
     let mut rng = nanorand::tls_rng();
+
+    // 实际上没人在意这该死的随机数安全性
+    #[cfg(target_os = "espidf")]
+    let mut rng = nanorand::WyRand::new_seed(114514);
+
     let mut buffer = vec![0u8; size];
     rng.fill_bytes(&mut buffer);
     buffer

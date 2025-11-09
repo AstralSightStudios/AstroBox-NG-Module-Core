@@ -4,8 +4,8 @@ use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
-use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
 use crate::anyhow_site;
+use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -148,7 +148,11 @@ impl ReverseMassPacket {
         } else {
             if total as u32 != self.total_part {
                 self.error = true;
-                return Err(anyhow_site!("Invalid total {} != {}", total, self.total_part));
+                return Err(anyhow_site!(
+                    "Invalid total {} != {}",
+                    total,
+                    self.total_part
+                ));
             }
             skip_offset = 6;
         }

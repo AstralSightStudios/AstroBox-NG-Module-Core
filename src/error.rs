@@ -34,7 +34,13 @@ pub fn format_anyhow(err: &Error) -> String {
 pub fn anyhow_with_site(args: fmt::Arguments<'_>) -> Error {
     let location = std::panic::Location::caller();
     let mut message = String::new();
-    let _ = write!(&mut message, "{} [{}:{}]", args, location.file(), location.line());
+    let _ = write!(
+        &mut message,
+        "{} [{}:{}]",
+        args,
+        location.file(),
+        location.line()
+    );
     anyhow::anyhow!(message)
 }
 
