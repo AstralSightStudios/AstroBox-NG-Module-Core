@@ -349,31 +349,40 @@ impl SarController {
                 false
             }
             L1DataType::Data => {
+                let channel = l1.payload.get(0).and_then(|b| L2Channel::try_from(*b).ok());
+
+                if matches!(channel, Some(L2Channel::Network)) {
+                    // Network 频道的所有包seq均为0，因此不做seq校验
+                    return true;
+                }
+
                 if l1.frx {
                     // 快速接收不需要 ACK
                     self.rx_expect_seq = self.rx_expect_seq.wrapping_add(1);
-                } else {
-                    if l1.seq != self.rx_expect_seq {
-                        // 收到的 seq 不是预期的，回 NAK 请求重传
-                        self.send_nak(self.rx_expect_seq);
-                        return false;
-                    }
-                    let ch = l1.payload.get(0).and_then(|b| L2Channel::try_from(*b).ok());
-                    if ch != Some(L2Channel::Network) {
-                        let immediate = u32::from(self.rx_cum_ack_index)
-                            >= (u32::from(self.effective_tx_win()) * 2 / 3)
-                            || matches!(ch, Some(L2Channel::Pb | L2Channel::Lyra));
-                        if immediate {
-                            self.stop_cum_ack_timer();
-                            self.send_ack(l1.seq);
-                        } else {
-                            self.rx_cum_ack_index = self.rx_cum_ack_index.saturating_add(1);
-                            self.rx_cum_ack_seq = l1.seq;
-                            self.start_cum_ack_timer(self.device_id.clone());
-                        }
-                    }
-                    self.rx_expect_seq = self.rx_expect_seq.wrapping_add(1);
+                    return true;
                 }
+
+                if l1.seq != self.rx_expect_seq {
+                    // 收到的 seq 不是预期的，回 NAK 请求重传
+                    self.send_nak(self.rx_expect_seq);
+                    return false;
+                }
+
+                if channel != Some(L2Channel::Network) {
+                    let immediate = u32::from(self.rx_cum_ack_index)
+                        >= (u32::from(self.effective_tx_win()) * 2 / 3)
+                        || matches!(channel, Some(L2Channel::Pb | L2Channel::Lyra));
+                    if immediate {
+                        self.stop_cum_ack_timer();
+                        self.send_ack(l1.seq);
+                    } else {
+                        self.rx_cum_ack_index = self.rx_cum_ack_index.saturating_add(1);
+                        self.rx_cum_ack_seq = l1.seq;
+                        self.start_cum_ack_timer(self.device_id.clone());
+                    }
+                }
+
+                self.rx_expect_seq = self.rx_expect_seq.wrapping_add(1);
                 true
             }
         }

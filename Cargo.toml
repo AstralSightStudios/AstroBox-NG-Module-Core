@@ -49,7 +49,7 @@ tokio = { version = "1", default-features = false, features = [
     "net",
 ] }
 tokio-util = "0.7"
-ipstack = { git = "https://github.com/Searchstars/ipstack-astrobox", branch = "main" }
+ipstack = { git = "http://github.com/narrowlink/ipstack/", branch = "main" }
 udp-stream = { version = "0.0", default-features = false }
 pcap-file = "2.0.0"
 packet_crafter = "0.2.0"
