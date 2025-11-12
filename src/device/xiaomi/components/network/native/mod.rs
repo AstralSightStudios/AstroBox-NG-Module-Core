@@ -370,24 +370,42 @@ impl NetworkRuntime {
                                                 });
                                             }
                                             IpStackStream::Udp(mut udp) => {
-                                                let mut peer = match UdpStream::connect(udp.peer_addr()).await {
+                                                let local_addr = udp.local_addr();
+                                                let remote_addr = udp.peer_addr();
+                                                let mut peer = match UdpStream::connect(remote_addr).await {
                                                     Ok(stream) => stream,
                                                     Err(err) => {
-                                                        log::warn!("[NetworkRuntime] UDP connect failed: {err}");
+                                                        log::warn!("[NetworkRuntime] UDP connect failed {local_addr} -> {remote_addr}: {err}");
                                                         continue;
                                                     }
                                                 };
                                                 let count = session_count.fetch_add(1, Ordering::Relaxed) + 1;
-                                                log::info!("[NetworkRuntime] UDP#{id} established, sessions={count}");
+                                                log::info!(
+                                                    "[NetworkRuntime] UDP#{id} established {} -> {}, sessions={count}",
+                                                    local_addr,
+                                                    remote_addr
+                                                );
                                                 let counter = session_count.clone();
-                                                crate::asyncrt::spawn(async move {
-                                                    if let Err(err) = io::copy_bidirectional(&mut udp, &mut peer).await {
-                                                        log::info!("[NetworkRuntime] UDP#{id} ended with error: {err}");
+                                                crate::asyncrt::spawn({
+                                                    let local_addr = local_addr;
+                                                    let remote_addr = remote_addr;
+                                                    async move {
+                                                        if let Err(err) = io::copy_bidirectional(&mut udp, &mut peer).await {
+                                                            log::info!(
+                                                                "[NetworkRuntime] UDP#{id} ended with error: {err} ({} -> {})",
+                                                                local_addr,
+                                                                remote_addr
+                                                            );
+                                                        }
+                                                        peer.shutdown();
+                                                        let _ = udp.shutdown().await;
+                                                        let remaining = counter.fetch_sub(1, Ordering::Relaxed) - 1;
+                                                        log::info!(
+                                                            "[NetworkRuntime] UDP#{id} closed, sessions={remaining} ({} -> {})",
+                                                            local_addr,
+                                                            remote_addr
+                                                        );
                                                     }
-                                                    peer.shutdown();
-                                                    let _ = udp.shutdown().await;
-                                                    let remaining = counter.fetch_sub(1, Ordering::Relaxed) - 1;
-                                                    log::info!("[NetworkRuntime] UDP#{id} closed, sessions={remaining}");
                                                 });
                                             }
                                             IpStackStream::UnknownTransport(pkt) => {

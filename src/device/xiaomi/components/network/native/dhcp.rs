@@ -5,6 +5,11 @@ use std::net::Ipv4Addr;
 
 use crate::tools::to_hex_string;
 
+const ROUTER_ADDR: Ipv4Addr = Ipv4Addr::new(10, 1, 10, 1);
+const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 1, 10, 2);
+// Fallback public DNS servers so the watch avoids querying the fake gateway.
+const DNS_SERVERS: [Ipv4Addr; 2] = [Ipv4Addr::new(223, 5, 5, 5), Ipv4Addr::new(119, 29, 29, 29)];
+
 fn push_u8(buf: &mut Vec<u8>, value: u8) {
     buf.push(value);
 }
@@ -76,8 +81,8 @@ pub fn maybe_build_reply(network_packet: &[u8]) -> Result<Option<Vec<u8>>> {
     reply.set_secs(0);
     reply.set_flags(0.into());
     reply.set_ciaddr(Ipv4Addr::UNSPECIFIED);
-    reply.set_yiaddr(Ipv4Addr::new(10, 1, 10, 2));
-    reply.set_siaddr(Ipv4Addr::new(10, 1, 10, 1));
+    reply.set_yiaddr(CLIENT_ADDR);
+    reply.set_siaddr(ROUTER_ADDR);
     reply.set_giaddr(Ipv4Addr::UNSPECIFIED);
 
     let mut opts = v4::DhcpOptions::new();
@@ -95,11 +100,10 @@ pub fn maybe_build_reply(network_packet: &[u8]) -> Result<Option<Vec<u8>>> {
         }
     }
     opts.insert(v4::DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
-    opts.insert(v4::DhcpOption::Router(vec![Ipv4Addr::new(10, 1, 10, 1)]));
+    opts.insert(v4::DhcpOption::Router(vec![ROUTER_ADDR]));
+    opts.insert(v4::DhcpOption::DomainNameServer(DNS_SERVERS.to_vec()));
     opts.insert(v4::DhcpOption::AddressLeaseTime(269_352_960));
-    opts.insert(v4::DhcpOption::ServerIdentifier(Ipv4Addr::new(
-        10, 1, 10, 1,
-    )));
+    opts.insert(v4::DhcpOption::ServerIdentifier(ROUTER_ADDR));
     reply.set_opts(opts);
 
     let mut dhcp_payload = Vec::new();
@@ -107,7 +111,7 @@ pub fn maybe_build_reply(network_packet: &[u8]) -> Result<Option<Vec<u8>>> {
 
     let udp_len = (dhcp_payload.len() + 8) as u16;
     let src_addr = Ipv4Addr::new(255, 255, 255, 255);
-    let dst_addr = Ipv4Addr::new(10, 1, 10, 1);
+    let dst_addr = ROUTER_ADDR;
 
     let mut udp_header = Vec::with_capacity(8);
     push_u16(&mut udp_header, 0x43);
