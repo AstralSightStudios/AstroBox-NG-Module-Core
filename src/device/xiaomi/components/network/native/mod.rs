@@ -150,10 +150,17 @@ impl XiaomiSystemExt for NetworkSystem {
             return;
         }
 
-        log::info!(
-            "Received network packet: {}",
-            crate::tools::to_hex_string(payload)
-        );
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "[NetworkSystem] received network packet: {}",
+                crate::tools::to_hex_string(payload)
+            );
+        } else {
+            log::debug!(
+                "[NetworkSystem] received network packet ({} bytes)",
+                payload.len()
+            );
+        }
 
         if let Some(runtime) = self.runtime.as_ref() {
             if let Err(err) = runtime.push_inbound(payload.to_vec()) {
