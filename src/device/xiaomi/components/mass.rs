@@ -204,7 +204,7 @@ where
                     prepare_pkt,
                     "MassSystem::send_file_for_owner.prepare",
                 );
-                dev.addr.clone()
+                dev.addr().to_string()
             } else {
                 String::new()
             }

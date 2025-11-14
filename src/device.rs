@@ -8,13 +8,45 @@ use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
 use crate::ecs::component::Component;
-use crate::ecs::entity::EntityExt;
+use crate::ecs::entity::{EntityExt, EntityMeta};
+use crate::impl_has_entity_meta;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::runtime::Handle;
 
 pub mod xiaomi;
+
+#[derive(Serialize)]
+pub struct Device {
+    #[serde(skip_serializing)]
+    meta: EntityMeta,
+    pub name: String,
+    pub addr: String,
+}
+
+impl Device {
+    pub fn new(name: String, addr: String) -> Self {
+        Self {
+            meta: EntityMeta {
+                id: addr.clone(),
+                ..Default::default()
+            },
+            name,
+            addr,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+impl_has_entity_meta!(Device, meta);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DeviceConnectionInfo {

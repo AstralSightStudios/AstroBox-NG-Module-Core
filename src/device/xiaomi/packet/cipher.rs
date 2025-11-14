@@ -72,7 +72,7 @@ pub fn encode_pb_packet(
     packet: protocol::WearPacket,
     log_ctx: &str,
 ) -> Vec<u8> {
-    match ensure_l2_cipher_blocking(&dev.addr, dev.sar_version) {
+    match ensure_l2_cipher_blocking(dev.addr(), dev.sar_version) {
         Some(cipher) => match L2Packet::pb_write_enc(packet.clone(), cipher.as_ref()) {
             Ok(pkt) => pkt.to_bytes(),
             Err(err) => {
