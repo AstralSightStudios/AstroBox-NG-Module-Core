@@ -22,7 +22,12 @@ impl Default for SyncSystem {
 
 impl SyncSystem {
     pub fn sync_time(&mut self, props: TimeSyncProps) {
+        log::info!("Syncing time with props: {}", serde_json::to_string(&props).unwrap_or_default());
         self.enqueue_pb_request(build_time_sync_packet(props), "SyncSystem::SyncTime");
+    }
+
+    pub fn set_language(&mut self, locale: String) {
+        self.enqueue_pb_request(build_set_language_packet(locale), "SyncSystem::SetLanguage");
     }
 }
 
@@ -49,6 +54,24 @@ impl SyncComponent {
 }
 
 impl_logic_component!(SyncComponent, meta);
+
+fn build_set_language_packet(lang: String) -> WearPacket {
+    let payload = protocol::Language {
+        locale: lang,
+    };
+
+    let pkt_payload = protocol::System {
+        payload: Some(protocol::system::Payload::Language(payload))
+    };
+
+    let pkt = WearPacket {
+        r#type: wear_packet::Type::System as i32,
+        id: protocol::system::SystemId::SetLanguage as u32,
+        payload: Some(wear_packet::Payload::System(pkt_payload))
+    };
+
+    pkt
+}
 
 fn build_time_sync_packet(props: TimeSyncProps) -> WearPacket {
     let payload = protocol::SystemTime {
