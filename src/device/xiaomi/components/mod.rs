@@ -8,3 +8,4 @@ pub mod resource;
 mod shared;
 pub mod thirdparty_app;
 pub mod watchface;
+pub mod sync;

@@ -8,9 +8,7 @@ use crate::{
         Device,
         xiaomi::{
             components::{
-                auth::AuthComponent, info::InfoComponent, install::InstallComponent,
-                mass::MassComponent, resource::ResourceComponent,
-                thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent,
+                auth::AuthComponent, info::InfoComponent, install::InstallComponent, mass::MassComponent, resource::ResourceComponent, sync::SyncComponent, thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent
             },
             config::XiaomiDeviceConfig,
             r#type::ConnectType,
@@ -111,6 +109,7 @@ impl XiaomiDevice {
         let watchface_comp = WatchfaceComponent::new();
         #[cfg(not(target_arch = "wasm32"))]
         let network_comp = NetworkComponent::new(config.network.clone());
+        let sync_comp = SyncComponent::new();
 
         // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
@@ -150,6 +149,7 @@ impl XiaomiDevice {
         dev.add_component(Box::new(watchface_comp));
         #[cfg(not(target_arch = "wasm32"))]
         dev.add_component(Box::new(network_comp));
+        dev.add_component(Box::new(sync_comp));
 
         #[cfg(not(target_arch = "wasm32"))]
         {

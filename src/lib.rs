@@ -7,6 +7,7 @@ pub mod ecs;
 pub mod error;
 pub mod logger;
 pub mod tools;
+pub mod models;
 
 // 默认初始化函数，使用默认配置初始化ECS系统
 pub fn init() {
