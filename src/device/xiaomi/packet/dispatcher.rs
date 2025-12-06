@@ -137,3 +137,15 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
         tk_handle,
     );
 }
+
+pub fn clear_recv_buffer(device_id: &str) {
+    match recv_buffer_registry().write() {
+        Ok(mut registry) => {
+            registry.remove(device_id);
+        }
+        Err(poisoned) => {
+            let mut registry = poisoned.into_inner();
+            registry.remove(device_id);
+        }
+    }
+}

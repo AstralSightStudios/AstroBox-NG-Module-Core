@@ -8,9 +8,12 @@ use crate::{
         Device,
         xiaomi::{
             components::{
-                auth::AuthComponent, info::InfoComponent, install::InstallComponent, mass::MassComponent, resource::ResourceComponent, sync::SyncComponent, thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent
+                auth::AuthComponent, info::InfoComponent, install::InstallComponent,
+                mass::MassComponent, resource::ResourceComponent, sync::SyncComponent,
+                thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent,
             },
             config::XiaomiDeviceConfig,
+            packet::{cipher, dispatcher},
             r#type::ConnectType,
         },
     },
@@ -48,6 +51,11 @@ pub struct XiaomiDevice {
     #[serde(skip_serializing)]
     pub sar: sar::SarController,
     pub config: XiaomiDeviceConfig,
+}
+
+pub fn cleanup_cached_state(device_id: &str) {
+    cipher::remove_l2_cipher(device_id);
+    dispatcher::clear_recv_buffer(device_id);
 }
 
 impl XiaomiDevice {

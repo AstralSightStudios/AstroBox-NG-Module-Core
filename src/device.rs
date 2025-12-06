@@ -1,5 +1,3 @@
-use crate::device::xiaomi::SendError;
-use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::components::auth::{AuthComponent, AuthSystem};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::device::xiaomi::components::network::NetworkComponent;
@@ -7,6 +5,7 @@ use crate::device::xiaomi::components::network::NetworkComponent;
 use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
+use crate::device::xiaomi::{cleanup_cached_state, SendError, XiaomiDevice};
 use crate::ecs::component::Component;
 use crate::ecs::entity::{EntityExt, EntityMeta};
 use crate::impl_has_entity_meta;
@@ -73,6 +72,8 @@ where
     let addr_for_entity = addr.clone();
     let name_for_entity = name.clone();
     let tk_handle_clone = tk_handle.clone();
+
+    cleanup_cached_state(&addr);
 
     crate::ecs::with_rt_mut(move |rt| {
         let device_config = XiaomiDeviceConfig::default();

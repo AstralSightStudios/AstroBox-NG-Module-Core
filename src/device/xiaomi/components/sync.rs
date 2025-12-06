@@ -1,7 +1,10 @@
 use pb::xiaomi::protocol::{self, WearPacket, wear_packet};
 
 use crate::{
-    device::xiaomi::{components::shared::SystemRequestExt, system::{L2PbExt, register_xiaomi_system_ext_on_l2packet}},
+    device::xiaomi::{
+        components::shared::SystemRequestExt,
+        system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
+    },
     ecs::{logic_component::LogicCompMeta, system::SysMeta},
     impl_has_sys_meta, impl_logic_component,
     models::sync::TimeSyncProps,
@@ -22,7 +25,10 @@ impl Default for SyncSystem {
 
 impl SyncSystem {
     pub fn sync_time(&mut self, props: TimeSyncProps) {
-        log::info!("Syncing time with props: {}", serde_json::to_string(&props).unwrap_or_default());
+        log::info!(
+            "Syncing time with props: {}",
+            serde_json::to_string(&props).unwrap_or_default()
+        );
         self.enqueue_pb_request(build_time_sync_packet(props), "SyncSystem::SyncTime");
     }
 
@@ -56,18 +62,16 @@ impl SyncComponent {
 impl_logic_component!(SyncComponent, meta);
 
 fn build_set_language_packet(lang: String) -> WearPacket {
-    let payload = protocol::Language {
-        locale: lang,
-    };
+    let payload = protocol::Language { locale: lang };
 
     let pkt_payload = protocol::System {
-        payload: Some(protocol::system::Payload::Language(payload))
+        payload: Some(protocol::system::Payload::Language(payload)),
     };
 
     let pkt = WearPacket {
         r#type: wear_packet::Type::System as i32,
         id: protocol::system::SystemId::SetLanguage as u32,
-        payload: Some(wear_packet::Payload::System(pkt_payload))
+        payload: Some(wear_packet::Payload::System(pkt_payload)),
     };
 
     pkt
@@ -92,17 +96,17 @@ fn build_time_sync_packet(props: TimeSyncProps) -> WearPacket {
             id: props.timezone.id,
             id_spec: "".to_string(),
         }),
-        is_12_hours: Some(props.is_12_hour_format)
+        is_12_hours: Some(props.is_12_hour_format),
     };
 
     let pkt_payload = protocol::System {
-        payload: Some(protocol::system::Payload::SystemTime(payload))
+        payload: Some(protocol::system::Payload::SystemTime(payload)),
     };
 
     let pkt = WearPacket {
         r#type: wear_packet::Type::System as i32,
         id: protocol::system::SystemId::SetSystemTime as u32,
-        payload: Some(wear_packet::Payload::System(pkt_payload))
+        payload: Some(wear_packet::Payload::System(pkt_payload)),
     };
 
     pkt

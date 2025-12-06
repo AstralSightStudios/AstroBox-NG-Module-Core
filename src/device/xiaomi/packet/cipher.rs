@@ -41,6 +41,18 @@ pub fn get_l2_cipher(device_id: &str) -> Option<SharedL2Cipher> {
     }
 }
 
+pub fn remove_l2_cipher(device_id: &str) {
+    match cipher_registry().write() {
+        Ok(mut guard) => {
+            guard.remove(device_id);
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.remove(device_id);
+        }
+    }
+}
+
 pub async fn ensure_l2_cipher(device_id: &str, sar_version: u32) -> Option<SharedL2Cipher> {
     if let Some(existing) = get_l2_cipher(device_id) {
         return Some(existing);

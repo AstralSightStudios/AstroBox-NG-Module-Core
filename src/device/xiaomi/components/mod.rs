@@ -6,6 +6,6 @@ pub mod mass;
 pub mod network;
 pub mod resource;
 mod shared;
+pub mod sync;
 pub mod thirdparty_app;
 pub mod watchface;
-pub mod sync;
