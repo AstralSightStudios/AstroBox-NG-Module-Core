@@ -20,11 +20,11 @@ pub fn hex_stream_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn generate_random_bytes(size: usize) -> Vec<u8> {
-    #[cfg(not(target_os = "espidf"))]
+    #[cfg(not(any(target_os = "espidf", target_arch = "wasm32")))]
     let mut rng = nanorand::tls_rng();
 
     // 实际上没人在意这该死的随机数安全性
-    #[cfg(target_os = "espidf")]
+    #[cfg(any(target_os = "espidf", target_arch = "wasm32"))]
     let mut rng = nanorand::WyRand::new_seed(114514);
 
     let mut buffer = vec![0u8; size];
