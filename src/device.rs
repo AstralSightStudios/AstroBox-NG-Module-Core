@@ -5,7 +5,7 @@ use crate::device::xiaomi::components::network::NetworkComponent;
 use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
-use crate::device::xiaomi::{cleanup_cached_state, SendError, XiaomiDevice};
+use crate::device::xiaomi::{SendError, XiaomiDevice, cleanup_cached_state};
 use crate::ecs::component::Component;
 use crate::ecs::entity::{EntityExt, EntityMeta};
 use crate::impl_has_entity_meta;
