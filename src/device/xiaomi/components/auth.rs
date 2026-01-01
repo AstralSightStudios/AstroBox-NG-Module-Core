@@ -3,71 +3,63 @@ use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::packet::v2::layer2::L2Packet;
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::device::xiaomi::r#type::ConnectType;
-use crate::ecs::entity::LookupError;
-use crate::ecs::fastlane::FastLane;
-use crate::ecs::system::{SysMeta, System};
-use crate::impl_has_sys_meta;
+use crate::ecs::Component;
+use crate::ecs::access::with_device_component_mut;
 use crate::{anyhow_site, bail_site};
-use crate::{ecs::logic_component::LogicCompMeta, impl_logic_component};
 use anyhow::Context;
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use pb::xiaomi::protocol::WearPacket;
 use prost::Message;
 use sha2::Sha256;
 use tokio::sync::oneshot;
 
+#[derive(Component)]
 pub struct AuthSystem {
-    meta: SysMeta,
-    auth_wait: Option<oneshot::Sender<anyhow::Result<()>>>,
+    owner_id: String,
+    auth_wait: Mutex<Option<oneshot::Sender<anyhow::Result<()>>>>,
 }
 
 impl Default for AuthSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-            auth_wait: None,
-        }
+        Self::new(String::new())
     }
 }
 
 impl AuthSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self {
+            owner_id,
+            auth_wait: Mutex::new(None),
+        }
+    }
+
     pub fn prepare_auth(&mut self) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
-        if self.auth_wait.is_some() {
+        if self.auth_wait.lock().is_some() {
             bail_site!("auth flow already in progress");
         }
 
         let nonce = crate::tools::generate_random_bytes(16);
 
-        let this: &mut dyn System = self;
         let nonce_clone = nonce.clone();
-        FastLane::with_component_mut::<AuthComponent, (), _>(
-            this,
-            AuthComponent::ID,
+        with_device_component_mut::<AuthComponent, _, _>(
+            self.owner_id.clone(),
             move |comp| {
                 comp.random_bytes = nonce_clone;
             },
         )
         .map_err(|err| anyhow_site!("failed to update auth component nonce: {err:?}"))?;
 
-        FastLane::with_entity_mut::<(), _>(this, move |ent| {
-            let entity_id = ent.id().to_string();
-            let dev = ent
-                .as_any_mut()
-                .downcast_mut::<XiaomiDevice>()
-                .ok_or_else(|| LookupError::TypeMismatch {
-                    id: entity_id,
-                    expected: std::any::type_name::<XiaomiDevice>(),
-                    actual: std::any::type_name::<dyn crate::ecs::entity::Entity>(),
-                })?;
+        with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), move |dev| {
             dev.sar
+                .lock()
                 .enqueue(L2Packet::pb_write(build_auth_step_1(&nonce)).to_bytes());
-            Ok(())
         })
         .map_err(|err| anyhow_site!("failed to send auth step 1 packet: {err:?}"))?;
 
         let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
-        self.auth_wait = Some(tx);
+        *self.auth_wait.lock() = Some(tx);
 
         Ok(rx)
     }
@@ -87,62 +79,51 @@ impl L2PbExt for AuthSystem {
             match pkt {
                 pb::xiaomi::protocol::wear_packet::Payload::Account(acc) => {
                     if let Some(acc_payload) = acc.payload {
-                        let this: &mut dyn System = self;
-
                         match acc_payload {
                             pb::xiaomi::protocol::account::Payload::AuthDeviceVerify(
                                 verify_pkt,
-                            ) => match build_auth_step_2(this, &verify_pkt) {
+                            ) => match build_auth_step_2(&self.owner_id, &verify_pkt) {
                                 Ok(verify_ret) => {
                                     if let Err(err) =
-                                        FastLane::with_entity_mut::<(), _>(this, move |ent| {
-                                            let entity_id = ent.id().to_string();
-                                            let dev = ent
-                                                .as_any_mut()
-                                                .downcast_mut::<XiaomiDevice>()
-                                                .ok_or_else(|| LookupError::TypeMismatch {
-                                                    id: entity_id,
-                                                    expected: std::any::type_name::<XiaomiDevice>(),
-                                                    actual: std::any::type_name::<
-                                                        dyn crate::ecs::entity::Entity,
-                                                    >(
-                                                    ),
-                                                })?;
-
-                                            dev.sar
-                                                .enqueue(L2Packet::pb_write(verify_ret).to_bytes());
-
-                                            Ok(())
-                                        })
+                                        with_device_component_mut::<XiaomiDevice, _, _>(
+                                            self.owner_id.clone(),
+                                            move |dev| {
+                                                dev.sar
+                                                    .lock()
+                                                    .enqueue(
+                                                        L2Packet::pb_write(verify_ret).to_bytes(),
+                                                    );
+                                            },
+                                        )
                                     {
                                         let anyhow_err = anyhow_site!(
                                             "failed to enqueue auth confirm packet: {err:?}"
                                         );
                                         log::error!("{anyhow_err:?}");
-                                        if let Some(waiter) = self.auth_wait.take() {
+                                        if let Some(waiter) = self.auth_wait.lock().take() {
                                             let _ = waiter.send(Err(anyhow_err));
                                         }
                                     }
                                 }
                                 Err(err) => {
                                     log::warn!("Auth device verify failed: {err:?}");
-                                    if let Some(waiter) = self.auth_wait.take() {
+                                    if let Some(waiter) = self.auth_wait.lock().take() {
                                         let _ = waiter.send(Err(err));
                                     }
                                 }
                             },
                             pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_dc) => {
-                                let update_res = FastLane::with_component_mut::<AuthComponent, (), _>(
-                                    this,
-                                    AuthComponent::ID,
-                                    |comp| {
-                                        comp.is_authed = true;
-                                    },
-                                );
+                                let update_res =
+                                    with_device_component_mut::<AuthComponent, _, _>(
+                                        self.owner_id.clone(),
+                                        |comp| {
+                                            comp.is_authed = true;
+                                        },
+                                    );
 
                                 match update_res {
                                     Ok(_) => {
-                                        if let Some(aw_sender) = self.auth_wait.take() {
+                                        if let Some(aw_sender) = self.auth_wait.lock().take() {
                                             if let Err(err) = aw_sender.send(Ok(())) {
                                                 log::debug!(
                                                     "Auth completion receiver dropped before delivery: {:?}",
@@ -160,7 +141,7 @@ impl L2PbExt for AuthSystem {
                                             "failed to mark auth component as authed: {err:?}"
                                         );
                                         log::error!("{anyhow_err:?}");
-                                        if let Some(waiter) = self.auth_wait.take() {
+                                        if let Some(waiter) = self.auth_wait.lock().take() {
                                             let _ = waiter.send(Err(anyhow_err));
                                         }
                                     }
@@ -176,12 +157,8 @@ impl L2PbExt for AuthSystem {
     }
 }
 
-impl_has_sys_meta!(AuthSystem, meta);
-
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct AuthComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
     pub authkey: String,
     pub is_authed: bool,
     pub random_bytes: Vec<u8>,
@@ -192,10 +169,8 @@ pub struct AuthComponent {
 }
 
 impl AuthComponent {
-    pub const ID: &'static str = "MiWearDeviceAuthLogicComponent";
     pub fn new(authkey: String) -> Self {
         Self {
-            meta: LogicCompMeta::new::<AuthSystem>(Self::ID),
             authkey,
             is_authed: false,
             random_bytes: vec![],
@@ -206,8 +181,6 @@ impl AuthComponent {
         }
     }
 }
-
-impl_logic_component!(AuthComponent, meta);
 
 fn build_auth_step_1(nonce: &[u8]) -> pb::xiaomi::protocol::WearPacket {
     let account_payload = pb::xiaomi::protocol::auth::AppVerify {
@@ -234,7 +207,7 @@ fn build_auth_step_1(nonce: &[u8]) -> pb::xiaomi::protocol::WearPacket {
 }
 
 fn build_auth_step_2(
-    this: &mut (dyn System + 'static),
+    owner_id: &str,
     device_verify: &pb::xiaomi::protocol::auth::DeviceVerify,
 ) -> anyhow::Result<pb::xiaomi::protocol::WearPacket> {
     let w_random = device_verify.device_random.clone();
@@ -244,25 +217,24 @@ fn build_auth_step_2(
         return Err(anyhow_site!("nonce/hmac length mismatch"));
     }
 
-    let authkey =
-        FastLane::with_component_mut::<AuthComponent, String, _>(this, AuthComponent::ID, |comp| {
-            comp.authkey.clone()
-        })
-        .unwrap();
+    let authkey = with_device_component_mut::<AuthComponent, String, _>(
+        owner_id.to_string(),
+        |comp| comp.authkey.clone(),
+    )
+    .map_err(|err| anyhow_site!("failed to read auth key: {err:?}"))?;
 
-    let (force_android, connect_type) =
-        FastLane::with_entity_mut::<(bool, crate::device::xiaomi::ConnectType), _>(this, |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            Ok((dev.force_android.clone(), dev.connect_type.clone()))
-        })
-        .unwrap();
+    let (force_android, connect_type) = with_device_component_mut::<
+        XiaomiDevice,
+        (bool, crate::device::xiaomi::ConnectType),
+        _,
+    >(owner_id.to_string(), |dev| (dev.force_android, dev.connect_type))
+    .map_err(|err| anyhow_site!("failed to read device connection type: {err:?}"))?;
 
-    let p_random_vec = FastLane::with_component_mut::<AuthComponent, Vec<u8>, _>(
-        this,
-        AuthComponent::ID,
+    let p_random_vec = with_device_component_mut::<AuthComponent, Vec<u8>, _>(
+        owner_id.to_string(),
         |comp| comp.random_bytes.clone(),
     )
-    .unwrap();
+    .map_err(|err| anyhow_site!("failed to read random bytes: {err:?}"))?;
     if p_random_vec.len() != 16 {
         return Err(anyhow_site!("phone nonce length mismatch"));
     }
@@ -347,13 +319,13 @@ fn build_auth_step_2(
     let enc_nonce_to_set = enc_nonce;
     let dec_nonce_to_set = dec_nonce;
 
-    FastLane::with_component_mut::<AuthComponent, (), _>(this, AuthComponent::ID, move |comp| {
+    with_device_component_mut::<AuthComponent, (), _>(owner_id.to_string(), move |comp| {
         comp.enc_key = enc_key_to_set;
         comp.dec_key = dec_key_to_set;
         comp.enc_nonce = enc_nonce_to_set;
         comp.dec_nonce = dec_nonce_to_set;
     })
-    .unwrap();
+    .map_err(|err| anyhow_site!("failed to update auth keys: {err:?}"))?;
 
     Ok(pkt)
 }

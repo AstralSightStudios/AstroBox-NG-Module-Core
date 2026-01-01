@@ -2,28 +2,30 @@ use pb::xiaomi::protocol::{self, WearPacket, wear_packet};
 
 use crate::{
     device::xiaomi::{
-        components::shared::SystemRequestExt,
+        components::shared::{HasOwnerId, SystemRequestExt},
         system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
     },
-    ecs::{logic_component::LogicCompMeta, system::SysMeta},
-    impl_has_sys_meta, impl_logic_component,
+    ecs::Component,
     models::sync::TimeSyncProps,
 };
 
+#[derive(Component)]
 pub struct SyncSystem {
-    meta: SysMeta,
+    owner_id: String,
 }
 
 impl Default for SyncSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl SyncSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self { owner_id }
+    }
+
     pub fn sync_time(&mut self, props: TimeSyncProps) {
         log::info!(
             "Syncing time with props: {}",
@@ -41,25 +43,21 @@ impl L2PbExt for SyncSystem {
     fn on_pb_packet(&mut self, _payload: WearPacket) {}
 }
 
-impl_has_sys_meta!(SyncSystem, meta);
-
-#[derive(serde::Serialize)]
-pub struct SyncComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
-}
-
-impl SyncComponent {
-    pub const ID: &'static str = "MiWearDeviceSyncLogicComponent";
-
-    pub fn new() -> Self {
-        Self {
-            meta: LogicCompMeta::new::<SyncSystem>(Self::ID),
-        }
+impl HasOwnerId for SyncSystem {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
     }
 }
 
-impl_logic_component!(SyncComponent, meta);
+#[derive(Component, serde::Serialize)]
+pub struct SyncComponent {
+}
+
+impl SyncComponent {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
 fn build_set_language_packet(lang: String) -> WearPacket {
     let payload = protocol::Language { locale: lang };

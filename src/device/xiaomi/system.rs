@@ -7,16 +7,17 @@ use std::{
     sync::{OnceLock, RwLock},
 };
 
+use bevy_ecs::{component::Component, entity::Entity, world::World};
+
 use crate::device::xiaomi::packet::v2::layer2::{L2Channel, L2OpCode};
-use crate::ecs::system::System;
 
 // 收L2包的System扩展trait
-pub trait XiaomiSystemExt: System {
+pub trait XiaomiSystemExt: Component {
     fn on_layer2_packet(&mut self, channel: L2Channel, opcode: L2OpCode, payload: &[u8]);
 }
 
 // 收PB包的System扩展trait，基于L2
-pub trait L2PbExt: System {
+pub trait L2PbExt: Component {
     fn on_pb_packet(&mut self, payload: WearPacket);
 }
 
@@ -34,7 +35,8 @@ where
     }
 }
 
-type OnL2PacketDispatcher = fn(sys: &mut dyn System, ch: L2Channel, op: L2OpCode, payload: &[u8]);
+type OnL2PacketDispatcher =
+    fn(world: &mut World, entity: Entity, ch: L2Channel, op: L2OpCode, payload: &[u8]);
 
 // 记录所有注册了该Ext的System
 // 唐比Rust不能动态类型。
@@ -49,26 +51,25 @@ fn xiaomi_ext_on_l2packet_registry() -> &'static RwLock<HashMap<TypeId, OnL2Pack
 
 fn make_xiaomi_ext_on_l2packet_dispatcher<T>() -> OnL2PacketDispatcher
 where
-    T: XiaomiSystemExt + 'static,
+    T: XiaomiSystemExt + Component + 'static,
 {
-    fn inner<T: XiaomiSystemExt + 'static>(
-        sys: &mut dyn System,
+    fn inner<T: XiaomiSystemExt + Component + 'static>(
+        world: &mut World,
+        entity: Entity,
         ch: L2Channel,
         op: L2OpCode,
         payload: &[u8],
     ) {
-        let any = sys.as_any_mut();
-        let t = any
-            .downcast_mut::<T>()
-            .expect("TypeId matched but downcast failed");
-        t.on_layer2_packet(ch, op, payload);
+        if let Some(mut t) = world.get_mut::<T>(entity) {
+            t.on_layer2_packet(ch, op, payload);
+        }
     }
     inner::<T>
 }
 
 pub fn register_xiaomi_system_ext_on_l2packet<T>()
 where
-    T: XiaomiSystemExt + 'static,
+    T: XiaomiSystemExt + Component + 'static,
 {
     let mut map = xiaomi_ext_on_l2packet_registry()
         .write()
@@ -79,29 +80,22 @@ where
     );
 }
 
-pub fn try_invoke_xiaomi_system_ext_on_l2packet(
-    sys: &mut dyn System,
+pub fn dispatch_xiaomi_system_ext_on_l2packet(
+    world: &mut World,
+    entity: Entity,
     ch: L2Channel,
     op: L2OpCode,
     payload: &[u8],
 ) -> bool {
-    let tid = sys.as_any().type_id();
-    if let Some(d) = xiaomi_ext_on_l2packet_registry()
+    let map = xiaomi_ext_on_l2packet_registry()
         .read()
-        .expect("poisoned XiaomiSystemExt registry")
-        .get(&tid)
-    {
-        (d)(sys, ch, op, payload);
-        true
-    } else {
-        false
+        .expect("poisoned XiaomiSystemExt registry");
+    if map.is_empty() {
+        return false;
     }
-}
 
-pub fn is_xiaomi_system_ext(sys: &dyn System) -> bool {
-    let tid = sys.as_any().type_id();
-    xiaomi_ext_on_l2packet_registry()
-        .read()
-        .expect("poisoned XiaomiSystemExt registry")
-        .contains_key(&tid)
+    for dispatch in map.values() {
+        dispatch(world, entity, ch, op, payload);
+    }
+    true
 }

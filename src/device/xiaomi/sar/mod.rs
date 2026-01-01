@@ -248,22 +248,26 @@ impl SarController {
                 sleep(Duration::from_millis(500)).await;
                 let handle_inner = handle_outer.clone();
                 crate::ecs::with_rt_mut(move |rt| {
-                    if let Some(dev) = rt.find_entity_by_id_mut::<super::XiaomiDevice>(&device) {
-                        if dev.sar.rx_cum_ack_index > 0 {
-                            let seq = dev.sar.rx_cum_ack_seq;
-                            dev.sar.rx_cum_ack_index = 0;
-                            dev.sar.rx_cum_ack_timer = None;
-                            let send_fn = dev.sar.sender.clone();
-                            let handle_send = handle_inner.clone();
-                            spawn_with_handle(
-                                async move {
-                                    let pkt = L1Packet::new(L1DataType::Ack, false, seq, vec![]);
-                                    let _ = (send_fn)(pkt.to_bytes()).await;
-                                },
-                                handle_send,
-                            );
+                    let _ = rt.with_device_mut(&device, |world, entity| {
+                        if let Some(dev) = world.get_mut::<super::XiaomiDevice>(entity) {
+                            let mut sar = dev.sar.lock();
+                            if sar.rx_cum_ack_index > 0 {
+                                let seq = sar.rx_cum_ack_seq;
+                                sar.rx_cum_ack_index = 0;
+                                sar.rx_cum_ack_timer = None;
+                                let send_fn = sar.sender.clone();
+                                let handle_send = handle_inner.clone();
+                                spawn_with_handle(
+                                    async move {
+                                        let pkt =
+                                            L1Packet::new(L1DataType::Ack, false, seq, vec![]);
+                                        let _ = (send_fn)(pkt.to_bytes()).await;
+                                    },
+                                    handle_send,
+                                );
+                            }
                         }
-                    }
+                    });
                 })
                 .await;
             },
@@ -286,10 +290,11 @@ impl SarController {
                     sleep(Duration::from_millis(500)).await;
                     let dev_id = device.clone();
                     crate::ecs::with_rt_mut(move |rt| {
-                        if let Some(dev) = rt.find_entity_by_id_mut::<super::XiaomiDevice>(&dev_id)
-                        {
-                            dev.sar.check_timeouts_internal();
-                        }
+                        let _ = rt.with_device_mut(&dev_id, |world, entity| {
+                            if let Some(dev) = world.get_mut::<super::XiaomiDevice>(entity) {
+                                dev.sar.lock().check_timeouts_internal();
+                            }
+                        });
                     })
                     .await;
                 }

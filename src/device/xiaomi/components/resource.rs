@@ -3,35 +3,35 @@ use tokio::sync::oneshot;
 
 use crate::{
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
-    ecs::{
-        fastlane::FastLane,
-        logic_component::LogicCompMeta,
-        system::{SysMeta, System},
-    },
-    impl_has_sys_meta, impl_logic_component,
+    ecs::{Component, access::with_device_component_mut},
 };
 
-use super::shared::{RequestSlot, SystemRequestExt, await_response};
+use super::shared::{HasOwnerId, RequestSlot, SystemRequestExt, await_response};
 use crate::anyhow_site;
 
+#[derive(Component)]
 pub struct ResourceSystem {
-    meta: SysMeta,
+    owner_id: String,
     watchface_wait: RequestSlot<Vec<protocol::WatchFaceItem>>,
     quick_app_wait: RequestSlot<Vec<protocol::AppItem>>,
 }
 
 impl Default for ResourceSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-            watchface_wait: RequestSlot::new(),
-            quick_app_wait: RequestSlot::new(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl ResourceSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self {
+            owner_id,
+            watchface_wait: RequestSlot::new(),
+            quick_app_wait: RequestSlot::new(),
+        }
+    }
+
     pub async fn get_installed_watchfaces(
         &mut self,
     ) -> anyhow::Result<Vec<protocol::WatchFaceItem>> {
@@ -71,6 +71,12 @@ impl ResourceSystem {
     }
 }
 
+impl HasOwnerId for ResourceSystem {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+}
+
 impl L2PbExt for ResourceSystem {
     fn on_pb_packet(&mut self, payload: WearPacket) {
         match payload.payload {
@@ -83,14 +89,13 @@ impl L2PbExt for ResourceSystem {
                     Some(protocol::watch_face::Payload::WatchFaceList(list)) => {
                         let items = list.list.clone();
                         let comp_items = items.clone();
-                        let this: &mut dyn System = self;
-                        let update_res = FastLane::with_component_mut::<ResourceComponent, (), _>(
-                            this,
-                            ResourceComponent::ID,
-                            move |comp| {
-                                comp.watchfaces = comp_items;
-                            },
-                        );
+                        let update_res =
+                            with_device_component_mut::<ResourceComponent, _, _>(
+                                self.owner_id.clone(),
+                                move |comp| {
+                                    comp.watchfaces = comp_items;
+                                },
+                            );
 
                         match update_res {
                             Ok(_) => self.watchface_wait.fulfill(items),
@@ -123,14 +128,13 @@ impl L2PbExt for ResourceSystem {
                     Some(protocol::thirdparty_app::Payload::AppItemList(list)) => {
                         let items = list.list.clone();
                         let comp_items = items.clone();
-                        let this: &mut dyn System = self;
-                        let update_res = FastLane::with_component_mut::<ResourceComponent, (), _>(
-                            this,
-                            ResourceComponent::ID,
-                            move |comp| {
-                                comp.quick_apps = comp_items;
-                            },
-                        );
+                        let update_res =
+                            with_device_component_mut::<ResourceComponent, _, _>(
+                                self.owner_id.clone(),
+                                move |comp| {
+                                    comp.quick_apps = comp_items;
+                                },
+                            );
 
                         match update_res {
                             Ok(_) => self.quick_app_wait.fulfill(items),
@@ -158,29 +162,20 @@ impl L2PbExt for ResourceSystem {
     }
 }
 
-impl_has_sys_meta!(ResourceSystem, meta);
-
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct ResourceComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
     pub watchfaces: Vec<protocol::WatchFaceItem>,
     pub quick_apps: Vec<protocol::AppItem>,
 }
 
 impl ResourceComponent {
-    pub const ID: &'static str = "MiWearDeviceResourceLogicComponent";
-
     pub fn new() -> Self {
         Self {
-            meta: LogicCompMeta::new::<ResourceSystem>(Self::ID),
             watchfaces: vec![],
             quick_apps: vec![],
         }
     }
 }
-
-impl_logic_component!(ResourceComponent, meta);
 
 fn build_watchface_get_installed() -> protocol::WearPacket {
     protocol::WearPacket {

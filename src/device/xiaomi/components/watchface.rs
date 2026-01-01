@@ -2,26 +2,28 @@ use pb::xiaomi::protocol::{self, WearPacket};
 
 use crate::{
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
-    ecs::{logic_component::LogicCompMeta, system::SysMeta},
-    impl_has_sys_meta, impl_logic_component,
+    ecs::Component,
 };
 
-use super::shared::SystemRequestExt;
+use super::shared::{HasOwnerId, SystemRequestExt};
 
+#[derive(Component)]
 pub struct WatchfaceSystem {
-    meta: SysMeta,
+    owner_id: String,
 }
 
 impl Default for WatchfaceSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl WatchfaceSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self { owner_id }
+    }
+
     pub fn set_watchface(&mut self, watchface_id: &str) {
         let packet = build_watchface_set(watchface_id);
         self.enqueue_request(packet);
@@ -56,25 +58,21 @@ impl L2PbExt for WatchfaceSystem {
     }
 }
 
-impl_has_sys_meta!(WatchfaceSystem, meta);
-
-#[derive(serde::Serialize)]
-pub struct WatchfaceComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
-}
-
-impl WatchfaceComponent {
-    pub const ID: &'static str = "MiWearDeviceWatchfaceLogicComponent";
-
-    pub fn new() -> Self {
-        Self {
-            meta: LogicCompMeta::new::<WatchfaceSystem>(Self::ID),
-        }
+impl HasOwnerId for WatchfaceSystem {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
     }
 }
 
-impl_logic_component!(WatchfaceComponent, meta);
+#[derive(Component, serde::Serialize)]
+pub struct WatchfaceComponent {
+}
+
+impl WatchfaceComponent {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
 fn build_watchface_set(watchface_id: &str) -> protocol::WearPacket {
     let payload = protocol::WatchFace {

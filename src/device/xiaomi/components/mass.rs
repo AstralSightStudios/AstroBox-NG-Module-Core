@@ -22,10 +22,8 @@ use crate::device::xiaomi::packet::{
     v2::layer2::{L2Channel, L2OpCode, L2Packet},
 };
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
-use crate::ecs::entity::EntityExt;
-use crate::ecs::logic_component::LogicCompMeta;
-use crate::ecs::system::SysMeta;
-use crate::{impl_has_sys_meta, impl_logic_component};
+use crate::ecs::{Component, access::with_device_component_mut};
+use parking_lot::Mutex;
 
 #[derive(Clone, serde::Serialize)]
 struct ResumeState {
@@ -53,20 +51,23 @@ struct PendingMassPart {
 }
 
 /// 管理 MASS 传输生命周期的系统，负责和 L2 PB 扩展交互。
+#[derive(Component)]
 pub struct MassSystem {
-    meta: SysMeta,
+    owner_id: String,
 }
 
 impl Default for MassSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl MassSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self { owner_id }
+    }
+
     pub async fn send_file<F>(
         &mut self,
         file_data: Vec<u8>,
@@ -76,10 +77,7 @@ impl MassSystem {
     where
         F: Fn(SendMassCallbackData) + Send + Sync + 'static,
     {
-        let owner_id = {
-            let sys: &dyn crate::ecs::system::System = self;
-            sys.owner().unwrap_or("").to_string()
-        };
+        let owner_id = self.owner_id.clone();
         let cb_arc: Arc<dyn Fn(SendMassCallbackData) + Send + Sync> = Arc::new(progress_cb);
         // 注意：这里用 move 把 cb_arc 捕获，保证生命周期。
         send_file_for_owner(owner_id, file_data, data_type, move |d| (cb_arc)(d)).await
@@ -90,44 +88,32 @@ impl L2PbExt for MassSystem {
     fn on_pb_packet(&mut self, payload: protocol::WearPacket) {
         if let Some(protocol::wear_packet::Payload::Mass(mass)) = payload.payload {
             if let Some(protocol::mass::Payload::PrepareResponse(resp)) = mass.payload {
-                let sys: &mut dyn crate::ecs::system::System = self;
-                let _ = crate::ecs::fastlane::FastLane::with_component_mut::<MassComponent, _, _>(
-                    sys,
-                    MassComponent::ID,
-                    move |comp| {
-                        if let Some(tx) = comp.prepare_wait.take() {
-                            let _ = tx.send(resp);
-                        }
-                    },
-                );
+                let owner = self.owner_id.clone();
+                let _ = with_device_component_mut::<MassComponent, _, _>(owner, move |comp| {
+                    if let Some(tx) = comp.prepare_wait.lock().take() {
+                        let _ = tx.send(resp);
+                    }
+                });
             }
         }
     }
 }
 
-impl_has_sys_meta!(MassSystem, meta);
-
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct MassComponent {
     #[serde(skip_serializing)]
-    meta: LogicCompMeta,
-    #[serde(skip_serializing)]
-    prepare_wait: Option<oneshot::Sender<protocol::PrepareResponse>>, // 等 Prepare 回包的单次通道
+    prepare_wait: Mutex<Option<oneshot::Sender<protocol::PrepareResponse>>>, // 等 Prepare 回包的单次通道
     resume_state: Option<ResumeState>, // 断点续传需要的“我现在传到哪了”
 }
 
 impl MassComponent {
-    pub const ID: &'static str = "MiWearDeviceMassLogicComponent";
     pub fn new() -> Self {
         Self {
-            meta: LogicCompMeta::new::<MassSystem>(Self::ID),
-            prepare_wait: None,
+            prepare_wait: Mutex::new(None),
             resume_state: None,
         }
     }
 }
-
-impl_logic_component!(MassComponent, meta);
 
 /// 构造 Prepare 请求（问设备：你能吃多大一口？）
 fn build_mass_prepare_request(
@@ -179,13 +165,11 @@ where
     crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         move |rt| {
-            if let Some(dev) =
-                rt.find_entity_by_id_mut::<crate::device::xiaomi::XiaomiDevice>(&owner)
-            {
-                if let Ok(comp) = dev.get_component_as_mut::<MassComponent>(MassComponent::ID) {
-                    comp.prepare_wait = Some(tx);
+            let _ = rt.with_device_mut(&owner, |world, entity| {
+                if let Some(comp) = world.get_mut::<MassComponent>(entity) {
+                    *comp.prepare_wait.lock() = Some(tx);
                 }
-            }
+            });
         }
     })
     .await;
@@ -197,17 +181,21 @@ where
         let owner = owner_id.clone();
         let file_md5_clone = file_md5.clone();
         move |rt| {
-            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
-                let prepare_pkt = build_mass_prepare_request(data_type, &file_md5_clone, file_len);
-                packet::cipher::enqueue_pb_packet(
-                    dev,
-                    prepare_pkt,
-                    "MassSystem::send_file_for_owner.prepare",
-                );
-                dev.addr().to_string()
-            } else {
-                String::new()
-            }
+            rt.with_device_mut(&owner, |world, entity| {
+                if let Some(mut dev) = world.get_mut::<XiaomiDevice>(entity) {
+                    let prepare_pkt =
+                        build_mass_prepare_request(data_type, &file_md5_clone, file_len);
+                    packet::cipher::enqueue_pb_packet(
+                        dev.as_mut(),
+                        prepare_pkt,
+                        "MassSystem::send_file_for_owner.prepare",
+                    );
+                    dev.addr().to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .unwrap_or_default()
         }
     })
     .await;
@@ -257,25 +245,22 @@ where
         let file_md5_for_resume = file_md5.clone();
         let device_addr_for_resume = device_addr.clone();
         move |rt| {
-            if let Some(dev) =
-                rt.find_entity_by_id_mut::<crate::device::xiaomi::XiaomiDevice>(&owner)
-            {
-                if let Ok(comp) = dev.get_component_as_mut::<MassComponent>(MassComponent::ID) {
+            rt.with_device_mut(&owner, |world, entity| {
+                if let Some(mut comp) = world.get_mut::<MassComponent>(entity) {
                     if let Some(state) = comp.resume_state.as_ref().filter(|s| {
                         s.mass_id == file_md5_for_resume && s.device_addr == device_addr_for_resume
                     }) {
                         return state.current_part;
-                    } else {
-                        comp.resume_state = Some(ResumeState {
-                            device_addr: device_addr_for_resume.clone(),
-                            mass_id: file_md5_for_resume.clone(),
-                            current_part: 1,
-                        });
-                        return 1u16;
                     }
+                    comp.resume_state = Some(ResumeState {
+                        device_addr: device_addr_for_resume.clone(),
+                        mass_id: file_md5_for_resume.clone(),
+                        current_part: 1,
+                    });
                 }
-            }
-            1u16
+                1u16
+            })
+            .unwrap_or(1u16)
         }
     })
     .await;
@@ -284,13 +269,17 @@ where
     let sar_hints = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         move |rt| {
-            rt.find_entity_by_id_mut::<XiaomiDevice>(&owner).map(|dev| {
-                (
-                    dev.sar.tx_window_size(),
-                    dev.sar.raw_tx_window_size(),
-                    dev.sar.send_timeout_ms(),
-                )
+            rt.with_device_mut(&owner, |world, entity| {
+                world.get_mut::<XiaomiDevice>(entity).map(|dev| {
+                    let sar = dev.sar.lock();
+                    (
+                        sar.tx_window_size(),
+                        sar.raw_tx_window_size(),
+                        sar.send_timeout_ms(),
+                    )
+                })
             })
+            .flatten()
         }
     })
     .await;
@@ -302,8 +291,12 @@ where
     let mass_config = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         move |rt| {
-            rt.find_entity_by_id_mut::<XiaomiDevice>(&owner)
-                .map(|dev| dev.config.mass.clone())
+            rt.with_device_mut(&owner, |world, entity| {
+                world
+                    .get::<XiaomiDevice>(entity)
+                    .map(|dev| dev.config.mass.clone())
+            })
+            .flatten()
         }
     })
     .await
@@ -506,11 +499,14 @@ async fn enqueue_mass_batch(owner_id: &str, payloads: Vec<Vec<u8>>) -> Result<Ve
     crate::ecs::with_rt_mut({
         let owner = owner_id.to_string();
         move |rt| -> Result<Vec<u8>> {
-            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
-                Ok(dev.sar.enqueue_batch(payloads))
-            } else {
-                bail_site!("Device {} not found when enqueueing MASS batch", owner)
-            }
+            rt.with_device_mut(&owner, |world, entity| {
+                if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+                    Ok(dev.sar.lock().enqueue_batch(payloads))
+                } else {
+                    bail_site!("Device {} not found when enqueueing MASS batch", owner)
+                }
+            })
+            .unwrap_or_else(|| bail_site!("Device {} not found when enqueueing MASS batch", owner))
         }
     })
     .await
@@ -562,10 +558,13 @@ async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Resul
         loop {
             let owner_clone = owner.clone();
             let acked = crate::ecs::with_rt_mut(move |rt| {
-                if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner_clone) {
-                    return dev.sar.is_acked(seq);
-                }
-                false
+                rt.with_device_mut(&owner_clone, |world, entity| {
+                    if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+                        return dev.sar.lock().is_acked(seq);
+                    }
+                    false
+                })
+                .unwrap_or(false)
             })
             .await;
             if acked {
@@ -612,12 +611,14 @@ where
                 let acked = crate::ecs::with_rt_mut({
                     let owner = owner.clone();
                     move |rt| {
-                        if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
-                            let acked = dev.sar.is_acked(seq);
+                        rt.with_device_mut(&owner, |world, entity| {
+                            let acked = if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+                                dev.sar.lock().is_acked(seq)
+                            } else {
+                                false
+                            };
                             if acked {
-                                if let Ok(comp) =
-                                    dev.get_component_as_mut::<MassComponent>(MassComponent::ID)
-                                {
+                                if let Some(mut comp) = world.get_mut::<MassComponent>(entity) {
                                     if let Some(state) = comp.resume_state.as_mut() {
                                         state.current_part = next_part;
                                         if state.current_part > total_parts {
@@ -625,12 +626,13 @@ where
                                         }
                                     }
                                 }
-                                dev.sar.mark_ack_consumed(seq);
+                                if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+                                    dev.sar.lock().mark_ack_consumed(seq);
+                                }
                             }
                             acked
-                        } else {
-                            false
-                        }
+                        })
+                        .unwrap_or(false)
                     }
                 })
                 .await;

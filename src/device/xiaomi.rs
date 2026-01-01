@@ -1,26 +1,20 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::device::xiaomi::components::network::NetworkComponent;
 use crate::{
     asyncrt::universal_block_on,
     device::{
         Device,
         xiaomi::{
-            components::{
-                auth::AuthComponent, info::InfoComponent, install::InstallComponent,
-                mass::MassComponent, resource::ResourceComponent, sync::SyncComponent,
-                thirdparty_app::ThirdpartyAppComponent, watchface::WatchfaceComponent,
-            },
             config::XiaomiDeviceConfig,
             packet::{cipher, dispatcher},
             r#type::ConnectType,
         },
     },
-    ecs::entity::{Entity, EntityExt, EntityMeta, HasEntityMeta},
+    ecs::Component,
 };
+use parking_lot::Mutex as ParkingMutex;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub mod components;
 pub mod config;
@@ -39,7 +33,7 @@ pub enum SendError {
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>;
 type SendFn = Arc<dyn Fn(Vec<u8>) -> SendFuture + Send + Sync>;
 
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct XiaomiDevice {
     #[serde(flatten)]
     device: Device,
@@ -49,7 +43,7 @@ pub struct XiaomiDevice {
     #[serde(skip_serializing)]
     sender: SendFn,
     #[serde(skip_serializing)]
-    pub sar: sar::SarController,
+    pub sar: ParkingMutex<sar::SarController>,
     pub config: XiaomiDeviceConfig,
 }
 
@@ -63,7 +57,7 @@ impl XiaomiDevice {
         tk_handle: Handle,
         name: String,
         addr: String,
-        authkey: String,
+        _authkey: String,
         sar_version: u32,
         connect_type: ConnectType,
         force_android: bool,
@@ -77,7 +71,7 @@ impl XiaomiDevice {
         // 包装线程安全Sender
         let raw_sender: SendFn = Arc::new(move |data: Vec<u8>| Box::pin(sender(data)));
         // 上锁防止串串包
-        let send_lock = Arc::new(Mutex::new(()));
+        let send_lock = Arc::new(AsyncMutex::new(()));
         let transport_config = config.transport.clone();
         let sender: SendFn = {
             let raw_sender = raw_sender.clone();
@@ -107,18 +101,6 @@ impl XiaomiDevice {
             })
         };
 
-        // 初始化Components
-        let auth_comp = AuthComponent::new(authkey.clone());
-        let install_comp = InstallComponent::new();
-        let mass_comp = MassComponent::new();
-        let info_comp = InfoComponent::new();
-        let thirdparty_comp = ThirdpartyAppComponent::new();
-        let resource_comp = ResourceComponent::new();
-        let watchface_comp = WatchfaceComponent::new();
-        #[cfg(not(target_arch = "wasm32"))]
-        let network_comp = NetworkComponent::new(config.network.clone());
-        let sync_comp = SyncComponent::new();
-
         // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
             universal_block_on(|| async {
@@ -137,36 +119,15 @@ impl XiaomiDevice {
             config.sar.clone(),
         );
 
-        let mut dev = Self {
+        let dev = Self {
             device: base,
             sar_version,
             connect_type,
             force_android,
             sender,
-            sar,
+            sar: ParkingMutex::new(sar),
             config,
         };
-
-        // 挂载Components
-        dev.add_component(Box::new(auth_comp));
-        dev.add_component(Box::new(install_comp));
-        dev.add_component(Box::new(mass_comp));
-        dev.add_component(Box::new(info_comp));
-        dev.add_component(Box::new(thirdparty_comp));
-        dev.add_component(Box::new(resource_comp));
-        dev.add_component(Box::new(watchface_comp));
-        #[cfg(not(target_arch = "wasm32"))]
-        dev.add_component(Box::new(network_comp));
-        dev.add_component(Box::new(sync_comp));
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Ok(comp) = dev.get_component_as_mut::<NetworkComponent>(NetworkComponent::ID) {
-                if let Err(err) = comp.ensure_stack(tk_handle.clone()) {
-                    log::warn!("[XiaomiDevice] failed to start network stack: {err:?}");
-                }
-            }
-        }
         dev
     }
 
@@ -188,15 +149,5 @@ impl XiaomiDevice {
 
     pub fn addr(&self) -> &str {
         self.device.addr()
-    }
-}
-
-impl HasEntityMeta for XiaomiDevice {
-    fn meta(&self) -> &EntityMeta {
-        self.device.meta()
-    }
-
-    fn meta_mut(&mut self) -> &mut EntityMeta {
-        self.device.meta_mut()
     }
 }

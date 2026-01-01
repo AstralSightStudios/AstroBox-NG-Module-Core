@@ -3,19 +3,15 @@ use tokio::sync::oneshot;
 
 use crate::{
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
-    ecs::{
-        fastlane::FastLane,
-        logic_component::LogicCompMeta,
-        system::{SysMeta, System},
-    },
-    impl_has_sys_meta, impl_logic_component,
+    ecs::{Component, access::with_device_component_mut},
 };
 
-use super::shared::{RequestSlot, SystemRequestExt, await_response};
+use super::shared::{HasOwnerId, RequestSlot, SystemRequestExt, await_response};
 use crate::anyhow_site;
 
+#[derive(Component)]
 pub struct InfoSystem {
-    meta: SysMeta,
+    owner_id: String,
     device_info_wait: RequestSlot<protocol::DeviceInfo>,
     device_status_wait: RequestSlot<protocol::DeviceStatus>,
     device_storage_wait: RequestSlot<protocol::StorageInfo>,
@@ -23,17 +19,20 @@ pub struct InfoSystem {
 
 impl Default for InfoSystem {
     fn default() -> Self {
+        Self::new(String::new())
+    }
+}
+
+impl InfoSystem {
+    pub fn new(owner_id: String) -> Self {
         register_xiaomi_system_ext_on_l2packet::<Self>();
         Self {
-            meta: SysMeta::default(),
+            owner_id,
             device_info_wait: RequestSlot::new(),
             device_status_wait: RequestSlot::new(),
             device_storage_wait: RequestSlot::new(),
         }
     }
-}
-
-impl InfoSystem {
     pub async fn get_device_info(&mut self) -> anyhow::Result<DeviceInfo> {
         await_response(
             self.request_device_info(),
@@ -97,10 +96,14 @@ impl InfoSystem {
     }
 }
 
+impl HasOwnerId for InfoSystem {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+}
+
 impl L2PbExt for InfoSystem {
     fn on_pb_packet(&mut self, payload: pb::xiaomi::protocol::WearPacket) {
-        let this: &mut dyn System = self;
-
         if let Some(pb::xiaomi::protocol::wear_packet::Payload::System(sys)) = payload.payload {
             if let Some(sys_payload) = sys.payload {
                 match sys_payload {
@@ -108,14 +111,14 @@ impl L2PbExt for InfoSystem {
                         let dev_info_for_slot = dev_info.clone();
                         let model = dev_info.model.clone();
                         let serial_number = dev_info.serial_number.clone();
-                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
-                            this,
-                            InfoComponent::ID,
-                            move |comp| {
-                                comp.model = model;
-                                comp.sn = serial_number;
-                            },
-                        );
+                        let update_res =
+                            with_device_component_mut::<InfoComponent, _, _>(
+                                self.owner_id.clone(),
+                                move |comp| {
+                                    comp.model = model;
+                                    comp.sn = serial_number;
+                                },
+                            );
 
                         match update_res {
                             Ok(_) => self.device_info_wait.fulfill(dev_info_for_slot),
@@ -131,13 +134,13 @@ impl L2PbExt for InfoSystem {
                     pb::xiaomi::protocol::system::Payload::DeviceStatus(dev_status) => {
                         let dev_status_for_slot = dev_status.clone();
                         let battery = dev_status.battery;
-                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
-                            this,
-                            InfoComponent::ID,
-                            move |comp| {
-                                comp.battery = Some(battery);
-                            },
-                        );
+                        let update_res =
+                            with_device_component_mut::<InfoComponent, _, _>(
+                                self.owner_id.clone(),
+                                move |comp| {
+                                    comp.battery = Some(battery);
+                                },
+                            );
 
                         match update_res {
                             Ok(_) => self.device_status_wait.fulfill(dev_status_for_slot),
@@ -154,14 +157,14 @@ impl L2PbExt for InfoSystem {
                         let storage_for_slot = storage.clone();
                         let total = storage.total;
                         let used = storage.used;
-                        let update_res = FastLane::with_component_mut::<InfoComponent, (), _>(
-                            this,
-                            InfoComponent::ID,
-                            move |comp| {
-                                comp.storage.free = total - used;
-                                comp.storage.total = total;
-                            },
-                        );
+                        let update_res =
+                            with_device_component_mut::<InfoComponent, _, _>(
+                                self.owner_id.clone(),
+                                move |comp| {
+                                    comp.storage.free = total - used;
+                                    comp.storage.total = total;
+                                },
+                            );
 
                         match update_res {
                             Ok(_) => self.device_storage_wait.fulfill(storage_for_slot),
@@ -181,18 +184,14 @@ impl L2PbExt for InfoSystem {
     }
 }
 
-impl_has_sys_meta!(InfoSystem, meta);
-
 #[derive(serde::Serialize)]
 pub struct StorageInfo {
     pub total: u64,
     pub free: u64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct InfoComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
     //codename: String,
     model: String,
     sn: String,
@@ -201,10 +200,8 @@ pub struct InfoComponent {
 }
 
 impl InfoComponent {
-    pub const ID: &'static str = "MiWearDeviceInfoLogicComponent";
     pub fn new() -> Self {
         Self {
-            meta: LogicCompMeta::new::<InfoSystem>(Self::ID),
             //codename: "".to_string(),
             model: "".to_string(),
             sn: "".to_string(),
@@ -213,5 +210,3 @@ impl InfoComponent {
         }
     }
 }
-
-impl_logic_component!(InfoComponent, meta);

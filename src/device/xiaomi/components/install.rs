@@ -11,18 +11,14 @@ use tokio::sync::oneshot;
 use crate::asyncrt::universal_block_on;
 use crate::device::xiaomi::components::{
     mass::{SendMassCallbackData, send_file_for_owner},
-    resource::{ResourceComponent, ResourceSystem},
+    resource::ResourceSystem,
 };
 use crate::device::xiaomi::config::ResConfig;
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::device::xiaomi::{XiaomiDevice, resutils};
-use crate::ecs::entity::EntityExt;
-use crate::ecs::fastlane::FastLane;
-use crate::ecs::logic_component::{LogicCompMeta, LogicComponent};
-use crate::ecs::system::{SysMeta, System};
-use crate::impl_has_sys_meta;
-use crate::impl_logic_component;
+use crate::ecs::{Component, access::with_device_component_mut};
+use parking_lot::Mutex;
 
 #[cfg(target_arch = "wasm32")]
 type InstallFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
@@ -30,8 +26,9 @@ type InstallFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
 #[cfg(not(target_arch = "wasm32"))]
 type InstallFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
+#[derive(Component)]
 pub struct InstallSystem {
-    meta: SysMeta,
+    owner_id: String,
 }
 
 struct InstallWaiters {
@@ -48,14 +45,16 @@ enum InstallResultEvent {
 
 impl Default for InstallSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl InstallSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self { owner_id }
+    }
+
     pub fn send_install_request(
         &mut self,
         r#type: MassDataType,
@@ -72,8 +71,7 @@ impl InstallSystem {
         package_name: Option<&str>,
         progress_cb: Arc<dyn Fn(SendMassCallbackData) + Send + Sync>,
     ) -> Result<InstallFuture> {
-        let this: &mut dyn System = self;
-        let owner = this.owner().unwrap_or("").to_string();
+        let owner = self.owner_id.clone();
 
         let (prepare_tx, prepare_rx) = oneshot::channel::<i32>();
         let (result_tx_opt, result_rx_opt) = match r#type {
@@ -84,14 +82,14 @@ impl InstallSystem {
             }
         };
 
-        FastLane::with_component_mut::<InstallComponent, _, _>(
-            this,
-            InstallComponent::ID,
+        with_device_component_mut::<InstallComponent, _, _>(
+            owner.clone(),
             move |comp| -> Result<()> {
-                if comp.waiters.is_some() {
+                let mut waiters = comp.waiters.lock();
+                if waiters.is_some() {
                     bail_site!("install request is already in progress");
                 }
-                comp.waiters = Some(InstallWaiters {
+                *waiters = Some(InstallWaiters {
                     data_type: r#type,
                     prepare_tx: Some(prepare_tx),
                     result_tx: result_tx_opt,
@@ -104,11 +102,12 @@ impl InstallSystem {
         let req_result: Result<WearPacket> = (|| {
             Ok(match r#type {
                 MassDataType::Watchface => {
-                    let res_config = FastLane::with_entity_mut::<ResConfig, _>(this, |ent| {
-                        let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-                        Ok(dev.config.res.clone())
-                    })
-                    .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
+                    let res_config =
+                        with_device_component_mut::<XiaomiDevice, ResConfig, _>(
+                            owner.clone(),
+                            |dev| dev.config.res.clone(),
+                        )
+                        .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
                     let id = resutils::get_watchface_id(&file_data, &res_config)
                         .context("invalid watchface id")?;
                     build_watchface_install_request(&id, file_data.len())
@@ -140,15 +139,16 @@ impl InstallSystem {
             }
         };
 
-        if let Err(err) = FastLane::with_entity_mut::<(), _>(this, move |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
-            packet::cipher::enqueue_pb_packet(
-                dev,
-                req,
-                "InstallSystem::send_install_request_with_progress",
-            );
-            Ok(())
-        }) {
+        if let Err(err) = with_device_component_mut::<XiaomiDevice, (), _>(
+            owner.clone(),
+            move |dev| {
+                packet::cipher::enqueue_pb_packet(
+                    dev,
+                    req,
+                    "InstallSystem::send_install_request_with_progress",
+                );
+            },
+        ) {
             let owner_for_cleanup = owner.clone();
             universal_block_on(|| clear_install_waiters(owner_for_cleanup.clone()));
             return Err(anyhow_site!("failed to enqueue install request: {:?}", err));
@@ -200,12 +200,10 @@ impl InstallSystem {
 
 impl L2PbExt for InstallSystem {
     fn on_pb_packet(&mut self, payload: protocol::WearPacket) {
-        let this: &mut dyn System = self;
-        let _ = FastLane::with_component_mut::<InstallComponent, _, _>(
-            this,
-            InstallComponent::ID,
-            move |comp| {
-                if let Some(waiters) = comp.waiters.as_mut() {
+        let owner = self.owner_id.clone();
+        let _ = with_device_component_mut::<InstallComponent, _, _>(owner, move |comp| {
+            let mut waiters_guard = comp.waiters.lock();
+            if let Some(waiters) = waiters_guard.as_mut() {
                     match payload.payload {
                         Some(protocol::wear_packet::Payload::WatchFace(wf)) => {
                             if let MassDataType::Watchface = waiters.data_type {
@@ -273,24 +271,20 @@ impl L2PbExt for InstallSystem {
                         }
                         _ => {}
                     }
-                }
-            },
-        );
+            }
+        });
     }
 }
-
-impl_has_sys_meta!(InstallSystem, meta);
 
 async fn clear_install_waiters(owner: String) {
     let _ = crate::ecs::with_rt_mut({
         let owner = owner.clone();
         move |rt| {
-            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
-                if let Ok(comp) = dev.get_component_as_mut::<InstallComponent>(InstallComponent::ID)
-                {
-                    comp.waiters = None;
+            let _ = rt.with_device_mut(&owner, |world, entity| {
+                if let Some(comp) = world.get_mut::<InstallComponent>(entity) {
+                    *comp.waiters.lock() = None;
                 }
-            }
+            });
         }
     })
     .await;
@@ -299,19 +293,11 @@ async fn clear_install_waiters(owner: String) {
 async fn refresh_quick_app_list(owner: String) {
     let _ = crate::ecs::with_rt_mut({
         move |rt| {
-            if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner) {
-                if let Ok(comp) =
-                    dev.get_component_as_mut::<ResourceComponent>(ResourceComponent::ID)
-                {
-                    if let Some(system) = comp
-                        .system_mut()
-                        .as_any_mut()
-                        .downcast_mut::<ResourceSystem>()
-                    {
-                        let _ = system.request_quick_app_list();
-                    }
+            let _ = rt.with_device_mut(&owner, |world, entity| {
+                if let Some(mut system) = world.get_mut::<ResourceSystem>(entity) {
+                    let _ = system.request_quick_app_list();
                 }
-            }
+            });
         }
     })
     .await;
@@ -364,25 +350,19 @@ fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Res
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct InstallComponent {
     #[serde(skip_serializing)]
-    meta: LogicCompMeta,
-    #[serde(skip_serializing)]
-    waiters: Option<InstallWaiters>,
+    waiters: Mutex<Option<InstallWaiters>>,
 }
 
 impl InstallComponent {
-    pub const ID: &'static str = "MiWearDeviceInstallLogicComponent";
     pub fn new() -> Self {
         Self {
-            meta: LogicCompMeta::new::<InstallSystem>(Self::ID),
-            waiters: None,
+            waiters: Mutex::new(None),
         }
     }
 }
-
-impl_logic_component!(InstallComponent, meta);
 
 pub fn build_watchface_install_request(id: &str, package_size: usize) -> protocol::WearPacket {
     let prepare_info = protocol::PrepareInfo {

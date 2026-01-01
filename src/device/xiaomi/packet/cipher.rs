@@ -11,7 +11,6 @@ use crate::{
         components::auth::AuthComponent,
         packet::v2::layer2::{L2Cipher, L2Packet},
     },
-    ecs::entity::EntityExt,
 };
 
 pub type SharedL2Cipher = Arc<dyn L2Cipher + Send + Sync>;
@@ -102,7 +101,7 @@ pub fn encode_pb_packet(
 
 pub fn enqueue_pb_packet(dev: &mut XiaomiDevice, packet: protocol::WearPacket, log_ctx: &str) {
     let bytes = encode_pb_packet(dev, packet, log_ctx);
-    dev.sar.enqueue(bytes);
+    dev.sar.lock().enqueue(bytes);
 }
 
 pub struct V2L2Cipher {
@@ -114,14 +113,14 @@ impl V2L2Cipher {
     pub async fn new(device_id: String) -> Option<Self> {
         let device_id_clone = device_id.clone();
         let keys = crate::ecs::with_rt_mut(move |rt| {
-            if let Some(device) = rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_clone) {
-                if let Ok(auth_comp) =
-                    device.get_component_as_mut::<AuthComponent>(AuthComponent::ID)
-                {
-                    return (auth_comp.enc_key.clone(), auth_comp.dec_key.clone());
+            rt.with_device_mut(&device_id_clone, |world, entity| {
+                if let Some(auth_comp) = world.get::<AuthComponent>(entity) {
+                    (auth_comp.enc_key.clone(), auth_comp.dec_key.clone())
+                } else {
+                    (vec![], vec![])
                 }
-            }
-            (vec![], vec![])
+            })
+            .unwrap_or((vec![], vec![]))
         })
         .await;
         let enc_key = keys.0;

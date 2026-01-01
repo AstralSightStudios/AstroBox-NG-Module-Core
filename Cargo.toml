@@ -33,6 +33,7 @@ serde_repr = "0.1"
 erased-serde = "0.4"
 byteorder = "1.5"
 web-time = "1"
+bevy_ecs = "0.14"
 pb = { path = "../pb" }
 prost = "0.14.1"
 nanorand = "0.8"

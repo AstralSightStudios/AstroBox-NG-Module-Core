@@ -1,10 +1,8 @@
-pub mod component;
-pub mod entity;
-pub mod fastlane;
+pub mod access;
 pub mod graph;
-pub mod logic_component;
 pub mod runtime;
-pub mod system;
+
+pub use bevy_ecs::prelude::{Bundle, Component, Entity, World};
 
 // 非WASM平台支持多线程，采用默认初始化方式
 #[cfg(not(target_arch = "wasm32"))]

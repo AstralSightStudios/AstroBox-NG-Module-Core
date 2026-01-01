@@ -1,112 +1,33 @@
-# AstroBox Core ECS说明文档
+# AstroBox Core ECS 说明文档
 
-## 设计理念
-这是一套类似游戏引擎的ECS实现方案，主要由`Runtime - Entity - Component + LogicComponent + System`组成。该系统具有这些核心设计理念：
-1. 通过传入闭包的方法进行调用，最大程度上避免死锁，淡化锁的存在
-2. 不允许在ECS线程内await，以防止任何阻塞现象
-3. 使用方便，可快速进行横向扩展
-4. All in mutable，拒绝readonly
-5. 不使用任何自定义生命周期，防止陷入生命周期地狱
+## 现状与设计
+Core 已彻底切换为 `bevy_ecs`。当前 ECS 运行时由 `Runtime` 包裹 `bevy_ecs::World`，
+并维护一张 `device_id -> Entity` 的索引表，用于快速定位设备实体。所有对 ECS 的访问
+通过 `ecs::with_rt_mut` 串行切入运行时线程，避免跨线程锁竞争和死锁问题。
+
+关键设计要点：
+1. 设备实体以地址为主键索引，外部只需要 `device_id` 即可访问组件。
+2. 组件/系统统一为 `bevy_ecs::Component`，不再区分 LogicComponent / System。
+3. 所有 ECS 访问都包裹在闭包里，避免在运行时线程里 `await`。
 
 ## 文件结构
-`runtime.rs` - Runtime (World) 结构实现
+`runtime.rs` - Runtime（World + 设备索引）实现  
+`access.rs` - 常用访问封装（如 `with_device_component_mut`）  
+`graph.rs` - ECS 状态图输出（用于调试）
 
-`entity.rs` - Entity结构实现
-
-`component.rs` - Component结构实现
-
-`logic_component.rs` - LogicComponent结构实现
-
-`system.rs` - System结构实现
-
-`fastlane.rs` - 为LogicComponent和System编写的扩展，允许其快速访问管理自己的Entity
-
-## 使用例
-### 实现一个Entity
+## 使用示例
 ```rust
-struct Fucker {
-    id: String,
-    comps: Vec<Box<dyn Component>>,
-    systs: Vec<Box<dyn System>>,
-}
+// 初始化运行时
+corelib::ecs::init_runtime_default();
 
-impl Fucker {
-    fn new(id: &str) -> Self {
-        Self { id: id.into(), comps: vec![], systs: vec![] }
-    }
-}
-
-// 由于Rust的语法特性，在这里你需要写一堆狗屎，我也没办法
-impl Entity for Fucker {
-    fn id(&self) -> &str { &self.id }
-    fn components(&mut self) -> &mut Vec<Box<dyn Component>> { &mut self.comps }
-    fn systems(&mut self) -> &mut Vec<Box<dyn System>> { &mut self.systs }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-}
-```
-### 实现一个Component
-```rust
-#[derive(Debug)]
-struct Name {
-    value: String,
-    // 你可以在这里扩充你自己的神笔数据
-    家庭住址: String,
-    身份证号: String,
-    owner: String,
-}
-
-impl Name {
-    fn new(value: &str) -> Self {
-        Self { value: value.into(), 
-        身份证号: "421302xxxxxxxx0033".to_string, 家庭住址: "湖北省随州市曾都区", owner: None }
-    }
-}
-
-impl Component for Name {
-    fn id(&self) -> &str { "name" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-    fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
-    fn set_owner(&mut self, entity_id: &str) { self.owner = entity_id.to_string(); }
-    fn owner(&self) -> Option<&str> { Some(self.owner.as_str()) }
-}
-```
-### 实现一个System
-```rust
-#[derive(Debug)]
-struct ExampleSystem {
-    value: i32,
-    owner: String,
-}
-
-impl ExampleSystem {
-    fn new(dmg: i32) -> Self {
-        Self { dmg, owner: None }
-    }
-}
-
-impl System for ExampleSystem {
-    fn id(&self) -> &str { "example" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-    fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
-    fn set_owner(&mut self, entity_id: &str) { self.owner = entity_id.to_string(); }
-    fn owner(&self) -> Option<&str> { Some(self.owner.as_str()) }
-}
-```
-### 为Entity添加Component
-```rust
-fucker.add_component(Box::new(Name::new("name", "彩虹哥")));
-fucker.add_component(Box::new(Age::new("age", 100)));
-```
-### 为Entity添加System
-```rust
-fucker.add_system(Box::new(ExampleSystem::new("test", 30)));
-```
-### 使用FastLane从System修改父Entity的Component
-```rust
-let result = <dyn System>::with_component_mut::<Age, _, _>(&age_sys, "age", |h| {
-    h.value -= 25;
-}).await?;
+// 访问指定设备的组件
+let device_id = "AA:BB:CC:DD";
+corelib::ecs::with_rt_mut(move |rt| {
+    rt.with_device_mut(device_id, |world, entity| {
+        let mut dev = world
+            .get_mut::<corelib::device::xiaomi::XiaomiDevice>(entity)
+            .expect("device missing");
+        dev.sar.lock().check_timeouts_internal();
+    });
+}).await;
 ```

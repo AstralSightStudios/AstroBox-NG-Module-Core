@@ -1,65 +1,91 @@
-use crate::ecs::{entity::Entity, system::System};
+use bevy_ecs::{
+    bundle::Bundle,
+    component::Component,
+    entity::Entity,
+    world::{EntityWorldMut, World},
+};
 use std::collections::HashMap;
 
+#[derive(Default)]
+struct DeviceIndex {
+    map: HashMap<String, Entity>,
+}
+
 // ECS运行时环境，相当于World
-// 存放了多个Entity和System，在AstroBox中一般一个设备一个Entity
+// 设备通过 bevy_ecs::World 托管，使用设备地址索引快速定位 Entity
 pub struct Runtime {
-    pub entities: HashMap<String, Box<dyn Entity>>,
-    pub systems: HashMap<String, Box<dyn System>>,
+    world: World,
+    devices: DeviceIndex,
 }
 
 impl Runtime {
     pub fn new() -> Runtime {
         Runtime {
-            entities: HashMap::new(),
-            systems: HashMap::new(),
+            world: World::new(),
+            devices: DeviceIndex::default(),
         }
     }
 
-    // 往Runtime中新增Entity
-    pub fn add_entity<E: Entity + 'static>(&mut self, entity: E) {
-        let id = entity.id().to_string();
-        self.entities.insert(id, Box::new(entity));
+    pub fn world(&self) -> &World {
+        &self.world
     }
 
-    // 在Runtime中根据ID寻找Entity并以指定类型返回（找不到返回None）
-    pub fn find_entity_by_id_mut<T>(&mut self, id: &str) -> Option<&mut T>
-    where
-        T: Entity + 'static,
-    {
-        self.entities
-            .get_mut(id)
-            .and_then(|e| e.as_any_mut().downcast_mut::<T>())
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 
-    // 在Runtime中根据ID寻找Entity并以dyn类型返回（这个给fastlane用的，一般用不上）
-    pub fn find_entity_dyn_mut(&mut self, id: &str) -> Option<&mut dyn Entity> {
-        self.entities.get_mut(id).map(|e| &mut **e)
+    pub fn device_count(&self) -> usize {
+        self.devices.map.len()
     }
 
-    // 在Runtime中根据ID卸载（删除）Entity并返回dyn类型
-    pub fn remove_entity_by_id(&mut self, id: &str) -> Option<Box<dyn Entity>> {
-        self.entities.remove(id)
+    pub fn device_ids(&self) -> impl Iterator<Item = &String> {
+        self.devices.map.keys()
     }
 
-    // 往Runtime中新增System
-    pub fn add_system<S: System + 'static>(&mut self, system: S) {
-        let id = system.id().to_string();
-        self.systems.insert(id, Box::new(system));
+    pub fn spawn_device<B: Bundle>(&mut self, id: String, bundle: B) -> Entity {
+        let entity = self.world.spawn(bundle).id();
+        self.devices.map.insert(id, entity);
+        entity
     }
 
-    // 在Runtime中根据ID寻找System并以指定类型返回（找不到返回None）
-    pub fn find_system_by_id_mut<T>(&mut self, id: &str) -> Option<&mut T>
-    where
-        T: System + 'static,
-    {
-        self.systems
-            .get_mut(id)
-            .and_then(|s| s.as_any_mut().downcast_mut::<T>())
+    pub fn remove_device(&mut self, id: &str) -> Option<Entity> {
+        let entity = self.devices.map.remove(id)?;
+        let _ = self.world.despawn(entity);
+        Some(entity)
     }
 
-    // 在Runtime中根据ID卸载（删除）System并返回dyn类型
-    pub fn remove_system_by_id(&mut self, id: &str) -> Option<Box<dyn System>> {
-        self.systems.remove(id)
+    pub fn device_entity(&self, id: &str) -> Option<Entity> {
+        self.devices.map.get(id).copied()
+    }
+
+    pub fn device_entity_mut(&mut self, id: &str) -> Option<EntityWorldMut<'_>> {
+        let entity = self.device_entity(id)?;
+        Some(self.world.entity_mut(entity))
+    }
+
+    pub fn component_mut<T: Component>(
+        &mut self,
+        id: &str,
+    ) -> Option<bevy_ecs::world::Mut<'_, T>> {
+        let entity = self.device_entity(id)?;
+        self.world.get_mut::<T>(entity)
+    }
+
+    pub fn component_ref<T: Component>(&self, id: &str) -> Option<&T> {
+        let entity = self.device_entity(id)?;
+        self.world.get::<T>(entity)
+    }
+
+    pub fn with_device_mut<R>(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut World, Entity) -> R,
+    ) -> Option<R> {
+        let entity = self.device_entity(id)?;
+        Some(f(&mut self.world, entity))
+    }
+
+    pub fn with_world_mut<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
+        f(&mut self.world)
     }
 }

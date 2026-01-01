@@ -5,7 +5,7 @@ use std::{
 
 use tokio::runtime::Handle;
 
-use crate::{device::xiaomi::XiaomiDevice, ecs::entity::Entity};
+use crate::device::xiaomi::XiaomiDevice;
 
 use super::{
     cipher::{SharedL2Cipher, ensure_l2_cipher},
@@ -67,10 +67,7 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
 
             let sar_version = crate::ecs::with_rt_mut({
                 let device_id_clone = device_id.clone();
-                move |rt| {
-                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_clone)
-                        .map(|dev| dev.sar_version)
-                }
+                move |rt| rt.component_ref::<XiaomiDevice>(&device_id_clone).map(|dev| dev.sar_version)
             })
             .await;
             let shared_cipher: Option<SharedL2Cipher> = match sar_version {
@@ -91,14 +88,15 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                     let device_id_lookup = device_id.clone();
                     let l1_clone = l1.clone();
                     move |rt| {
-                        if let Some(dev) =
-                            rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_lookup)
-                        {
-                            if dev.sar_version == 2 {
-                                return dev.sar.on_l1_packet(&l1_clone);
+                        rt.with_device_mut(&device_id_lookup, |world, entity| {
+                            if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+                                if dev.sar_version == 2 {
+                                    return dev.sar.lock().on_l1_packet(&l1_clone);
+                                }
                             }
-                        }
-                        false
+                            false
+                        })
+                        .unwrap_or(false)
                     }
                 })
                 .await;
@@ -113,20 +111,19 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                         crate::ecs::with_rt_mut({
                             let device_id_dispatch = device_id.clone();
                             move |rt| {
-                                if let Some(dev) =
-                                    rt.find_entity_by_id_mut::<XiaomiDevice>(&device_id_dispatch)
-                                {
-                                    if dev.sar_version == 2 {
-                                        for comp in dev.components() {
-                                            if let Some(logic_comp) = comp.as_logic_component_mut() {
-                                                let sys = logic_comp.system_mut();
-                                                crate::device::xiaomi::system::try_invoke_xiaomi_system_ext_on_l2packet(
-                                                    sys, ch, op, &payload,
-                                                );
-                                            }
+                                let _ = rt.with_device_mut(&device_id_dispatch, |world, entity| {
+                                    if let Some(dev) = world.get::<XiaomiDevice>(entity) {
+                                        if dev.sar_version == 2 {
+                                            let _ = crate::device::xiaomi::system::dispatch_xiaomi_system_ext_on_l2packet(
+                                                world,
+                                                entity,
+                                                ch,
+                                                op,
+                                                &payload,
+                                            );
                                         }
                                     }
-                                }
+                                });
                             }
                         })
                         .await;

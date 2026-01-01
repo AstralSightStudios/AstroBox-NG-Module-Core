@@ -36,14 +36,9 @@ use crate::{
         },
         system::{XiaomiSystemExt, register_xiaomi_system_ext_on_l2packet},
     },
-    ecs::{
-        entity::EntityExt,
-        fastlane::FastLane,
-        logic_component::LogicCompMeta,
-        system::{SysMeta, System},
-    },
-    impl_has_sys_meta, impl_logic_component,
+    ecs::{Component, access::with_device_component_mut},
 };
+use parking_lot::Mutex;
 
 mod dhcp;
 mod meter;
@@ -59,21 +54,16 @@ pub struct NetWorkSpeed {
     pub read: f64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Component, serde::Serialize)]
 pub struct NetworkComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
     #[serde(skip_serializing)]
     config: NetworkConfig,
     pub last_speed: NetWorkSpeed,
 }
 
 impl NetworkComponent {
-    pub const ID: &'static str = "MiWearDeviceNetworkLogicComponent";
-
     pub fn new(config: NetworkConfig) -> Self {
         Self {
-            meta: LogicCompMeta::new::<NetworkSystem>(Self::ID),
             config,
             last_speed: NetWorkSpeed::default(),
         }
@@ -82,61 +72,48 @@ impl NetworkComponent {
     pub fn config(&self) -> &NetworkConfig {
         &self.config
     }
-
-    pub fn ensure_stack(&mut self, handle: Handle) -> Result<()> {
-        let system = self
-            .meta
-            .system
-            .as_any_mut()
-            .downcast_mut::<NetworkSystem>()
-            .expect("NetworkComponent misconfigured");
-        system.ensure_runtime(handle, self.config.clone())
-    }
 }
 
-impl_logic_component!(NetworkComponent, meta);
-
+#[derive(Component)]
 pub struct NetworkSystem {
-    meta: SysMeta,
-    runtime: Option<NetworkRuntime>,
+    owner_id: String,
+    runtime: Mutex<Option<NetworkRuntime>>,
 }
 
 impl Default for NetworkSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-            runtime: None,
-        }
+        Self::new(String::new())
     }
 }
 
 impl NetworkSystem {
-    fn ensure_runtime(&mut self, handle: Handle, config: NetworkConfig) -> Result<()> {
-        if self.runtime.is_some() {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self {
+            owner_id,
+            runtime: Mutex::new(None),
+        }
+    }
+
+    pub fn ensure_runtime(&mut self, handle: Handle, config: NetworkConfig) -> Result<()> {
+        if self.runtime.lock().is_some() {
             return Ok(());
         }
-        let owner = self
-            .owner()
-            .ok_or_else(|| anyhow_site!("NetworkSystem missing owner"))?
-            .to_string();
-        let runtime = NetworkRuntime::new(owner, config, handle)?;
-        self.runtime = Some(runtime);
+        if self.owner_id.is_empty() {
+            return Err(anyhow_site!("NetworkSystem missing owner"));
+        }
+        let runtime = NetworkRuntime::new(self.owner_id.clone(), config, handle)?;
+        *self.runtime.lock() = Some(runtime);
         Ok(())
     }
 
     pub fn sync_network_status(&mut self) -> Result<()> {
-        let this: &mut dyn System = self;
-
-        FastLane::with_entity_mut::<(), _>(this, |ent| {
-            let dev = ent.as_any_mut().downcast_mut::<XiaomiDevice>().unwrap();
+        with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), |dev| {
             packet::cipher::enqueue_pb_packet(
                 dev,
                 build_sync_network_status(),
                 "NetworkComponent::sync_network_status",
             );
-
-            Ok(())
         })
         .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
 
@@ -162,7 +139,7 @@ impl XiaomiSystemExt for NetworkSystem {
             );
         }
 
-        if let Some(runtime) = self.runtime.as_ref() {
+        if let Some(runtime) = self.runtime.lock().as_ref() {
             if let Err(err) = runtime.push_inbound(payload.to_vec()) {
                 match err {
                     IngressError::Closed => {
@@ -178,8 +155,6 @@ impl XiaomiSystemExt for NetworkSystem {
         }
     }
 }
-
-impl_has_sys_meta!(NetworkSystem, meta);
 
 fn build_sync_network_status() -> protocol::WearPacket {
     let network_status = protocol::NetworkStatus { capability: 2 };
@@ -508,12 +483,16 @@ enum IngressError {
 async fn enqueue_network_payload(owner: &str, payload: Vec<u8>) -> Result<()> {
     let owner_id = owner.to_string();
     crate::ecs::with_rt_mut(move |rt| {
-        let dev = rt
-            .find_entity_by_id_mut::<XiaomiDevice>(&owner_id)
-            .ok_or_else(|| anyhow_site!("device {} not found for network send", owner_id))?;
-        dev.sar
-            .enqueue(L2Packet::new(L2Channel::Network, L2OpCode::Write, payload).to_bytes());
-        Ok(())
+        rt.with_device_mut(&owner_id, |world, entity| {
+            let dev = world
+                .get_mut::<XiaomiDevice>(entity)
+                .ok_or_else(|| anyhow_site!("device {} not found for network send", owner_id))?;
+            dev.sar
+                .lock()
+                .enqueue(L2Packet::new(L2Channel::Network, L2OpCode::Write, payload).to_bytes());
+            Ok(())
+        })
+        .ok_or_else(|| anyhow_site!("device {} not found for network send", owner_id))?
     })
     .await
 }
@@ -521,11 +500,11 @@ async fn enqueue_network_payload(owner: &str, payload: Vec<u8>) -> Result<()> {
 async fn update_speed(owner: &str, speed: NetWorkSpeed) {
     let owner_id = owner.to_string();
     let _ = crate::ecs::with_rt_mut(move |rt| {
-        if let Some(dev) = rt.find_entity_by_id_mut::<XiaomiDevice>(&owner_id) {
-            if let Ok(comp) = dev.get_component_as_mut::<NetworkComponent>(NetworkComponent::ID) {
+        let _ = rt.with_device_mut(&owner_id, |world, entity| {
+            if let Some(mut comp) = world.get_mut::<NetworkComponent>(entity) {
                 comp.last_speed = speed;
             }
-        }
+        });
     })
     .await;
 }

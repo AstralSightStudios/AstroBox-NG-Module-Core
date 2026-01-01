@@ -2,11 +2,10 @@ use pb::xiaomi::protocol::{self, WearPacket};
 
 use crate::{
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
-    ecs::{logic_component::LogicCompMeta, system::SysMeta},
-    impl_has_sys_meta, impl_logic_component,
+    ecs::Component,
 };
 
-use super::shared::SystemRequestExt;
+use super::shared::{HasOwnerId, SystemRequestExt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppInfo {
@@ -14,20 +13,23 @@ pub struct AppInfo {
     pub fingerprint: Vec<u8>,
 }
 
+#[derive(Component)]
 pub struct ThirdpartyAppSystem {
-    meta: SysMeta,
+    owner_id: String,
 }
 
 impl Default for ThirdpartyAppSystem {
     fn default() -> Self {
-        register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self {
-            meta: SysMeta::default(),
-        }
+        Self::new(String::new())
     }
 }
 
 impl ThirdpartyAppSystem {
+    pub fn new(owner_id: String) -> Self {
+        register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self { owner_id }
+    }
+
     pub fn send_phone_message(&mut self, app: &AppInfo, payload: Vec<u8>) {
         let packet = build_thirdparty_app_msg_content(app, payload);
         self.enqueue_request(packet);
@@ -70,10 +72,10 @@ impl ThirdpartyAppSystem {
             text
         );
 
-        if let Some(device_addr) = self.meta.owner.clone() {
+        if !self.owner_id.is_empty() {
             crate::events::emit(crate::events::CoreEvent::InterconnectMessage(
                 crate::events::InterconnectMessage {
-                    device_addr,
+                    device_addr: self.owner_id.clone(),
                     pkg_name,
                     payload: message.content,
                 },
@@ -109,25 +111,21 @@ impl L2PbExt for ThirdpartyAppSystem {
     }
 }
 
-impl_has_sys_meta!(ThirdpartyAppSystem, meta);
-
-#[derive(serde::Serialize)]
-pub struct ThirdpartyAppComponent {
-    #[serde(skip_serializing)]
-    meta: LogicCompMeta,
-}
-
-impl ThirdpartyAppComponent {
-    pub const ID: &'static str = "MiWearDeviceThirdpartyAppLogicComponent";
-
-    pub fn new() -> Self {
-        Self {
-            meta: LogicCompMeta::new::<ThirdpartyAppSystem>(Self::ID),
-        }
+impl HasOwnerId for ThirdpartyAppSystem {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
     }
 }
 
-impl_logic_component!(ThirdpartyAppComponent, meta);
+#[derive(Component, serde::Serialize)]
+pub struct ThirdpartyAppComponent {
+}
+
+impl ThirdpartyAppComponent {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
 fn build_thirdparty_app_sync_status(
     basic_info: protocol::BasicInfo,
