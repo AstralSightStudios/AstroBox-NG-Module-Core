@@ -4,6 +4,7 @@ use crate::{
     asyncrt::universal_block_on,
     device::{
         Device,
+        DeviceKind,
         xiaomi::{
             config::XiaomiDeviceConfig,
             packet::{cipher, dispatcher},
@@ -110,7 +111,7 @@ impl XiaomiDevice {
             });
         }
 
-        let base = Device::new(name, addr);
+        let base = Device::new(name, addr, DeviceKind::Xiaomi);
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
         let sar = sar::SarController::new(
             tk_handle.clone(),
