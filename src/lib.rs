@@ -3,6 +3,7 @@ pub mod constants;
 pub mod crypto;
 pub mod device;
 pub mod ecs;
+pub mod events;
 #[macro_use]
 pub mod error;
 pub mod logger;

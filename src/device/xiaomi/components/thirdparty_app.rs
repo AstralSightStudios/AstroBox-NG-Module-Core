@@ -62,14 +62,27 @@ impl ThirdpartyAppSystem {
     }
 
     fn handle_message_content(&mut self, message: protocol::MessageContent) {
+        let pkg_name = message.basic_info.package_name.clone();
         let text = String::from_utf8_lossy(&message.content).to_string();
         log::debug!(
             "Received third-party app message from {}: {}",
-            message.basic_info.package_name,
+            pkg_name,
             text
         );
 
-        // TODO: 集成插件系统后，将消息分发给插件。
+        if let Some(device_addr) = self.meta.owner.clone() {
+            crate::events::emit(crate::events::CoreEvent::InterconnectMessage(
+                crate::events::InterconnectMessage {
+                    device_addr,
+                    pkg_name,
+                    payload: message.content,
+                },
+            ));
+        } else {
+            log::warn!(
+                "ThirdpartyAppSystem missing owner; interconnect message dropped"
+            );
+        }
     }
 }
 
