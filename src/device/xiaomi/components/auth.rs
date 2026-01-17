@@ -74,7 +74,7 @@ impl AuthSystem {
 impl L2PbExt for AuthSystem {
     fn on_pb_packet(&mut self, payload: WearPacket) {
         #[cfg(not(target_os = "espidf"))]
-        log::info!("on_pb_packet: {}", serde_json::to_string(&payload).unwrap());
+        log::trace!("on_pb_packet: {}", serde_json::to_string(&payload).unwrap());
         if let Some(pkt) = payload.payload {
             match pkt {
                 pb::xiaomi::protocol::wear_packet::Payload::Account(acc) => {

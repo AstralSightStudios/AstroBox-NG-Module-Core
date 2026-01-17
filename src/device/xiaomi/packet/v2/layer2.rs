@@ -136,13 +136,13 @@ impl L2Packet {
 
     pub fn pb_write(packet: WearPacket) -> Self {
         #[cfg(not(target_os = "espidf"))]
-        log::info!("l2_pb_write: {}", serde_json::to_string(&packet).unwrap());
+        log::trace!("l2_pb_write: {}", serde_json::to_string(&packet).unwrap());
         Self::new(L2Channel::Pb, L2OpCode::Write, packet.encode_to_vec())
     }
 
     pub fn pb_write_enc(packet: WearPacket, cipher: &dyn L2Cipher) -> Result<Self, L2Error> {
         #[cfg(not(target_os = "espidf"))]
-        log::info!(
+        log::trace!(
             "l2_pb_write_enc: {}",
             serde_json::to_string(&packet).unwrap()
         );
