@@ -61,7 +61,7 @@ impl InstallSystem {
         file_data: Vec<u8>,
         package_name: Option<&str>,
     ) -> Result<InstallFuture> {
-        self.send_install_request_with_progress(r#type, file_data, package_name, Arc::new(|_| {}))
+        self.send_install_request_with_progress(r#type, file_data, package_name, Arc::new(|_| {}), None)
     }
 
     pub fn send_install_request_with_progress(
@@ -70,8 +70,23 @@ impl InstallSystem {
         file_data: Vec<u8>,
         package_name: Option<&str>,
         progress_cb: Arc<dyn Fn(SendMassCallbackData) + Send + Sync>,
+        watchface_id: Option<&str>,
     ) -> Result<InstallFuture> {
         let owner = self.owner_id.clone();
+
+        let mut file_data = file_data;
+
+        // 如果提供了新的watchface_id且是表盘类型，先修改文件中的ID
+        if let (MassDataType::Watchface, Some(new_id)) = (r#type, watchface_id) {
+            let res_config =
+                with_device_component_mut::<XiaomiDevice, ResConfig, _>(
+                    owner.clone(),
+                    |dev| dev.config.res.clone(),
+                )
+                .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
+            resutils::set_watchface_id(&mut file_data, &res_config, new_id)
+                .map_err(|err| anyhow_site!("failed to set watchface id: {}", err))?;
+        }
 
         let (prepare_tx, prepare_rx) = oneshot::channel::<i32>();
         let (result_tx_opt, result_rx_opt) = match r#type {

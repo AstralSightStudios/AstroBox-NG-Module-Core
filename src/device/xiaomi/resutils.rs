@@ -20,6 +20,48 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     Some(digits)
 }
 
+pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Result<(), String> {
+    // 验证新ID是否为纯数字
+    if !new_id.chars().all(|c| c.is_ascii_digit()) {
+        return Err("Watchface ID must contain only digits".to_string());
+    }
+
+    let offset = config.watchface_id_offset;
+    let field_len = config.watchface_id_field_len;
+
+    if data.len() < offset + field_len {
+        return Err("Data too short to contain watchface ID field".to_string());
+    }
+
+    // 获取当前ID
+    let field = &data[offset..offset + field_len];
+    let start = field
+        .iter()
+        .position(|&b| (b as char).is_ascii_digit())
+        .ok_or("No digits found in watchface ID field")?;
+    let current_digits: String = field[start..]
+        .iter()
+        .take_while(|&&b| (b as char).is_ascii_digit())
+        .map(|&b| b as char)
+        .collect();
+
+    // 检查新ID长度是否与原ID相同
+    if new_id.len() != current_digits.len() {
+        return Err(format!(
+            "New watchface ID length ({}) does not match current ID length ({})",
+            new_id.len(),
+            current_digits.len()
+        ));
+    }
+
+    // 替换ID
+    let id_start = offset + start;
+    let id_bytes = new_id.as_bytes();
+    data[id_start..id_start + id_bytes.len()].copy_from_slice(id_bytes);
+
+    Ok(())
+}
+
 #[derive(Clone, Copy, Serialize_repr, PartialEq)]
 #[repr(u8)]
 pub enum FileType {
