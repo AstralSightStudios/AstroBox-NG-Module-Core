@@ -43,12 +43,9 @@ impl AuthSystem {
         let nonce = crate::tools::generate_random_bytes(16);
 
         let nonce_clone = nonce.clone();
-        with_device_component_mut::<AuthComponent, _, _>(
-            self.owner_id.clone(),
-            move |comp| {
-                comp.random_bytes = nonce_clone;
-            },
-        )
+        with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
+            comp.random_bytes = nonce_clone;
+        })
         .map_err(|err| anyhow_site!("failed to update auth component nonce: {err:?}"))?;
 
         with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), move |dev| {
@@ -84,18 +81,14 @@ impl L2PbExt for AuthSystem {
                                 verify_pkt,
                             ) => match build_auth_step_2(&self.owner_id, &verify_pkt) {
                                 Ok(verify_ret) => {
-                                    if let Err(err) =
-                                        with_device_component_mut::<XiaomiDevice, _, _>(
-                                            self.owner_id.clone(),
-                                            move |dev| {
-                                                dev.sar
-                                                    .lock()
-                                                    .enqueue(
-                                                        L2Packet::pb_write(verify_ret).to_bytes(),
-                                                    );
-                                            },
-                                        )
-                                    {
+                                    if let Err(err) = with_device_component_mut::<XiaomiDevice, _, _>(
+                                        self.owner_id.clone(),
+                                        move |dev| {
+                                            dev.sar
+                                                .lock()
+                                                .enqueue(L2Packet::pb_write(verify_ret).to_bytes());
+                                        },
+                                    ) {
                                         let anyhow_err = anyhow_site!(
                                             "failed to enqueue auth confirm packet: {err:?}"
                                         );
@@ -113,13 +106,12 @@ impl L2PbExt for AuthSystem {
                                 }
                             },
                             pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_dc) => {
-                                let update_res =
-                                    with_device_component_mut::<AuthComponent, _, _>(
-                                        self.owner_id.clone(),
-                                        |comp| {
-                                            comp.is_authed = true;
-                                        },
-                                    );
+                                let update_res = with_device_component_mut::<AuthComponent, _, _>(
+                                    self.owner_id.clone(),
+                                    |comp| {
+                                        comp.is_authed = true;
+                                    },
+                                );
 
                                 match update_res {
                                     Ok(_) => {
@@ -217,24 +209,24 @@ fn build_auth_step_2(
         return Err(anyhow_site!("nonce/hmac length mismatch"));
     }
 
-    let authkey = with_device_component_mut::<AuthComponent, String, _>(
-        owner_id.to_string(),
-        |comp| comp.authkey.clone(),
-    )
-    .map_err(|err| anyhow_site!("failed to read auth key: {err:?}"))?;
+    let authkey =
+        with_device_component_mut::<AuthComponent, String, _>(owner_id.to_string(), |comp| {
+            comp.authkey.clone()
+        })
+        .map_err(|err| anyhow_site!("failed to read auth key: {err:?}"))?;
 
-    let (force_android, connect_type) = with_device_component_mut::<
-        XiaomiDevice,
-        (bool, crate::device::xiaomi::ConnectType),
-        _,
-    >(owner_id.to_string(), |dev| (dev.force_android, dev.connect_type))
-    .map_err(|err| anyhow_site!("failed to read device connection type: {err:?}"))?;
+    let (force_android, connect_type) =
+        with_device_component_mut::<XiaomiDevice, (bool, crate::device::xiaomi::ConnectType), _>(
+            owner_id.to_string(),
+            |dev| (dev.force_android, dev.connect_type),
+        )
+        .map_err(|err| anyhow_site!("failed to read device connection type: {err:?}"))?;
 
-    let p_random_vec = with_device_component_mut::<AuthComponent, Vec<u8>, _>(
-        owner_id.to_string(),
-        |comp| comp.random_bytes.clone(),
-    )
-    .map_err(|err| anyhow_site!("failed to read random bytes: {err:?}"))?;
+    let p_random_vec =
+        with_device_component_mut::<AuthComponent, Vec<u8>, _>(owner_id.to_string(), |comp| {
+            comp.random_bytes.clone()
+        })
+        .map_err(|err| anyhow_site!("failed to read random bytes: {err:?}"))?;
     if p_random_vec.len() != 16 {
         return Err(anyhow_site!("phone nonce length mismatch"));
     }

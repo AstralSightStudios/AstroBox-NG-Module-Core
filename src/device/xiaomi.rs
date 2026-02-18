@@ -3,8 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use crate::{
     asyncrt::universal_block_on,
     device::{
-        Device,
-        DeviceKind,
+        Device, DeviceKind,
         xiaomi::{
             config::XiaomiDeviceConfig,
             packet::{cipher, dispatcher},

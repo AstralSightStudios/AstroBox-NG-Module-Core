@@ -111,14 +111,13 @@ impl L2PbExt for InfoSystem {
                         let dev_info_for_slot = dev_info.clone();
                         let model = dev_info.model.clone();
                         let serial_number = dev_info.serial_number.clone();
-                        let update_res =
-                            with_device_component_mut::<InfoComponent, _, _>(
-                                self.owner_id.clone(),
-                                move |comp| {
-                                    comp.model = model;
-                                    comp.sn = serial_number;
-                                },
-                            );
+                        let update_res = with_device_component_mut::<InfoComponent, _, _>(
+                            self.owner_id.clone(),
+                            move |comp| {
+                                comp.model = model;
+                                comp.sn = serial_number;
+                            },
+                        );
 
                         match update_res {
                             Ok(_) => self.device_info_wait.fulfill(dev_info_for_slot),
@@ -134,13 +133,12 @@ impl L2PbExt for InfoSystem {
                     pb::xiaomi::protocol::system::Payload::DeviceStatus(dev_status) => {
                         let dev_status_for_slot = dev_status.clone();
                         let battery = dev_status.battery;
-                        let update_res =
-                            with_device_component_mut::<InfoComponent, _, _>(
-                                self.owner_id.clone(),
-                                move |comp| {
-                                    comp.battery = Some(battery);
-                                },
-                            );
+                        let update_res = with_device_component_mut::<InfoComponent, _, _>(
+                            self.owner_id.clone(),
+                            move |comp| {
+                                comp.battery = Some(battery);
+                            },
+                        );
 
                         match update_res {
                             Ok(_) => self.device_status_wait.fulfill(dev_status_for_slot),
@@ -157,14 +155,13 @@ impl L2PbExt for InfoSystem {
                         let storage_for_slot = storage.clone();
                         let total = storage.total;
                         let used = storage.used;
-                        let update_res =
-                            with_device_component_mut::<InfoComponent, _, _>(
-                                self.owner_id.clone(),
-                                move |comp| {
-                                    comp.storage.free = total - used;
-                                    comp.storage.total = total;
-                                },
-                            );
+                        let update_res = with_device_component_mut::<InfoComponent, _, _>(
+                            self.owner_id.clone(),
+                            move |comp| {
+                                comp.storage.free = total - used;
+                                comp.storage.total = total;
+                            },
+                        );
 
                         match update_res {
                             Ok(_) => self.device_storage_wait.fulfill(storage_for_slot),

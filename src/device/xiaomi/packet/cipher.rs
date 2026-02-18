@@ -11,6 +11,7 @@ use crate::{
         components::auth::AuthComponent,
         packet::v2::layer2::{L2Cipher, L2Packet},
     },
+    ecs::runtime::Runtime,
 };
 
 pub type SharedL2Cipher = Arc<dyn L2Cipher + Send + Sync>;
@@ -72,6 +73,13 @@ pub fn ensure_l2_cipher_blocking(device_id: &str, sar_version: u32) -> Option<Sh
         return Some(existing);
     }
 
+    if crate::ecs::in_rt_thread() {
+        return crate::ecs::try_with_rt_local_mut(|rt| {
+            ensure_l2_cipher_in_runtime(rt, device_id, sar_version)
+        })
+        .flatten();
+    }
+
     let device_id_owned = device_id.to_string();
     crate::asyncrt::universal_block_on(|| async {
         ensure_l2_cipher(&device_id_owned, sar_version).await
@@ -109,20 +117,48 @@ pub struct V2L2Cipher {
     dec_key: Vec<u8>,
 }
 
+fn auth_keys_from_runtime(rt: &mut Runtime, device_id: &str) -> (Vec<u8>, Vec<u8>) {
+    rt.with_device_mut(device_id, |world, entity| {
+        if let Some(auth_comp) = world.get::<AuthComponent>(entity) {
+            (auth_comp.enc_key.clone(), auth_comp.dec_key.clone())
+        } else {
+            (vec![], vec![])
+        }
+    })
+    .unwrap_or((vec![], vec![]))
+}
+
+fn ensure_l2_cipher_in_runtime(
+    rt: &mut Runtime,
+    device_id: &str,
+    sar_version: u32,
+) -> Option<SharedL2Cipher> {
+    match sar_version {
+        2 => {
+            let (enc_key, dec_key) = auth_keys_from_runtime(rt, device_id);
+            if enc_key.len() == 16 && dec_key.len() == 16 {
+                let cipher: SharedL2Cipher = Arc::new(V2L2Cipher { enc_key, dec_key });
+                register_l2_cipher(device_id.to_string(), cipher.clone());
+                Some(cipher)
+            } else {
+                log::debug!(
+                    "ensure_l2_cipher: device {} missing auth keys (enc={}, dec={})",
+                    device_id,
+                    enc_key.len(),
+                    dec_key.len()
+                );
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 impl V2L2Cipher {
     pub async fn new(device_id: String) -> Option<Self> {
         let device_id_clone = device_id.clone();
-        let keys = crate::ecs::with_rt_mut(move |rt| {
-            rt.with_device_mut(&device_id_clone, |world, entity| {
-                if let Some(auth_comp) = world.get::<AuthComponent>(entity) {
-                    (auth_comp.enc_key.clone(), auth_comp.dec_key.clone())
-                } else {
-                    (vec![], vec![])
-                }
-            })
-            .unwrap_or((vec![], vec![]))
-        })
-        .await;
+        let keys =
+            crate::ecs::with_rt_mut(move |rt| auth_keys_from_runtime(rt, &device_id_clone)).await;
         let enc_key = keys.0;
         let dec_key = keys.1;
         if enc_key.len() == 16 && dec_key.len() == 16 {

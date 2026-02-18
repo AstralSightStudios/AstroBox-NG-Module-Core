@@ -81,9 +81,7 @@ impl ThirdpartyAppSystem {
                 },
             ));
         } else {
-            log::warn!(
-                "ThirdpartyAppSystem missing owner; interconnect message dropped"
-            );
+            log::warn!("ThirdpartyAppSystem missing owner; interconnect message dropped");
         }
     }
 }
@@ -118,8 +116,7 @@ impl HasOwnerId for ThirdpartyAppSystem {
 }
 
 #[derive(Component, serde::Serialize)]
-pub struct ThirdpartyAppComponent {
-}
+pub struct ThirdpartyAppComponent {}
 
 impl ThirdpartyAppComponent {
     pub fn new() -> Self {

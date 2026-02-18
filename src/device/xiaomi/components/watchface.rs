@@ -65,8 +65,7 @@ impl HasOwnerId for WatchfaceSystem {
 }
 
 #[derive(Component, serde::Serialize)]
-pub struct WatchfaceComponent {
-}
+pub struct WatchfaceComponent {}
 
 impl WatchfaceComponent {
     pub fn new() -> Self {

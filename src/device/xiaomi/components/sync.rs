@@ -50,8 +50,7 @@ impl HasOwnerId for SyncSystem {
 }
 
 #[derive(Component, serde::Serialize)]
-pub struct SyncComponent {
-}
+pub struct SyncComponent {}
 
 impl SyncComponent {
     pub fn new() -> Self {

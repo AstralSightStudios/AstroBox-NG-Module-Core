@@ -1,3 +1,7 @@
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::xiaomi::components::network::NetworkComponent;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::components::{
     auth::{AuthComponent, AuthSystem},
     info::{InfoComponent, InfoSystem},
@@ -8,10 +12,6 @@ use crate::device::xiaomi::components::{
     thirdparty_app::{ThirdpartyAppComponent, ThirdpartyAppSystem},
     watchface::{WatchfaceComponent, WatchfaceSystem},
 };
-#[cfg(not(target_arch = "wasm32"))]
-use crate::device::xiaomi::components::network::NetworkComponent;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
 use crate::device::xiaomi::{SendError, XiaomiDevice, cleanup_cached_state};
@@ -37,11 +37,7 @@ pub struct Device {
 
 impl Device {
     pub fn new(name: String, addr: String, kind: DeviceKind) -> Self {
-        Self {
-            name,
-            addr,
-            kind,
-        }
+        Self { name, addr, kind }
     }
 
     pub fn name(&self) -> &str {

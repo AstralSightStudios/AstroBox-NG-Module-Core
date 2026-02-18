@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::xiaomi::components::network::{NetworkComponent, NetworkSystem};
 use crate::{
     device::xiaomi::{
         XiaomiDevice,
@@ -15,8 +17,6 @@ use crate::{
     ecs::runtime::Runtime,
     ecs::with_rt_mut,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use crate::device::xiaomi::components::network::{NetworkComponent, NetworkSystem};
 use bevy_ecs::{component::Component, entity::Entity, world::World};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -94,7 +94,10 @@ fn build_graph(rt: &mut Runtime) -> ReactFlowGraph {
     nodes.push(ReactFlowNode {
         id: runtime_node_id.clone(),
         node_type: Some("input".to_string()),
-        position: ReactFlowPosition { x: RUNTIME_X, y: 0.0 },
+        position: ReactFlowPosition {
+            x: RUNTIME_X,
+            y: 0.0,
+        },
         data: ReactFlowNodeData {
             label: "ECS Runtime".to_string(),
             kind: ReactFlowNodeKind::Runtime,

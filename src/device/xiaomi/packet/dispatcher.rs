@@ -67,7 +67,10 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
 
             let sar_version = crate::ecs::with_rt_mut({
                 let device_id_clone = device_id.clone();
-                move |rt| rt.component_ref::<XiaomiDevice>(&device_id_clone).map(|dev| dev.sar_version)
+                move |rt| {
+                    rt.component_ref::<XiaomiDevice>(&device_id_clone)
+                        .map(|dev| dev.sar_version)
+                }
             })
             .await;
             let shared_cipher: Option<SharedL2Cipher> = match sar_version {

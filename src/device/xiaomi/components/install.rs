@@ -61,7 +61,13 @@ impl InstallSystem {
         file_data: Vec<u8>,
         package_name: Option<&str>,
     ) -> Result<InstallFuture> {
-        self.send_install_request_with_progress(r#type, file_data, package_name, Arc::new(|_| {}), None)
+        self.send_install_request_with_progress(
+            r#type,
+            file_data,
+            package_name,
+            Arc::new(|_| {}),
+            None,
+        )
     }
 
     pub fn send_install_request_with_progress(
@@ -79,10 +85,9 @@ impl InstallSystem {
         // 如果提供了新的watchface_id且是表盘类型，先修改文件中的ID
         if let (MassDataType::Watchface, Some(new_id)) = (r#type, watchface_id) {
             let res_config =
-                with_device_component_mut::<XiaomiDevice, ResConfig, _>(
-                    owner.clone(),
-                    |dev| dev.config.res.clone(),
-                )
+                with_device_component_mut::<XiaomiDevice, ResConfig, _>(owner.clone(), |dev| {
+                    dev.config.res.clone()
+                })
                 .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
             resutils::set_watchface_id(&mut file_data, &res_config, new_id)
                 .map_err(|err| anyhow_site!("failed to set watchface id: {}", err))?;
@@ -117,12 +122,11 @@ impl InstallSystem {
         let req_result: Result<WearPacket> = (|| {
             Ok(match r#type {
                 MassDataType::Watchface => {
-                    let res_config =
-                        with_device_component_mut::<XiaomiDevice, ResConfig, _>(
-                            owner.clone(),
-                            |dev| dev.config.res.clone(),
-                        )
-                        .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
+                    let res_config = with_device_component_mut::<XiaomiDevice, ResConfig, _>(
+                        owner.clone(),
+                        |dev| dev.config.res.clone(),
+                    )
+                    .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
                     let id = resutils::get_watchface_id(&file_data, &res_config)
                         .context("invalid watchface id")?;
                     build_watchface_install_request(&id, file_data.len())
@@ -154,16 +158,15 @@ impl InstallSystem {
             }
         };
 
-        if let Err(err) = with_device_component_mut::<XiaomiDevice, (), _>(
-            owner.clone(),
-            move |dev| {
+        if let Err(err) =
+            with_device_component_mut::<XiaomiDevice, (), _>(owner.clone(), move |dev| {
                 packet::cipher::enqueue_pb_packet(
                     dev,
                     req,
                     "InstallSystem::send_install_request_with_progress",
                 );
-            },
-        ) {
+            })
+        {
             let owner_for_cleanup = owner.clone();
             universal_block_on(|| clear_install_waiters(owner_for_cleanup.clone()));
             return Err(anyhow_site!("failed to enqueue install request: {:?}", err));
@@ -219,73 +222,67 @@ impl L2PbExt for InstallSystem {
         let _ = with_device_component_mut::<InstallComponent, _, _>(owner, move |comp| {
             let mut waiters_guard = comp.waiters.lock();
             if let Some(waiters) = waiters_guard.as_mut() {
-                    match payload.payload {
-                        Some(protocol::wear_packet::Payload::WatchFace(wf)) => {
-                            if let MassDataType::Watchface = waiters.data_type {
-                                match wf.payload {
-                                    Some(protocol::watch_face::Payload::PrepareStatus(status)) => {
-                                        if let Some(tx) = waiters.prepare_tx.take() {
-                                            let _ = tx.send(status);
-                                        }
-                                    }
-                                    Some(protocol::watch_face::Payload::InstallResult(result)) => {
-                                        if let Some(tx) = waiters.result_tx.take() {
-                                            let _ = tx.send(InstallResultEvent::Watchface(result));
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Some(protocol::wear_packet::Payload::ThirdpartyApp(ta)) => {
-                            if let MassDataType::ThirdPartyApp = waiters.data_type {
-                                match ta.payload {
-                                    Some(protocol::thirdparty_app::Payload::InstallResponse(
-                                        resp,
-                                    )) => {
-                                        if let Some(tx) = waiters.prepare_tx.take() {
-                                            let _ = tx.send(resp.prepare_status);
-                                        }
-                                    }
-                                    Some(protocol::thirdparty_app::Payload::InstallResult(
-                                        result,
-                                    )) => {
-                                        if let Some(tx) = waiters.result_tx.take() {
-                                            let _ =
-                                                tx.send(InstallResultEvent::ThirdpartyApp(result));
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Some(protocol::wear_packet::Payload::System(sys)) => {
-                            if let MassDataType::Firmare = waiters.data_type {
-                                if let Some(protocol::system::Payload::PrepareOtaResponse(resp)) =
-                                    sys.payload
-                                {
+                match payload.payload {
+                    Some(protocol::wear_packet::Payload::WatchFace(wf)) => {
+                        if let MassDataType::Watchface = waiters.data_type {
+                            match wf.payload {
+                                Some(protocol::watch_face::Payload::PrepareStatus(status)) => {
                                     if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(resp.prepare_status);
-                                    } else if let Some(tx) = waiters.result_tx.take() {
-                                        let _ = tx.send(InstallResultEvent::Firmware(resp));
+                                        let _ = tx.send(status);
                                     }
                                 }
-                            }
-                        }
-                        Some(protocol::wear_packet::Payload::Notification(nc)) => {
-                            if let MassDataType::NotificationIcon = waiters.data_type {
-                                if let Some(protocol::notification::Payload::AppIconResponse(
-                                    resp,
-                                )) = nc.payload
-                                {
-                                    if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(resp.prepare_status);
+                                Some(protocol::watch_face::Payload::InstallResult(result)) => {
+                                    if let Some(tx) = waiters.result_tx.take() {
+                                        let _ = tx.send(InstallResultEvent::Watchface(result));
                                     }
                                 }
+                                _ => {}
                             }
                         }
-                        _ => {}
                     }
+                    Some(protocol::wear_packet::Payload::ThirdpartyApp(ta)) => {
+                        if let MassDataType::ThirdPartyApp = waiters.data_type {
+                            match ta.payload {
+                                Some(protocol::thirdparty_app::Payload::InstallResponse(resp)) => {
+                                    if let Some(tx) = waiters.prepare_tx.take() {
+                                        let _ = tx.send(resp.prepare_status);
+                                    }
+                                }
+                                Some(protocol::thirdparty_app::Payload::InstallResult(result)) => {
+                                    if let Some(tx) = waiters.result_tx.take() {
+                                        let _ = tx.send(InstallResultEvent::ThirdpartyApp(result));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(protocol::wear_packet::Payload::System(sys)) => {
+                        if let MassDataType::Firmare = waiters.data_type {
+                            if let Some(protocol::system::Payload::PrepareOtaResponse(resp)) =
+                                sys.payload
+                            {
+                                if let Some(tx) = waiters.prepare_tx.take() {
+                                    let _ = tx.send(resp.prepare_status);
+                                } else if let Some(tx) = waiters.result_tx.take() {
+                                    let _ = tx.send(InstallResultEvent::Firmware(resp));
+                                }
+                            }
+                        }
+                    }
+                    Some(protocol::wear_packet::Payload::Notification(nc)) => {
+                        if let MassDataType::NotificationIcon = waiters.data_type {
+                            if let Some(protocol::notification::Payload::AppIconResponse(resp)) =
+                                nc.payload
+                            {
+                                if let Some(tx) = waiters.prepare_tx.take() {
+                                    let _ = tx.send(resp.prepare_status);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         });
     }

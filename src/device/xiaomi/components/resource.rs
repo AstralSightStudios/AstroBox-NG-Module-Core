@@ -89,13 +89,12 @@ impl L2PbExt for ResourceSystem {
                     Some(protocol::watch_face::Payload::WatchFaceList(list)) => {
                         let items = list.list.clone();
                         let comp_items = items.clone();
-                        let update_res =
-                            with_device_component_mut::<ResourceComponent, _, _>(
-                                self.owner_id.clone(),
-                                move |comp| {
-                                    comp.watchfaces = comp_items;
-                                },
-                            );
+                        let update_res = with_device_component_mut::<ResourceComponent, _, _>(
+                            self.owner_id.clone(),
+                            move |comp| {
+                                comp.watchfaces = comp_items;
+                            },
+                        );
 
                         match update_res {
                             Ok(_) => self.watchface_wait.fulfill(items),
@@ -128,13 +127,12 @@ impl L2PbExt for ResourceSystem {
                     Some(protocol::thirdparty_app::Payload::AppItemList(list)) => {
                         let items = list.list.clone();
                         let comp_items = items.clone();
-                        let update_res =
-                            with_device_component_mut::<ResourceComponent, _, _>(
-                                self.owner_id.clone(),
-                                move |comp| {
-                                    comp.quick_apps = comp_items;
-                                },
-                            );
+                        let update_res = with_device_component_mut::<ResourceComponent, _, _>(
+                            self.owner_id.clone(),
+                            move |comp| {
+                                comp.quick_apps = comp_items;
+                            },
+                        );
 
                         match update_res {
                             Ok(_) => self.quick_app_wait.fulfill(items),

@@ -122,6 +122,25 @@ mod native {
         tx.send(job).expect("runtime thread has stopped");
         ret_rx.await.expect("runtime thread dropped the response")
     }
+
+    pub fn in_rt_thread() -> bool {
+        IN_RT_THREAD.with(|flag| flag.get())
+    }
+
+    pub fn try_with_rt_local_mut<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Runtime) -> R,
+    {
+        if !in_rt_thread() {
+            return None;
+        }
+
+        Some(RT_LOCAL_PTR.with(|cell| {
+            let ptr = cell.get();
+            debug_assert!(!ptr.is_null(), "Runtime thread-local pointer not set");
+            unsafe { f(&mut *ptr) }
+        }))
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -168,6 +187,23 @@ mod wasm {
                     .as_mut()
                     .expect("RT not initialized. Call ecs::init_runtime_* first.");
                 f(rt)
+            }
+        })
+    }
+
+    pub fn in_rt_thread() -> bool {
+        RT.with(|cell| cell.borrow().is_some())
+    }
+
+    pub fn try_with_rt_local_mut<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Runtime) -> R,
+    {
+        RT.with(|cell| {
+            let ptr = cell.as_ptr();
+            unsafe {
+                let rt_opt = &mut *ptr;
+                rt_opt.as_mut().map(f)
             }
         })
     }
