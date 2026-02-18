@@ -19,7 +19,15 @@ pub fn build_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "espidf"))]
+pub fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "espidf")))]
 pub fn build_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
@@ -33,7 +41,11 @@ where
     {
         executor::block_on(f())
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "espidf"))]
+    {
+        build_runtime().block_on(f())
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "espidf")))]
     {
         tokio::task::block_in_place(|| tokio::runtime::Runtime::new().unwrap().block_on(f()))
     }
