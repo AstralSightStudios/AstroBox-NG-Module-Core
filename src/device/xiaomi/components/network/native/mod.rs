@@ -20,7 +20,6 @@ use tokio::{
     net::TcpStream,
     runtime::Handle,
     sync::{mpsc, watch},
-    time,
 };
 use tokio_util::sync::PollSender;
 use udp_stream::UdpStream;
@@ -58,14 +57,12 @@ pub struct NetWorkSpeed {
 pub struct NetworkComponent {
     #[serde(skip_serializing)]
     config: NetworkConfig,
-    pub last_speed: NetWorkSpeed,
 }
 
 impl NetworkComponent {
     pub fn new(config: NetworkConfig) -> Self {
         Self {
             config,
-            last_speed: NetWorkSpeed::default(),
         }
     }
 
@@ -78,6 +75,7 @@ impl NetworkComponent {
 pub struct NetworkSystem {
     owner_id: String,
     runtime: Mutex<Option<NetworkRuntime>>,
+    meter: Mutex<Option<BandwidthMeter>>,
 }
 
 impl Default for NetworkSystem {
@@ -92,6 +90,7 @@ impl NetworkSystem {
         Self {
             owner_id,
             runtime: Mutex::new(None),
+            meter: Mutex::new(None),
         }
     }
 
@@ -102,8 +101,11 @@ impl NetworkSystem {
         if self.owner_id.is_empty() {
             return Err(anyhow_site!("NetworkSystem missing owner"));
         }
-        let runtime = NetworkRuntime::new(self.owner_id.clone(), config, handle)?;
+        let meter_window = Duration::from_secs(config.meter_window_secs.max(1));
+        let meter = BandwidthMeter::new(meter_window);
+        let runtime = NetworkRuntime::new(self.owner_id.clone(), config, handle, &meter)?;
         *self.runtime.lock() = Some(runtime);
+        *self.meter.lock() = Some(meter);
         Ok(())
     }
 
@@ -119,6 +121,12 @@ impl NetworkSystem {
 
         Ok(())
     }
+
+    pub fn get_speed(&self) -> NetWorkSpeed {
+        let meter = self.meter.lock().as_ref().unwrap().clone();
+        NetWorkSpeed { write: meter.write_speed(), read: meter.read_speed() }
+    }
+
 }
 
 impl XiaomiSystemExt for NetworkSystem {
@@ -179,7 +187,7 @@ struct NetworkRuntime {
 }
 
 impl NetworkRuntime {
-    fn new(owner: String, config: NetworkConfig, handle: Handle) -> Result<Self> {
+    fn new(owner: String, config: NetworkConfig, handle: Handle,meter:&BandwidthMeter) -> Result<Self> {
         let ingress_capacity = config.ingress_buffer.max(1);
         let tun_capacity = config.tun_buffer.max(1);
         let outbound_capacity = config.outbound_buffer.max(1);
@@ -188,8 +196,6 @@ impl NetworkRuntime {
         let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(tun_capacity);
         let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(outbound_capacity);
         let capture = prepare_capture_writer(&owner, &config);
-        let meter_window = Duration::from_secs(config.meter_window_secs.max(1));
-        let meter = BandwidthMeter::new(meter_window);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut tasks = Vec::new();
@@ -254,35 +260,6 @@ impl NetworkRuntime {
                                     }
                                     None => break,
                                 }
-                            }
-                            changed = shutdown.changed() => {
-                                if changed.is_ok() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                },
-                handle.clone(),
-            ));
-        }
-
-        // 流量计数器循环
-        {
-            let owner_clone = owner.clone();
-            let meter_clone = meter.clone();
-            let mut shutdown = shutdown_rx.clone();
-            tasks.push(crate::asyncrt::spawn_with_handle(
-                async move {
-                    let mut ticker = time::interval(Duration::from_secs(1));
-                    loop {
-                        tokio::select! {
-                            _ = ticker.tick() => {
-                                let speed = NetWorkSpeed {
-                                    write: meter_clone.write_speed(),
-                                    read: meter_clone.read_speed(),
-                                };
-                                update_speed(&owner_clone, speed).await;
                             }
                             changed = shutdown.changed() => {
                                 if changed.is_ok() {
@@ -495,18 +472,6 @@ async fn enqueue_network_payload(owner: &str, payload: Vec<u8>) -> Result<()> {
         .ok_or_else(|| anyhow_site!("device {} not found for network send", owner_id))?
     })
     .await
-}
-
-async fn update_speed(owner: &str, speed: NetWorkSpeed) {
-    let owner_id = owner.to_string();
-    let _ = crate::ecs::with_rt_mut(move |rt| {
-        let _ = rt.with_device_mut(&owner_id, |world, entity| {
-            if let Some(mut comp) = world.get_mut::<NetworkComponent>(entity) {
-                comp.last_speed = speed;
-            }
-        });
-    })
-    .await;
 }
 
 fn prepare_capture_writer(owner: &str, config: &NetworkConfig) -> Option<PcapWriter<File>> {
