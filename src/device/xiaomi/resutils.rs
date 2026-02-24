@@ -88,12 +88,11 @@ pub fn get_file_type(data: &[u8]) -> FileType {
             }
         } */
         // 检查尾部是否包含 quickapp 字样
-        let tail = if data.len() > 256 {
-            &data[data.len() - 256..]
-        } else {
-            &data[..]
-        };
-        if String::from_utf8_lossy(tail).contains("toolkit") {
+        let tail = &data[..];
+
+        if String::from_utf8_lossy(tail).contains("toolkit")
+            || String::from_utf8_lossy(tail).contains("manifest-watch.json")
+        {
             return FileType::ThirdPartyApp;
         } else {
             return FileType::Zip;
