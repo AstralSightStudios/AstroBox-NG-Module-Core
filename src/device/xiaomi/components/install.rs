@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 
 use crate::asyncrt::universal_block_on;
 use crate::device::xiaomi::components::{
+    info::InfoSystem,
     mass::{SendMassCallbackData, send_file_for_owner},
     resource::ResourceSystem,
 };
@@ -199,9 +200,7 @@ impl InstallSystem {
                         .await
                         .map_err(|_| anyhow_site!("install result message missing"))?;
                     handle_install_result(r#type, event)?;
-                    if r#type == MassDataType::ThirdPartyApp {
-                        refresh_quick_app_list(owner_for_future.clone()).await;
-                    }
+                    refresh_post_install_state(owner_for_future.clone(), r#type).await;
                 }
 
                 Ok(())
@@ -313,6 +312,46 @@ async fn refresh_quick_app_list(owner: String) {
         }
     })
     .await;
+}
+
+async fn refresh_watchface_list(owner: String) {
+    let _ = crate::ecs::with_rt_mut({
+        move |rt| {
+            let _ = rt.with_device_mut(&owner, |world, entity| {
+                if let Some(mut system) = world.get_mut::<ResourceSystem>(entity) {
+                    let _ = system.request_watchface_list();
+                }
+            });
+        }
+    })
+    .await;
+}
+
+async fn refresh_storage_info(owner: String) {
+    let _ = crate::ecs::with_rt_mut({
+        move |rt| {
+            let _ = rt.with_device_mut(&owner, |world, entity| {
+                if let Some(mut system) = world.get_mut::<InfoSystem>(entity) {
+                    let _ = system.request_device_storage();
+                }
+            });
+        }
+    })
+    .await;
+}
+
+async fn refresh_post_install_state(owner: String, data_type: MassDataType) {
+    match data_type {
+        MassDataType::Watchface => {
+            refresh_watchface_list(owner.clone()).await;
+            refresh_storage_info(owner).await;
+        }
+        MassDataType::ThirdPartyApp => {
+            refresh_quick_app_list(owner.clone()).await;
+            refresh_storage_info(owner).await;
+        }
+        MassDataType::Firmare | MassDataType::NotificationIcon => {}
+    }
 }
 
 fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Result<()> {

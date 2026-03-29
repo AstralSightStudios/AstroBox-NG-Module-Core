@@ -97,7 +97,14 @@ impl L2PbExt for ResourceSystem {
                         );
 
                         match update_res {
-                            Ok(_) => self.watchface_wait.fulfill(items),
+                            Ok(_) => {
+                                crate::events::emit(crate::events::CoreEvent::DeviceStateChanged(
+                                    crate::events::DeviceStateChanged {
+                                        device_addr: self.owner_id.clone(),
+                                    },
+                                ));
+                                self.watchface_wait.fulfill(items);
+                            }
                             Err(err) => {
                                 let anyhow_err = anyhow_site!(
                                     "failed to update watchface list in component: {err:?}"
@@ -135,7 +142,14 @@ impl L2PbExt for ResourceSystem {
                         );
 
                         match update_res {
-                            Ok(_) => self.quick_app_wait.fulfill(items),
+                            Ok(_) => {
+                                crate::events::emit(crate::events::CoreEvent::DeviceStateChanged(
+                                    crate::events::DeviceStateChanged {
+                                        device_addr: self.owner_id.clone(),
+                                    },
+                                ));
+                                self.quick_app_wait.fulfill(items);
+                            }
                             Err(err) => {
                                 let anyhow_err = anyhow_site!(
                                     "failed to update quick app list in component: {err:?}"

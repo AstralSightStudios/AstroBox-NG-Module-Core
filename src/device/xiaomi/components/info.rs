@@ -111,16 +111,27 @@ impl L2PbExt for InfoSystem {
                         let dev_info_for_slot = dev_info.clone();
                         let model = dev_info.model.clone();
                         let serial_number = dev_info.serial_number.clone();
+                        let firmware_version = dev_info.firmware_version.clone();
+                        let product_device = dev_info.product_device.clone();
                         let update_res = with_device_component_mut::<InfoComponent, _, _>(
                             self.owner_id.clone(),
                             move |comp| {
                                 comp.model = model;
                                 comp.sn = serial_number;
+                                comp.firmware_version = firmware_version;
+                                comp.product_device = product_device;
                             },
                         );
 
                         match update_res {
-                            Ok(_) => self.device_info_wait.fulfill(dev_info_for_slot),
+                            Ok(_) => {
+                                crate::events::emit(crate::events::CoreEvent::DeviceStateChanged(
+                                    crate::events::DeviceStateChanged {
+                                        device_addr: self.owner_id.clone(),
+                                    },
+                                ));
+                                self.device_info_wait.fulfill(dev_info_for_slot);
+                            }
                             Err(err) => {
                                 let anyhow_err = anyhow_site!(
                                     "failed to update info component with device info: {err:?}"
@@ -141,7 +152,14 @@ impl L2PbExt for InfoSystem {
                         );
 
                         match update_res {
-                            Ok(_) => self.device_status_wait.fulfill(dev_status_for_slot),
+                            Ok(_) => {
+                                crate::events::emit(crate::events::CoreEvent::DeviceStateChanged(
+                                    crate::events::DeviceStateChanged {
+                                        device_addr: self.owner_id.clone(),
+                                    },
+                                ));
+                                self.device_status_wait.fulfill(dev_status_for_slot);
+                            }
                             Err(err) => {
                                 let anyhow_err = anyhow_site!(
                                     "failed to update info component with device status: {err:?}"
@@ -164,7 +182,14 @@ impl L2PbExt for InfoSystem {
                         );
 
                         match update_res {
-                            Ok(_) => self.device_storage_wait.fulfill(storage_for_slot),
+                            Ok(_) => {
+                                crate::events::emit(crate::events::CoreEvent::DeviceStateChanged(
+                                    crate::events::DeviceStateChanged {
+                                        device_addr: self.owner_id.clone(),
+                                    },
+                                ));
+                                self.device_storage_wait.fulfill(storage_for_slot);
+                            }
                             Err(err) => {
                                 let anyhow_err = anyhow_site!(
                                     "failed to update info component with storage info: {err:?}"
@@ -192,6 +217,8 @@ pub struct InfoComponent {
     //codename: String,
     model: String,
     sn: String,
+    firmware_version: String,
+    product_device: String,
     battery: Option<Battery>,
     storage: StorageInfo,
 }
@@ -202,8 +229,34 @@ impl InfoComponent {
             //codename: "".to_string(),
             model: "".to_string(),
             sn: "".to_string(),
+            firmware_version: "".to_string(),
+            product_device: "".to_string(),
             battery: None,
             storage: StorageInfo { total: 0, free: 0 },
         }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn serial_number(&self) -> &str {
+        &self.sn
+    }
+
+    pub fn firmware_version(&self) -> &str {
+        &self.firmware_version
+    }
+
+    pub fn product_device(&self) -> &str {
+        &self.product_device
+    }
+
+    pub fn battery(&self) -> Option<&Battery> {
+        self.battery.as_ref()
+    }
+
+    pub fn storage(&self) -> &StorageInfo {
+        &self.storage
     }
 }

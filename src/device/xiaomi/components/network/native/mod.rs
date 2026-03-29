@@ -61,9 +61,7 @@ pub struct NetworkComponent {
 
 impl NetworkComponent {
     pub fn new(config: NetworkConfig) -> Self {
-        Self {
-            config,
-        }
+        Self { config }
     }
 
     pub fn config(&self) -> &NetworkConfig {
@@ -124,9 +122,11 @@ impl NetworkSystem {
 
     pub fn get_speed(&self) -> NetWorkSpeed {
         let meter = self.meter.lock().as_ref().unwrap().clone();
-        NetWorkSpeed { write: meter.write_speed(), read: meter.read_speed() }
+        NetWorkSpeed {
+            write: meter.write_speed(),
+            read: meter.read_speed(),
+        }
     }
-
 }
 
 impl XiaomiSystemExt for NetworkSystem {
@@ -187,7 +187,12 @@ struct NetworkRuntime {
 }
 
 impl NetworkRuntime {
-    fn new(owner: String, config: NetworkConfig, handle: Handle,meter:&BandwidthMeter) -> Result<Self> {
+    fn new(
+        owner: String,
+        config: NetworkConfig,
+        handle: Handle,
+        meter: &BandwidthMeter,
+    ) -> Result<Self> {
         let ingress_capacity = config.ingress_buffer.max(1);
         let tun_capacity = config.tun_buffer.max(1);
         let outbound_capacity = config.outbound_buffer.max(1);

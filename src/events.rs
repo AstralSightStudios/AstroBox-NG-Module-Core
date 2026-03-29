@@ -9,8 +9,14 @@ pub struct InterconnectMessage {
 }
 
 #[derive(Debug, Clone)]
+pub struct DeviceStateChanged {
+    pub device_addr: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum CoreEvent {
     InterconnectMessage(InterconnectMessage),
+    DeviceStateChanged(DeviceStateChanged),
 }
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
