@@ -74,6 +74,8 @@ pub async fn create_device<F, Fut>(
     sar_version: u32,
     connect_type: ConnectType,
     tx_win_overrun_allowance: Option<u8>,
+    transport_chunk_size_spp: Option<usize>,
+    transport_chunk_size_ble: Option<usize>,
     force_android: bool,
     sender: F,
 ) -> anyhow::Result<DeviceConnectionInfo>
@@ -96,6 +98,12 @@ where
                 let mut device_config = XiaomiDeviceConfig::default();
                 if let Some(allowance) = tx_win_overrun_allowance {
                     device_config.sar.tx_win_overrun_allowance = allowance.min(16);
+                }
+                if let Some(chunk_size_spp) = transport_chunk_size_spp {
+                    device_config.transport.chunk_size_spp = chunk_size_spp.max(1);
+                }
+                if let Some(chunk_size_ble) = transport_chunk_size_ble {
+                    device_config.transport.chunk_size_ble = chunk_size_ble.max(1);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 let network_config = device_config.network.clone();

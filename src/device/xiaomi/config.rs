@@ -7,7 +7,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            chunk_size_spp: 977,
+            chunk_size_spp: 666,
             chunk_size_ble: 244,
         }
     }

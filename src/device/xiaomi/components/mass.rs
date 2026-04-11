@@ -157,7 +157,6 @@ where
 {
     let file_md5 = crate::tools::calc_md5(&file_data);
     let file_len = file_data.len();
-
     log::info!("Building MASS Prepare response listener...");
 
     // 1) 建立一次性通道，等设备的 PrepareResponse
@@ -175,7 +174,6 @@ where
     .await;
 
     log::info!("Sending MASS Prepare...");
-
     // 2) 发 Prepare 请求，同时取下设备地址（断点续传用来校验是不是同一台设备）
     let device_addr = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
@@ -232,12 +230,6 @@ where
     if total_parts == 0 && !mass_inner_payload_with_crc32.is_empty() {
         bail_site!("Calculated total_parts is 0 for non-empty payload.");
     }
-
-    log::info!(
-        "Starting to send MASS! mass_fragment_max_len={} total_parts={}",
-        &mass_fragment_max_len,
-        &total_parts
-    );
 
     // 5) 断点续传：如果有之前记录且 data/device 都匹配，就从记录的分片号继续
     let start_part = crate::ecs::with_rt_mut({
@@ -324,6 +316,7 @@ where
     let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(batch_limit);
     let mut batch_meta: Vec<(u16, usize)> = Vec::with_capacity(batch_limit);
     let mut last_progress_at = Instant::now();
+    let mut flush_count = 0usize;
 
     for i in (start_part - 1)..total_parts {
         let current_part_num = i + 1;
@@ -352,11 +345,13 @@ where
 
         // 批攒够了就立刻下发，并根据 ACK 调整节奏
         if batch_payloads.len() >= batch_limit {
+            flush_count += 1;
             flush_mass_batch(
                 &owner_id,
                 &mut batch_payloads,
                 &mut batch_meta,
                 &mut pending_parts,
+                flush_count,
             )
             .await?;
             enforce_flow_control(
@@ -375,11 +370,13 @@ where
 
     // 把尾巴再送出去
     if !batch_payloads.is_empty() {
+        flush_count += 1;
         flush_mass_batch(
             &owner_id,
             &mut batch_payloads,
             &mut batch_meta,
             &mut pending_parts,
+            flush_count,
         )
         .await?;
     }
@@ -412,6 +409,7 @@ async fn flush_mass_batch(
     batch_payloads: &mut Vec<Vec<u8>>,
     batch_meta: &mut Vec<(u16, usize)>,
     pending_parts: &mut VecDeque<PendingMassPart>,
+    flush_round: usize,
 ) -> Result<()> {
     if batch_payloads.is_empty() {
         return Ok(());
@@ -438,6 +436,8 @@ async fn flush_mass_batch(
             acked: false,
         });
     }
+
+    let _ = flush_round;
 
     Ok(())
 }
@@ -477,10 +477,16 @@ where
 
     if should_wait {
         if let Some(front_seq) = pending_parts.front().map(|p| p.seq) {
+            let wait_reason = if pending_parts.len() >= backlog_soft_limit {
+                "backlog"
+            } else {
+                "stall"
+            };
             // 等队头 ACK 一个，再继续推进
             wait_for_seq_ack(owner_id, front_seq, config).await?;
             let consumed_after_wait =
                 consume_acked_parts(owner_id, pending_parts, total_parts, progress_cb).await?;
+            let _ = wait_reason;
             if consumed_after_wait > 0 {
                 *last_progress_at = Instant::now();
             }
@@ -596,7 +602,7 @@ where
     let mut consumed = 0usize;
 
     loop {
-        let (part_num, payload_len) = {
+        let (part_num, payload_len, seq) = {
             let front = match pending_parts.front_mut() {
                 Some(front) => front,
                 None => break,
@@ -644,7 +650,7 @@ where
                 front.acked = true;
             }
 
-            (front.part_num, front.payload_len)
+            (front.part_num, front.payload_len, front.seq)
         };
 
         pending_parts.pop_front();
@@ -659,6 +665,7 @@ where
             current_part_num: part_num,
             actual_data_payload_len: payload_len,
         });
+        let _ = seq;
         consumed += 1;
     }
 
