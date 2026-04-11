@@ -73,6 +73,7 @@ pub async fn create_device<F, Fut>(
     authkey: String,
     sar_version: u32,
     connect_type: ConnectType,
+    tx_win_overrun_allowance: Option<u8>,
     force_android: bool,
     sender: F,
 ) -> anyhow::Result<DeviceConnectionInfo>
@@ -92,7 +93,10 @@ where
             cleanup_device_state(device_kind, &addr);
 
             crate::ecs::with_rt_mut(move |rt| {
-                let device_config = XiaomiDeviceConfig::default();
+                let mut device_config = XiaomiDeviceConfig::default();
+                if let Some(allowance) = tx_win_overrun_allowance {
+                    device_config.sar.tx_win_overrun_allowance = allowance.min(16);
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 let network_config = device_config.network.clone();
                 let authkey_for_component = authkey.clone();
