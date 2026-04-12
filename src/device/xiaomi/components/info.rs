@@ -58,28 +58,34 @@ impl InfoSystem {
     }
 
     pub fn request_device_info(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceInfo>> {
-        let rx = self.device_info_wait.prepare();
-        self.enqueue_request(Self::build_system_packet(
-            protocol::system::SystemId::GetDeviceInfo,
-        ));
+        let (rx, should_enqueue) = self.device_info_wait.prepare();
+        if should_enqueue {
+            self.enqueue_request(Self::build_system_packet(
+                protocol::system::SystemId::GetDeviceInfo,
+            ));
+        }
         rx
     }
 
     pub fn request_device_status(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceStatus>> {
-        let rx = self.device_status_wait.prepare();
-        self.enqueue_request(Self::build_system_packet(
-            protocol::system::SystemId::GetDeviceStatus,
-        ));
+        let (rx, should_enqueue) = self.device_status_wait.prepare();
+        if should_enqueue {
+            self.enqueue_request(Self::build_system_packet(
+                protocol::system::SystemId::GetDeviceStatus,
+            ));
+        }
         rx
     }
 
     pub fn request_device_storage(
         &mut self,
     ) -> oneshot::Receiver<anyhow::Result<protocol::StorageInfo>> {
-        let rx = self.device_storage_wait.prepare();
-        self.enqueue_request(Self::build_system_packet(
-            protocol::system::SystemId::GetStorageInfo,
-        ));
+        let (rx, should_enqueue) = self.device_storage_wait.prepare();
+        if should_enqueue {
+            self.enqueue_request(Self::build_system_packet(
+                protocol::system::SystemId::GetStorageInfo,
+            ));
+        }
         rx
     }
 

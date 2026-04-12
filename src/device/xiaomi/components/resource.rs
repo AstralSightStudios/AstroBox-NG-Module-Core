@@ -53,16 +53,20 @@ impl ResourceSystem {
     pub fn request_watchface_list(
         &mut self,
     ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::WatchFaceItem>>> {
-        let rx = self.watchface_wait.prepare();
-        self.enqueue_request(build_watchface_get_installed());
+        let (rx, should_enqueue) = self.watchface_wait.prepare();
+        if should_enqueue {
+            self.enqueue_request(build_watchface_get_installed());
+        }
         rx
     }
 
     pub fn request_quick_app_list(
         &mut self,
     ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::AppItem>>> {
-        let rx = self.quick_app_wait.prepare();
-        self.enqueue_request(build_thirdparty_app_get_installed());
+        let (rx, should_enqueue) = self.quick_app_wait.prepare();
+        if should_enqueue {
+            self.enqueue_request(build_thirdparty_app_get_installed());
+        }
         rx
     }
 

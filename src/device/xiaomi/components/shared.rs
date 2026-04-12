@@ -9,36 +9,52 @@ use crate::{
 use parking_lot::Mutex;
 
 pub struct RequestSlot<T> {
-    waiter: Mutex<Option<oneshot::Sender<Result<T>>>>,
+    waiters: Mutex<Vec<oneshot::Sender<Result<T>>>>,
 }
 
 impl<T> RequestSlot<T> {
     pub fn new() -> Self {
         Self {
-            waiter: Mutex::new(None),
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn prepare(&mut self) -> oneshot::Receiver<Result<T>> {
+    pub fn prepare(&mut self) -> (oneshot::Receiver<Result<T>>, bool) {
         let (tx, rx) = oneshot::channel();
-        *self.waiter.lock() = Some(tx);
-        rx
+        let mut waiters = self.waiters.lock();
+        let should_enqueue = waiters.is_empty();
+        waiters.push(tx);
+        (rx, should_enqueue)
     }
 
-    pub fn fulfill(&mut self, value: T) {
-        self.fulfill_result(Ok(value));
-    }
-
-    pub fn fail(&mut self, err: anyhow::Error) {
-        self.fulfill_result(Err(err));
-    }
-
-    fn fulfill_result(&mut self, result: Result<T>) {
-        if let Some(tx) = self.waiter.lock().take() {
-            if tx.send(result).is_err() {
+    pub fn fulfill(&mut self, value: T)
+    where
+        T: Clone,
+    {
+        let mut waiters = self.take_waiters();
+        for tx in waiters.drain(..) {
+            if tx.send(Ok(value.clone())).is_err() {
                 log::debug!("request slot receiver dropped before fulfillment");
             }
         }
+    }
+
+    pub fn fail(&mut self, err: anyhow::Error) {
+        let mut waiters = self.take_waiters();
+        if waiters.is_empty() {
+            return;
+        }
+
+        let err_text = format!("{err:#}");
+        for tx in waiters.drain(..) {
+            if tx.send(Err(anyhow::Error::msg(err_text.clone()))).is_err() {
+                log::debug!("request slot receiver dropped before failure");
+            }
+        }
+    }
+
+    fn take_waiters(&mut self) -> Vec<oneshot::Sender<Result<T>>> {
+        std::mem::take(&mut *self.waiters.lock())
     }
 }
 
