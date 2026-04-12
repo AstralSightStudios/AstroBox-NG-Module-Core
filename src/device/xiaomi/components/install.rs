@@ -97,6 +97,11 @@ impl InstallSystem {
         let (prepare_tx, prepare_rx) = oneshot::channel::<i32>();
         let (result_tx_opt, result_rx_opt) = match r#type {
             MassDataType::NotificationIcon => (None, None),
+            MassDataType::Music => {
+                return Err(anyhow_site!(
+                    "music payloads are not supported by InstallSystem; use MediaSystem instead"
+                ));
+            }
             _ => {
                 let (tx, rx) = oneshot::channel();
                 (Some(tx), Some(rx))
@@ -141,6 +146,9 @@ impl InstallSystem {
                     let pkg =
                         package_name.context("package_name is required for notification icon")?;
                     build_notification_icon_request(pkg)
+                }
+                MassDataType::Music => {
+                    bail_site!("music payloads are not supported by InstallSystem")
                 }
                 MassDataType::ThirdPartyApp => {
                     let pkg =
@@ -350,7 +358,7 @@ async fn refresh_post_install_state(owner: String, data_type: MassDataType) {
             refresh_quick_app_list(owner.clone()).await;
             refresh_storage_info(owner).await;
         }
-        MassDataType::Firmare | MassDataType::NotificationIcon => {}
+        MassDataType::Firmare | MassDataType::NotificationIcon | MassDataType::Music => {}
     }
 }
 
@@ -386,6 +394,9 @@ fn handle_install_result(r#type: MassDataType, event: InstallResultEvent) -> Res
                 bail_site!("firmware install reported status: {:?}", status);
             }
             Ok(())
+        }
+        (MassDataType::Music, _) => {
+            bail_site!("music payloads are not supported by InstallSystem")
         }
         (unexpected_type, unexpected_event) => {
             bail_site!(

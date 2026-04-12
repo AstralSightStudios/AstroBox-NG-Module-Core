@@ -82,6 +82,28 @@ impl MassSystem {
         // 注意：这里用 move 把 cb_arc 捕获，保证生命周期。
         send_file_for_owner(owner_id, file_data, data_type, move |d| (cb_arc)(d)).await
     }
+
+    pub async fn send_file_with_known_slice_length<F>(
+        &mut self,
+        file_data: Vec<u8>,
+        data_type: MassDataType,
+        expected_slice_length: usize,
+        progress_cb: F,
+    ) -> Result<()>
+    where
+        F: Fn(SendMassCallbackData) + Send + Sync + 'static,
+    {
+        let owner_id = self.owner_id.clone();
+        let cb_arc: Arc<dyn Fn(SendMassCallbackData) + Send + Sync> = Arc::new(progress_cb);
+        send_file_for_owner_with_known_slice_length(
+            owner_id,
+            file_data,
+            data_type,
+            expected_slice_length,
+            move |d| (cb_arc)(d),
+        )
+        .await
+    }
 }
 
 impl L2PbExt for MassSystem {
@@ -205,12 +227,74 @@ where
     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
         bail_site!("Mass data prepare was not READY");
     }
-    let miwear_packet_body_max_len = prepare_resp.expected_slice_length() as usize;
+    let expected_slice_length = prepare_resp.expected_slice_length() as usize;
+    send_file_for_owner_with_slice_length(
+        owner_id,
+        file_data,
+        data_type,
+        expected_slice_length,
+        file_md5,
+        device_addr,
+        progress_cb,
+    )
+    .await
+}
+
+pub async fn send_file_for_owner_with_known_slice_length<F>(
+    owner_id: String,
+    file_data: Vec<u8>,
+    data_type: MassDataType,
+    expected_slice_length: usize,
+    progress_cb: F,
+) -> Result<()>
+where
+    F: Fn(SendMassCallbackData) + Send + Sync,
+{
+    let file_md5 = crate::tools::calc_md5(&file_data);
+    let device_addr = crate::ecs::with_rt_mut({
+        let owner = owner_id.clone();
+        move |rt| {
+            rt.with_device_mut(&owner, |world, entity| {
+                world
+                    .get::<XiaomiDevice>(entity)
+                    .map(|dev| dev.addr().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+        }
+    })
+    .await;
+
+    send_file_for_owner_with_slice_length(
+        owner_id,
+        file_data,
+        data_type,
+        expected_slice_length,
+        file_md5,
+        device_addr,
+        progress_cb,
+    )
+    .await
+}
+
+async fn send_file_for_owner_with_slice_length<F>(
+    owner_id: String,
+    file_data: Vec<u8>,
+    data_type: MassDataType,
+    expected_slice_length: usize,
+    file_md5: Vec<u8>,
+    device_addr: String,
+    progress_cb: F,
+) -> Result<()>
+where
+    F: Fn(SendMassCallbackData) + Send + Sync,
+{
+    let miwear_packet_body_max_len = expected_slice_length;
     if miwear_packet_body_max_len == 0 {
         bail_site!("Device reported expected_slice_length of 0, cannot proceed.");
     }
 
-    // 4) 把文件包成 MASS 内部负载，并附带 CRC32（设备端用于校验）
+    // 把文件包成 MASS 内部负载，并附带 CRC32（设备端用于校验）
     let mass_inner_payload = MassPacket::build(file_data, data_type)?;
     let mass_inner_payload_with_crc32 = mass_inner_payload.encode_with_crc32();
 
@@ -231,7 +315,7 @@ where
         bail_site!("Calculated total_parts is 0 for non-empty payload.");
     }
 
-    // 5) 断点续传：如果有之前记录且 data/device 都匹配，就从记录的分片号继续
+    // 断点续传：如果有之前记录且 data/device 都匹配，就从记录的分片号继续
     let start_part = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         let file_md5_for_resume = file_md5.clone();
@@ -257,7 +341,7 @@ where
     })
     .await;
 
-    // 6) 从 SAR 拿窗口大小 & 发送超时，便于自适应批量/等待策略
+    // 从 SAR 拿窗口大小 & 发送超时，便于自适应批量/等待策略
     let sar_hints = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         move |rt| {

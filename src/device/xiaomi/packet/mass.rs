@@ -13,6 +13,7 @@ pub enum MassDataType {
     Watchface = 16,
     Firmare = 32,
     NotificationIcon = 50,
+    Music = 52,
     ThirdPartyApp = 64,
 }
 
@@ -30,6 +31,7 @@ impl TryFrom<u8> for MassDataType {
             16 => Ok(MassDataType::Watchface),
             32 => Ok(MassDataType::Firmare),
             50 => Ok(MassDataType::NotificationIcon),
+            52 => Ok(MassDataType::Music),
             64 => Ok(MassDataType::ThirdPartyApp),
             _ => Err("invalid MassDataType value"),
         }

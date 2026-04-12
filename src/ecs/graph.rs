@@ -8,6 +8,7 @@ use crate::{
             info::{InfoComponent, InfoSystem},
             install::{InstallComponent, InstallSystem},
             mass::{MassComponent, MassSystem},
+            media::{MediaComponent, MediaSystem},
             resource::{ResourceComponent, ResourceSystem},
             sync::{SyncComponent, SyncSystem},
             thirdparty_app::{ThirdpartyAppComponent, ThirdpartyAppSystem},
@@ -169,6 +170,18 @@ fn build_graph(rt: &mut Runtime) -> ReactFlowGraph {
             &mut nodes,
             &mut edges,
         );
+        add_component_node::<MediaComponent>(
+            world,
+            entity,
+            device_id,
+            &node_id,
+            position,
+            &mut comp_idx,
+            &mut component_labels,
+            &mut component_nodes,
+            &mut nodes,
+            &mut edges,
+        );
         add_component_node::<InfoComponent>(
             world,
             entity,
@@ -266,6 +279,17 @@ fn build_graph(rt: &mut Runtime) -> ReactFlowGraph {
             &mut edges,
         );
         add_system_node::<MassSystem, MassComponent>(
+            world,
+            entity,
+            device_id,
+            &node_id,
+            position,
+            &component_nodes,
+            &mut system_labels,
+            &mut nodes,
+            &mut edges,
+        );
+        add_system_node::<MediaSystem, MediaComponent>(
             world,
             entity,
             device_id,

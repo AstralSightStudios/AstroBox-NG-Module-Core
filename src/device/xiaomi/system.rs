@@ -28,8 +28,15 @@ where
 {
     fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
         if channel == L2Channel::Pb {
-            if let Ok(wp) = pb::xiaomi::protocol::WearPacket::decode(Cursor::new(&payload)) {
-                self.on_pb_packet(wp);
+            match pb::xiaomi::protocol::WearPacket::decode(Cursor::new(&payload)) {
+                Ok(wp) => self.on_pb_packet(wp),
+                Err(err) => {
+                    log::warn!(
+                        "failed to decode Xiaomi PB payload ({} bytes): {}",
+                        payload.len(),
+                        err
+                    );
+                }
             }
         }
     }
