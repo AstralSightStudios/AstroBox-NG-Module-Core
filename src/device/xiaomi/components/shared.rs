@@ -53,6 +53,10 @@ impl<T> RequestSlot<T> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.take_waiters();
+    }
+
     fn take_waiters(&mut self) -> Vec<oneshot::Sender<Result<T>>> {
         std::mem::take(&mut *self.waiters.lock())
     }

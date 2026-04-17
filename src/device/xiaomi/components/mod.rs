@@ -5,6 +5,7 @@ pub mod mass;
 pub mod media;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network;
+pub mod report;
 pub mod resource;
 mod shared;
 pub mod sync;

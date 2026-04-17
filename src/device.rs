@@ -8,6 +8,7 @@ use crate::device::xiaomi::components::{
     install::{InstallComponent, InstallSystem},
     mass::{MassComponent, MassSystem},
     media::{MediaComponent, MediaSystem},
+    report::ReportSystem,
     resource::{ResourceComponent, ResourceSystem},
     sync::{SyncComponent, SyncSystem},
     thirdparty_app::{ThirdpartyAppComponent, ThirdpartyAppSystem},
@@ -144,6 +145,7 @@ where
                     MediaSystem::new(device_id.clone()),
                     InfoComponent::new(),
                     InfoSystem::new(device_id.clone()),
+                    ReportSystem::new(device_id.clone()),
                 ));
                 entity_ref.insert((
                     ThirdpartyAppComponent::new(),
