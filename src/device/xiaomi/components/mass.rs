@@ -3,8 +3,10 @@ use crate::bail_site;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use pb::xiaomi::protocol;
+use prost::Message;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::mem;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -18,10 +20,10 @@ use crate::device::xiaomi::XiaomiDevice;
 use crate::device::xiaomi::config::MassConfig;
 use crate::device::xiaomi::packet::{
     self,
-    mass::{MassDataType, MassPacket},
+    mass::{MassDataType, MassPacket, ReverseMassPacket},
     v2::layer2::{L2Channel, L2OpCode, L2Packet},
 };
-use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
+use crate::device::xiaomi::system::{XiaomiSystemExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::{Component, access::with_device_component_mut};
 use parking_lot::Mutex;
 
@@ -40,6 +42,32 @@ pub struct SendMassCallbackData {
     pub actual_data_payload_len: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiveMassCallbackData {
+    pub channel: u8,
+    pub progress: f32,
+    pub total_parts: u32,
+    pub current_part_num: u32,
+    pub file_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReverseMassReceiveResult {
+    pub channel: L2Channel,
+    pub file_name: String,
+    pub data: Vec<u8>,
+}
+
+struct ReverseMassWaiter {
+    packet: ReverseMassPacket,
+    progress_cb: Arc<dyn Fn(ReceiveMassCallbackData) + Send + Sync>,
+    /// 针对 reverse mass 的完成信号发送器
+    /// 当多个通道共享同一个逻辑接收过程 (看不懂的猪请看begin_reverse_mass_receive_multi)，所有相关的等待方会共用一个被 mutex 包裹的发送器
+    /// 这样可以确保只有第一个完成的通道会发送结果，其余通道的发送操作都no-op
+    tx: Arc<parking_lot::Mutex<Option<oneshot::Sender<Result<ReverseMassReceiveResult>>>>>,
+    siblings: Vec<u8>,
+}
+
 /// 记录已经等待确认的 MASS 分片，用于推进进度与续传。
 /// 这里其实他妈的就是个“待确认队列”，发出去还没收到 ACK 的分片都塞进来，
 /// 一边盯 ACK、一边按顺序出队，顺手更新进度。
@@ -54,6 +82,7 @@ struct PendingMassPart {
 #[derive(Component)]
 pub struct MassSystem {
     owner_id: String,
+    reverse_mass_waits: HashMap<u8, ReverseMassWaiter>,
 }
 
 impl Default for MassSystem {
@@ -65,7 +94,10 @@ impl Default for MassSystem {
 impl MassSystem {
     pub fn new(owner_id: String) -> Self {
         register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self { owner_id }
+        Self {
+            owner_id,
+            reverse_mass_waits: HashMap::new(),
+        }
     }
 
     pub async fn send_file<F>(
@@ -104,18 +136,181 @@ impl MassSystem {
         )
         .await
     }
+
+    pub fn begin_reverse_mass_receive(
+        &mut self,
+        channel: L2Channel,
+        progress_cb: Arc<dyn Fn(ReceiveMassCallbackData) + Send + Sync>,
+    ) -> Result<oneshot::Receiver<Result<ReverseMassReceiveResult>>> {
+        self.begin_reverse_mass_receive_multi(&[channel], progress_cb)
+    }
+
+    /// 注册一个reverse mass接收任务，狠狠视奸l2packet，，，
+    /// 支持监听多个channel，虽然可能没啥逼用
+    /// 一旦某个通道率先接收到完整文件，对应的 future 就会被resolve，此时其他通道上尚未完成的接收进度都会被丢弃
+    pub fn begin_reverse_mass_receive_multi(
+        &mut self,
+        channels: &[L2Channel],
+        progress_cb: Arc<dyn Fn(ReceiveMassCallbackData) + Send + Sync>,
+    ) -> Result<oneshot::Receiver<Result<ReverseMassReceiveResult>>> {
+        if channels.is_empty() {
+            bail_site!("reverse MASS receive requires at least one channel");
+        }
+
+        for channel in channels {
+            if self.reverse_mass_waits.contains_key(&(*channel as u8)) {
+                bail_site!(
+                    "reverse MASS receive already in progress on channel {:?}",
+                    channel
+                );
+            }
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let shared_tx = Arc::new(parking_lot::Mutex::new(Some(tx)));
+        let siblings: Vec<u8> = channels.iter().map(|c| *c as u8).collect();
+
+        for channel in channels {
+            let key = *channel as u8;
+            let other_siblings: Vec<u8> =
+                siblings.iter().cloned().filter(|s| *s != key).collect();
+            self.reverse_mass_waits.insert(
+                key,
+                ReverseMassWaiter {
+                    packet: ReverseMassPacket::new(),
+                    progress_cb: progress_cb.clone(),
+                    tx: shared_tx.clone(),
+                    siblings: other_siblings,
+                },
+            );
+        }
+        Ok(rx)
+    }
+
+    pub fn clear_reverse_mass_wait(&mut self, channel: L2Channel) {
+        let key = channel as u8;
+        let siblings = self
+            .reverse_mass_waits
+            .get(&key)
+            .map(|w| w.siblings.clone())
+            .unwrap_or_default();
+        self.reverse_mass_waits.remove(&key);
+        for sibling in siblings {
+            self.reverse_mass_waits.remove(&sibling);
+        }
+    }
+
+    fn handle_prepare_response(&mut self, resp: protocol::PrepareResponse) {
+        let owner = self.owner_id.clone();
+        let _ = with_device_component_mut::<MassComponent, _, _>(owner, move |comp| {
+            if let Some(tx) = comp.prepare_wait.lock().take() {
+                let _ = tx.send(resp);
+            }
+        });
+    }
+
+    fn handle_reverse_mass_payload(&mut self, channel: L2Channel, payload: &[u8]) {
+        let channel_key = channel as u8;
+        let mut progress_cb = None;
+        let mut progress = None;
+        let mut completion = None;
+        let mut should_remove = false;
+
+        if let Some(waiter) = self.reverse_mass_waits.get_mut(&channel_key) {
+            if waiter.packet.empty() && !looks_like_reverse_mass_packet(payload) {
+                return;
+            }
+            match waiter.packet.handle_packet(payload.to_vec()) {
+                Ok(()) => {
+                    progress_cb = Some(waiter.progress_cb.clone());
+                    let total_parts = waiter.packet.total_block();
+                    let current_part_num = waiter.packet.current_block();
+                    let file_name = waiter.packet.file_name();
+                    progress = Some(ReceiveMassCallbackData {
+                        channel: channel_key,
+                        progress: if total_parts == 0 {
+                            0.0
+                        } else {
+                            current_part_num as f32 / total_parts as f32
+                        },
+                        total_parts,
+                        current_part_num,
+                        file_name: file_name.clone(),
+                    });
+
+                    if waiter.packet.complete() {
+                        should_remove = true;
+                        completion = Some(
+                            waiter
+                                .packet
+                                .file(false)
+                                .map(|data| ReverseMassReceiveResult {
+                                    channel,
+                                    file_name,
+                                    data,
+                                })
+                                .context("failed to assemble reverse MASS payload"),
+                        );
+                    }
+                }
+                Err(err) => {
+                    should_remove = true;
+                    completion = Some(Err(err).context("failed to decode reverse MASS packet"));
+                }
+            }
+        }
+
+        if let (Some(cb), Some(data)) = (progress_cb, progress) {
+            (cb)(data);
+        }
+
+        if !should_remove {
+            return;
+        }
+
+        // First channel to complete wins; tear down sibling waiters too.
+        let waiter = match self.reverse_mass_waits.remove(&channel_key) {
+            Some(w) => w,
+            None => return,
+        };
+        for sibling in &waiter.siblings {
+            self.reverse_mass_waits.remove(sibling);
+        }
+
+        if let Some(result) = completion {
+            if let Some(tx) = waiter.tx.lock().take() {
+                if tx.send(result).is_err() {
+                    log::debug!("reverse MASS waiter receiver dropped before completion");
+                }
+            }
+        }
+    }
 }
 
-impl L2PbExt for MassSystem {
-    fn on_pb_packet(&mut self, payload: protocol::WearPacket) {
-        if let Some(protocol::wear_packet::Payload::Mass(mass)) = payload.payload {
-            if let Some(protocol::mass::Payload::PrepareResponse(resp)) = mass.payload {
-                let owner = self.owner_id.clone();
-                let _ = with_device_component_mut::<MassComponent, _, _>(owner, move |comp| {
-                    if let Some(tx) = comp.prepare_wait.lock().take() {
-                        let _ = tx.send(resp);
+impl XiaomiSystemExt for MassSystem {
+    fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
+        match channel {
+            L2Channel::Pb => match protocol::WearPacket::decode(Cursor::new(payload)) {
+                Ok(packet) => {
+                    if let Some(protocol::wear_packet::Payload::Mass(mass)) = packet.payload {
+                        if let Some(protocol::mass::Payload::PrepareResponse(resp)) = mass.payload {
+                            self.handle_prepare_response(resp);
+                        }
                     }
-                });
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to decode Xiaomi PB payload for MassSystem ({} bytes): {}",
+                        payload.len(),
+                        err
+                    );
+                }
+            },
+            _ => {
+                let key = channel as u8;
+                if self.reverse_mass_waits.contains_key(&key) {
+                    self.handle_reverse_mass_payload(channel, payload);
+                }
             }
         }
     }
@@ -135,6 +330,10 @@ impl MassComponent {
             resume_state: None,
         }
     }
+}
+
+fn looks_like_reverse_mass_packet(payload: &[u8]) -> bool {
+    payload.len() >= 12 && payload.first().copied() == Some(0)
 }
 
 /// 构造 Prepare 请求（问设备：你能吃多大一口？）

@@ -48,15 +48,18 @@ impl AuthSystem {
         })
         .map_err(|err| anyhow_site!("failed to update auth component nonce: {err:?}"))?;
 
+        let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
+        *self.auth_wait.lock() = Some(tx);
+
         with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), move |dev| {
             dev.sar
                 .lock()
                 .enqueue(L2Packet::pb_write(build_auth_step_1(&nonce)).to_bytes());
         })
-        .map_err(|err| anyhow_site!("failed to send auth step 1 packet: {err:?}"))?;
-
-        let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
-        *self.auth_wait.lock() = Some(tx);
+        .map_err(|err| {
+            self.auth_wait.lock().take();
+            anyhow_site!("failed to send auth step 1 packet: {err:?}")
+        })?;
 
         Ok(rx)
     }
