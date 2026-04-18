@@ -1,5 +1,10 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 use crate::{
     asyncrt::universal_block_on,
     device::{
@@ -15,6 +20,7 @@ use crate::{
 use parking_lot::Mutex as ParkingMutex;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
+use transport_profiler::TransportProfilerHandle;
 
 pub mod components;
 pub mod config;
@@ -22,6 +28,7 @@ pub mod packet;
 pub mod resutils;
 pub mod sar;
 pub mod system;
+pub mod transport_profiler;
 pub mod r#type;
 
 #[derive(Debug)]
@@ -32,6 +39,7 @@ pub enum SendError {
 
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>;
 type SendFn = Arc<dyn Fn(Vec<Vec<u8>>) -> SendFuture + Send + Sync>;
+const SPP_STREAM_SEND_COALESCE_CAP: usize = 60 * 1024;
 
 #[derive(Component, serde::Serialize)]
 pub struct XiaomiDevice {
@@ -42,6 +50,8 @@ pub struct XiaomiDevice {
     pub force_android: bool, // 安卓人安卓代码安卓生态安卓手表安卓设备安卓pb 在连接设备时强制使用ANDROID作为设备类型
     #[serde(skip_serializing)]
     sender: SendFn,
+    #[serde(skip_serializing)]
+    pub transport_profiler: TransportProfilerHandle,
     #[serde(skip_serializing)]
     pub sar: ParkingMutex<sar::SarController>,
     pub config: XiaomiDeviceConfig,
@@ -68,6 +78,7 @@ impl XiaomiDevice {
         F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), SendError>> + Send + 'static,
     {
+        let transport_profiler = TransportProfilerHandle::new();
         // 包装线程安全Sender
         let raw_sender: SendFn = Arc::new(move |data: Vec<Vec<u8>>| Box::pin(sender(data)));
         // 上锁防止串串包
@@ -76,18 +87,21 @@ impl XiaomiDevice {
         let sender: SendFn = {
             let raw_sender = raw_sender.clone();
             let send_lock = send_lock.clone();
+            let profiler = transport_profiler.clone();
             Arc::new(move |data: Vec<Vec<u8>>| {
                 let raw_sender = raw_sender.clone();
                 let send_lock = send_lock.clone();
+                let profiler = profiler.clone();
                 let chunk_size_ble = transport_config.chunk_size_ble;
                 let chunk_size_spp = transport_config.chunk_size_spp;
                 Box::pin(async move {
                     let _guard = send_lock.lock().await;
 
-                    let mut chunk_size_max = chunk_size_ble;
-                    if connect_type == ConnectType::SPP {
-                        chunk_size_max = chunk_size_spp;
-                    }
+                    let chunk_size_max = if connect_type == ConnectType::SPP {
+                        chunk_size_spp.max(SPP_STREAM_SEND_COALESCE_CAP)
+                    } else {
+                        chunk_size_ble
+                    };
 
                     let mut chunks = Vec::new();
                     for packet in data {
@@ -97,7 +111,34 @@ impl XiaomiDevice {
                             chunks.extend(packet.chunks(chunk_size_max).map(|chunk| chunk.to_vec()));
                         }
                     }
-                    raw_sender(chunks).await
+                    let packet_count = chunks.len() as u32;
+                    let total_bytes = chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
+                    let started_at = Instant::now();
+                    let result = raw_sender(chunks).await;
+                    profiler.record(
+                        "transport",
+                        if connect_type == ConnectType::BLE {
+                            "send_batch_ble"
+                        } else {
+                            "send_batch_spp"
+                        },
+                        Some(
+                            started_at
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        ),
+                        Some(packet_count),
+                        Some(total_bytes),
+                        None,
+                        Some(result.is_ok()),
+                        Some(format!(
+                            "chunk_size_max={},connect_type={:?}",
+                            chunk_size_max, connect_type
+                        )),
+                    );
+                    result
                 })
             })
         };
@@ -117,6 +158,7 @@ impl XiaomiDevice {
             tk_handle.clone(),
             sender.clone(),
             base.addr().to_string(),
+            transport_profiler.clone(),
             config.sar.clone(),
         );
 
@@ -126,6 +168,7 @@ impl XiaomiDevice {
             connect_type,
             force_android,
             sender,
+            transport_profiler,
             sar: ParkingMutex::new(sar),
             config,
         };

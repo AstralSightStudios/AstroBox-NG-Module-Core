@@ -26,6 +26,7 @@ use crate::device::xiaomi::packet::{
 use crate::device::xiaomi::system::{XiaomiSystemExt, register_xiaomi_system_ext_on_l2packet};
 use crate::ecs::{Component, access::with_device_component_mut};
 use parking_lot::Mutex;
+use crate::device::xiaomi::transport_profiler::TransportProfilerHandle;
 
 #[derive(Clone, serde::Serialize)]
 struct ResumeState {
@@ -378,6 +379,7 @@ where
 {
     let file_md5 = crate::tools::calc_md5(&file_data);
     let file_len = file_data.len();
+    let profiler = get_transport_profiler(&owner_id).await;
     log::info!("Building MASS Prepare response listener...");
 
     // 1) 建立一次性通道，等设备的 PrepareResponse
@@ -395,6 +397,7 @@ where
     .await;
 
     log::info!("Sending MASS Prepare...");
+    let prepare_started_at = Instant::now();
     // 2) 发 Prepare 请求，同时取下设备地址（断点续传用来校验是不是同一台设备）
     let device_addr = crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
@@ -418,6 +421,18 @@ where
         }
     })
     .await;
+    if let Some(profiler) = profiler.as_ref() {
+        profiler.record(
+            "mass",
+            "prepare_request",
+            None,
+            Some(1),
+            Some(file_len as u64),
+            None,
+            Some(true),
+            None,
+        );
+    }
 
     log::info!("Waiting for prepare response...");
 
@@ -425,6 +440,27 @@ where
     let prepare_resp = rx.await.context("Mass prepare response not received")?;
     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
         bail_site!("Mass data prepare was not READY");
+    }
+    if let Some(profiler) = profiler.as_ref() {
+        profiler.record(
+            "mass",
+            "prepare_response",
+            Some(
+                prepare_started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+            Some(1),
+            None,
+            None,
+            Some(true),
+            Some(format!(
+                "expected_slice_length={}",
+                prepare_resp.expected_slice_length()
+            )),
+        );
     }
     let expected_slice_length = prepare_resp.expected_slice_length() as usize;
     send_file_for_owner_with_slice_length(
@@ -488,6 +524,7 @@ async fn send_file_for_owner_with_slice_length<F>(
 where
     F: Fn(SendMassCallbackData) + Send + Sync,
 {
+    let profiler = get_transport_profiler(&owner_id).await;
     let miwear_packet_body_max_len = expected_slice_length;
     if miwear_packet_body_max_len == 0 {
         bail_site!("Device reported expected_slice_length of 0, cannot proceed.");
@@ -593,6 +630,21 @@ where
         batch_limit,
         backlog_soft_limit,
     );
+    if let Some(profiler) = profiler.as_ref() {
+        profiler.record(
+            "mass",
+            "send_setup",
+            None,
+            None,
+            Some(mass_inner_payload_with_crc32.len() as u64),
+            None,
+            Some(true),
+            Some(format!(
+                "total_parts={},fragment_max_len={},batch_limit={},backlog_limit={}",
+                total_parts, mass_fragment_max_len, batch_limit, backlog_soft_limit
+            )),
+        );
+    }
 
     // 发送主循环：按批次装包 -> 入队 -> 根据 ACK 控制节奏
     let mut pending_parts = VecDeque::new();
@@ -635,6 +687,7 @@ where
                 &mut batch_meta,
                 &mut pending_parts,
                 flush_count,
+                profiler.as_ref(),
             )
             .await?;
             enforce_flow_control(
@@ -646,6 +699,7 @@ where
                 ack_stall_deadline,
                 backlog_soft_limit,
                 &mut last_progress_at,
+                profiler.as_ref(),
             )
             .await?;
         }
@@ -660,6 +714,7 @@ where
             &mut batch_meta,
             &mut pending_parts,
             flush_count,
+            profiler.as_ref(),
         )
         .await?;
     }
@@ -674,6 +729,7 @@ where
         ack_stall_deadline,
         backlog_soft_limit,
         &mut last_progress_at,
+        profiler.as_ref(),
     )
     .await?;
 
@@ -693,6 +749,7 @@ async fn flush_mass_batch(
     batch_meta: &mut Vec<(u16, usize)>,
     pending_parts: &mut VecDeque<PendingMassPart>,
     flush_round: usize,
+    profiler: Option<&TransportProfilerHandle>,
 ) -> Result<()> {
     if batch_payloads.is_empty() {
         return Ok(());
@@ -720,7 +777,29 @@ async fn flush_mass_batch(
         });
     }
 
-    let _ = flush_round;
+    if let Some(profiler) = profiler {
+        let packet_count = pending_parts
+            .iter()
+            .rev()
+            .take(meta_len)
+            .count() as u32;
+        let total_bytes = pending_parts
+            .iter()
+            .rev()
+            .take(meta_len)
+            .map(|part| part.payload_len as u64)
+            .sum::<u64>();
+        profiler.record(
+            "mass",
+            "flush_batch",
+            None,
+            Some(packet_count),
+            Some(total_bytes),
+            None,
+            Some(true),
+            Some(format!("round={flush_round}")),
+        );
+    }
 
     Ok(())
 }
@@ -736,6 +815,7 @@ async fn enforce_flow_control<F>(
     ack_stall_deadline: Duration,
     backlog_soft_limit: usize,
     last_progress_at: &mut Instant,
+    profiler: Option<&TransportProfilerHandle>,
 ) -> Result<()>
 where
     F: Fn(SendMassCallbackData) + Send + Sync,
@@ -765,11 +845,27 @@ where
             } else {
                 "stall"
             };
+            let wait_started_at = Instant::now();
             // 等队头 ACK 一个，再继续推进
             wait_for_seq_ack(owner_id, front_seq, config).await?;
+            if let Some(profiler) = profiler {
+                profiler.record(
+                    "mass",
+                    "flow_wait",
+                    Some(wait_started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                    None,
+                    None,
+                    Some(u32::from(front_seq)),
+                    Some(true),
+                    Some(format!(
+                        "reason={},pending_parts={}",
+                        wait_reason,
+                        pending_parts.len()
+                    )),
+                );
+            }
             let consumed_after_wait =
                 consume_acked_parts(owner_id, pending_parts, total_parts, progress_cb).await?;
-            let _ = wait_reason;
             if consumed_after_wait > 0 {
                 *last_progress_at = Instant::now();
             }
@@ -777,6 +873,19 @@ where
     }
 
     Ok(())
+}
+
+async fn get_transport_profiler(owner_id: &str) -> Option<TransportProfilerHandle> {
+    let owner = owner_id.to_string();
+    crate::ecs::with_rt_mut(move |rt| {
+        rt.with_device_mut(&owner, |world, entity| {
+            world
+                .get::<XiaomiDevice>(entity)
+                .map(|dev| dev.transport_profiler.clone())
+        })
+        .flatten()
+    })
+    .await
 }
 
 /// 真正把批量包入队（交给 SAR），拿回每个包对应的 seq

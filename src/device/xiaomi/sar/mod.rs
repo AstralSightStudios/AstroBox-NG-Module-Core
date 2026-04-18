@@ -18,6 +18,7 @@ use crate::device::xiaomi::{
         layer1cmd::{CmdCode, L1CmdBuilder, L1CmdPacket},
         layer2::L2Channel,
     },
+    transport_profiler::TransportProfilerHandle,
 };
 
 mod command_pool;
@@ -60,11 +61,18 @@ pub struct SarController {
     /// 记录已经确认的 seq，供上层查询（会在 seq 重用或消费后清理）。
     acked: HashSet<u8>,
     ack_notify: Arc<Notify>,
+    profiler: TransportProfilerHandle,
     config: SarConfig,
 }
 
 impl SarController {
-    pub fn new(tk_handle: Handle, sender: SendFn, device_id: String, config: SarConfig) -> Self {
+    pub fn new(
+        tk_handle: Handle,
+        sender: SendFn,
+        device_id: String,
+        profiler: TransportProfilerHandle,
+        config: SarConfig,
+    ) -> Self {
         log::info!("Initializing SarController...");
 
         let mut ctrl = Self {
@@ -87,6 +95,7 @@ impl SarController {
             rx_cum_ack_timer: None,
             acked: HashSet::new(),
             ack_notify: Arc::new(Notify::new()),
+            profiler,
             config,
         };
 
@@ -224,6 +233,16 @@ impl SarController {
 
     fn send_ack(&self, seq: u8) {
         let pkt = L1Packet::new(L1DataType::Ack, false, seq, vec![]);
+        self.profiler.record(
+            "sar",
+            "ack_send",
+            None,
+            Some(1),
+            Some(pkt.to_bytes().len() as u64),
+            Some(u32::from(seq)),
+            Some(true),
+            None,
+        );
         let send_fn = self.sender.clone();
         let handle = self.tk_handle.clone();
         spawn_with_handle(
@@ -236,6 +255,16 @@ impl SarController {
 
     fn send_nak(&self, seq: u8) {
         let pkt = L1Packet::new(L1DataType::Nak, false, seq, vec![]);
+        self.profiler.record(
+            "sar",
+            "nak_send",
+            None,
+            Some(1),
+            Some(pkt.to_bytes().len() as u64),
+            Some(u32::from(seq)),
+            Some(false),
+            None,
+        );
         let send_fn = self.sender.clone();
         let handle = self.tk_handle.clone();
         spawn_with_handle(
@@ -358,6 +387,21 @@ impl SarController {
                             self.tx_win_effective,
                             self.send_timeout.as_millis()
                         );
+                        self.profiler.record(
+                            "sar",
+                            "l1start_rsp",
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some(format!(
+                                "tx_win={},soft_cap={},send_timeout_ms={}",
+                                self.tx_win,
+                                self.tx_win_effective,
+                                self.send_timeout.as_millis()
+                            )),
+                        );
                     }
                 }
                 false
@@ -416,12 +460,32 @@ impl SarController {
             }
         }
         if advanced {
+            self.profiler.record(
+                "sar",
+                "ack_received",
+                None,
+                None,
+                None,
+                Some(u32::from(seq)),
+                Some(true),
+                Some("window_advanced".to_string()),
+            );
             self.ack_notify.notify_waiters();
         }
         self.try_run_next();
     }
 
     fn handle_nak(&mut self, seq: u8) {
+        self.profiler.record(
+            "sar",
+            "nak_received",
+            None,
+            None,
+            None,
+            Some(u32::from(seq)),
+            Some(false),
+            None,
+        );
         if seq > 0 {
             let ack_seq = seq.wrapping_sub(1);
             self.handle_ack(ack_seq);
@@ -446,6 +510,16 @@ impl SarController {
             item.need_retransmission = false;
             item.wait_ack = true;
             item.deadline = Instant::now() + self.send_timeout;
+            self.profiler.record(
+                "sar",
+                "data_retransmit",
+                None,
+                Some(1),
+                Some(pkt.to_bytes().len() as u64),
+                Some(u32::from(pkt.seq)),
+                None,
+                None,
+            );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
             spawn_with_handle(
@@ -464,6 +538,18 @@ impl SarController {
             cmd_batch.push(pkt.to_bytes());
         }
         if !cmd_batch.is_empty() {
+            let cmd_packets = cmd_batch.len() as u32;
+            let cmd_bytes = cmd_batch.iter().map(|pkt| pkt.len() as u64).sum::<u64>();
+            self.profiler.record(
+                "sar",
+                "cmd_batch_send",
+                None,
+                Some(cmd_packets),
+                Some(cmd_bytes),
+                None,
+                Some(true),
+                None,
+            );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
             spawn_with_handle(
@@ -493,6 +579,22 @@ impl SarController {
             });
         }
         if !data_batch.is_empty() {
+            let packet_count = data_batch.len() as u32;
+            let total_bytes = data_batch.iter().map(|pkt| pkt.len() as u64).sum::<u64>();
+            self.profiler.record(
+                "sar",
+                "data_batch_send",
+                None,
+                Some(packet_count),
+                Some(total_bytes),
+                None,
+                Some(true),
+                Some(format!(
+                    "soft_window={},raw_window={}",
+                    self.effective_tx_win(),
+                    self.raw_tx_window_size()
+                )),
+            );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
             spawn_with_handle(
