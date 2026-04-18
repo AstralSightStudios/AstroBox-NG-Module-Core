@@ -31,7 +31,7 @@ pub enum SendError {
 }
 
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>;
-type SendFn = Arc<dyn Fn(Vec<u8>) -> SendFuture + Send + Sync>;
+type SendFn = Arc<dyn Fn(Vec<Vec<u8>>) -> SendFuture + Send + Sync>;
 
 #[derive(Component, serde::Serialize)]
 pub struct XiaomiDevice {
@@ -65,18 +65,18 @@ impl XiaomiDevice {
         sender: F,
     ) -> Self
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), SendError>> + Send + 'static,
     {
         // 包装线程安全Sender
-        let raw_sender: SendFn = Arc::new(move |data: Vec<u8>| Box::pin(sender(data)));
+        let raw_sender: SendFn = Arc::new(move |data: Vec<Vec<u8>>| Box::pin(sender(data)));
         // 上锁防止串串包
         let send_lock = Arc::new(AsyncMutex::new(()));
         let transport_config = config.transport.clone();
         let sender: SendFn = {
             let raw_sender = raw_sender.clone();
             let send_lock = send_lock.clone();
-            Arc::new(move |data: Vec<u8>| {
+            Arc::new(move |data: Vec<Vec<u8>>| {
                 let raw_sender = raw_sender.clone();
                 let send_lock = send_lock.clone();
                 let chunk_size_ble = transport_config.chunk_size_ble;
@@ -89,14 +89,15 @@ impl XiaomiDevice {
                         chunk_size_max = chunk_size_spp;
                     }
 
-                    if data.len() <= chunk_size_max {
-                        raw_sender(data).await
-                    } else {
-                        for chunk in data.chunks(chunk_size_max) {
-                            raw_sender(chunk.to_vec()).await?;
+                    let mut chunks = Vec::new();
+                    for packet in data {
+                        if packet.len() <= chunk_size_max {
+                            chunks.push(packet);
+                        } else {
+                            chunks.extend(packet.chunks(chunk_size_max).map(|chunk| chunk.to_vec()));
                         }
-                        Ok(())
                     }
+                    raw_sender(chunks).await
                 })
             })
         };
@@ -104,7 +105,7 @@ impl XiaomiDevice {
         // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
             universal_block_on(|| async {
-                sender(crate::tools::hex_stream_to_bytes("badcfe00c00300000100ef").unwrap())
+                sender(vec![crate::tools::hex_stream_to_bytes("badcfe00c00300000100ef").unwrap()])
                     .await
                     .unwrap();
             });
@@ -132,7 +133,7 @@ impl XiaomiDevice {
     }
 
     pub async fn send_data(&self, data: Vec<u8>) -> Result<(), SendError> {
-        (self.sender)(data).await
+        (self.sender)(vec![data]).await
     }
 
     pub fn base(&self) -> &Device {

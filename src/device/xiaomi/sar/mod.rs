@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
@@ -7,6 +8,7 @@ use web_time::{Duration, Instant};
 
 use crate::asyncrt::{TaskHandle, sleep, spawn_with_handle};
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 
 use super::SendFn;
 use crate::device::xiaomi::{
@@ -57,6 +59,7 @@ pub struct SarController {
     rx_cum_ack_timer: Option<TaskHandle>,
     /// 记录已经确认的 seq，供上层查询（会在 seq 重用或消费后清理）。
     acked: HashSet<u8>,
+    ack_notify: Arc<Notify>,
     config: SarConfig,
 }
 
@@ -83,6 +86,7 @@ impl SarController {
             rx_cum_ack_seq: 0,
             rx_cum_ack_timer: None,
             acked: HashSet::new(),
+            ack_notify: Arc::new(Notify::new()),
             config,
         };
 
@@ -189,6 +193,11 @@ impl SarController {
         seqs.iter().all(|s| self.acked.contains(s))
     }
 
+    #[inline]
+    pub fn ack_notifier(&self) -> Arc<Notify> {
+        self.ack_notify.clone()
+    }
+
     /// 在外部消费 ACK 后调用，避免陈旧的 ACK 记录影响后续判断。
     pub fn mark_ack_consumed(&mut self, seq: u8) {
         self.acked.remove(&seq);
@@ -219,7 +228,7 @@ impl SarController {
         let handle = self.tk_handle.clone();
         spawn_with_handle(
             async move {
-                let _ = (send_fn)(pkt.to_bytes()).await;
+                let _ = (send_fn)(vec![pkt.to_bytes()]).await;
             },
             handle,
         );
@@ -231,7 +240,7 @@ impl SarController {
         let handle = self.tk_handle.clone();
         spawn_with_handle(
             async move {
-                let _ = (send_fn)(pkt.to_bytes()).await;
+                let _ = (send_fn)(vec![pkt.to_bytes()]).await;
             },
             handle,
         );
@@ -261,7 +270,7 @@ impl SarController {
                                     async move {
                                         let pkt =
                                             L1Packet::new(L1DataType::Ack, false, seq, vec![]);
-                                        let _ = (send_fn)(pkt.to_bytes()).await;
+                                        let _ = (send_fn)(vec![pkt.to_bytes()]).await;
                                     },
                                     handle_send,
                                 );
@@ -394,15 +403,20 @@ impl SarController {
     }
 
     fn handle_ack(&mut self, seq: u8) {
+        let mut advanced = false;
         while let Some(item) = self.tx_queue.front() {
             if Self::seq_le(item.packet.seq, seq) {
                 let seq_val = item.packet.seq;
                 self.acked.insert(seq_val);
                 self.tx_queue.pop_front();
                 self.tx_base = self.tx_base.wrapping_add(1);
+                advanced = true;
             } else {
                 break;
             }
+        }
+        if advanced {
+            self.ack_notify.notify_waiters();
         }
         self.try_run_next();
     }
@@ -436,7 +450,7 @@ impl SarController {
             let handle = self.tk_handle.clone();
             spawn_with_handle(
                 async move {
-                    let _ = (send_fn)(pkt.to_bytes()).await;
+                    let _ = (send_fn)(vec![pkt.to_bytes()]).await;
                 },
                 handle,
             );
@@ -444,41 +458,49 @@ impl SarController {
         }
 
         // 先发命令
+        let mut cmd_batch = Vec::new();
         while let Some(cmd) = self.command_pool.pop_cmd() {
             let pkt = L1Packet::new(L1DataType::Cmd, false, 0, cmd);
+            cmd_batch.push(pkt.to_bytes());
+        }
+        if !cmd_batch.is_empty() {
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
             spawn_with_handle(
                 async move {
-                    let _ = (send_fn)(pkt.to_bytes()).await;
+                    let _ = (send_fn)(cmd_batch).await;
                 },
-                handle.clone(),
+                handle,
             );
         }
 
         // 再发数据，受窗口限制
         // 仅根据当前正在等待 ACK 的数量控制窗口，允许上层一次性排队更多数据。
+        let mut data_batch = Vec::new();
         while self.tx_queue.len() < usize::from(self.effective_tx_win()) {
             let Some(qd) = self.command_pool.pop_data() else {
                 break;
             };
             let pkt = L1Packet::new(L1DataType::Data, false, qd.seq, qd.payload);
             let bytes = pkt.to_bytes();
-            let send_fn = self.sender.clone();
             let deadline = Instant::now() + self.send_timeout;
-            let handle = self.tk_handle.clone();
-            spawn_with_handle(
-                async move {
-                    let _ = (send_fn)(bytes).await;
-                },
-                handle,
-            );
+            data_batch.push(bytes);
             self.tx_queue.push_back(SendItem {
                 packet: pkt,
                 wait_ack: true,
                 need_retransmission: false,
                 deadline,
             });
+        }
+        if !data_batch.is_empty() {
+            let send_fn = self.sender.clone();
+            let handle = self.tk_handle.clone();
+            spawn_with_handle(
+                async move {
+                    let _ = (send_fn)(data_batch).await;
+                },
+                handle,
+            );
         }
     }
 }

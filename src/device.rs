@@ -82,7 +82,7 @@ pub async fn create_device<F, Fut>(
     sender: F,
 ) -> anyhow::Result<DeviceConnectionInfo>
 where
-    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
     match device_kind {
@@ -98,6 +98,12 @@ where
 
             crate::ecs::with_rt_mut(move |rt| {
                 let mut device_config = XiaomiDeviceConfig::default();
+                #[cfg(target_os = "ios")]
+                let tx_win_overrun_allowance = if matches!(connect_type, ConnectType::BLE) {
+                    Some(0)
+                } else {
+                    tx_win_overrun_allowance
+                };
                 if let Some(allowance) = tx_win_overrun_allowance {
                     device_config.sar.tx_win_overrun_allowance = allowance.min(16);
                 }

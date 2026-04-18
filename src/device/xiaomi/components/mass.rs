@@ -1,4 +1,4 @@
-use crate::asyncrt::{Duration, sleep, timeout};
+use crate::asyncrt::{Duration, timeout};
 use crate::bail_site;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -843,8 +843,23 @@ fn compute_ack_stall_deadline(
 /// 阻塞等待某个 seq 收到 ACK（带总超时保护）
 async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Result<()> {
     let owner = owner_id.to_string();
+    let ack_notifier = crate::ecs::with_rt_mut({
+        let owner = owner.clone();
+        move |rt| {
+            rt.with_device_mut(&owner, |world, entity| {
+                world
+                    .get_mut::<XiaomiDevice>(entity)
+                    .map(|dev| dev.sar.lock().ack_notifier())
+            })
+            .flatten()
+        }
+    })
+    .await
+    .with_context(|| format!("Device {owner_id} not found when waiting for MASS ACK"))?;
+
     let ack_future = async {
         loop {
+            let notified = ack_notifier.notified();
             let owner_clone = owner.clone();
             let acked = crate::ecs::with_rt_mut(move |rt| {
                 rt.with_device_mut(&owner_clone, |world, entity| {
@@ -859,7 +874,7 @@ async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Resul
             if acked {
                 break;
             }
-            sleep(Duration::from_millis(config.ack_poll_interval_ms)).await; // 隔一会儿问一下防止变成黄金矿工，
+            notified.await;
         }
     };
 
