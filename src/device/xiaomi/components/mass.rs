@@ -1007,6 +1007,7 @@ where
     F: Fn(SendMassCallbackData) + Send + Sync,
 {
     let mut consumed = 0usize;
+    let mut latest_progress = None;
 
     loop {
         let (part_num, payload_len, seq) = {
@@ -1066,7 +1067,7 @@ where
         } else {
             part_num as f32 / total_parts as f32
         };
-        (progress_cb)(SendMassCallbackData {
+        latest_progress = Some(SendMassCallbackData {
             progress,
             total_parts,
             current_part_num: part_num,
@@ -1074,6 +1075,10 @@ where
         });
         let _ = seq;
         consumed += 1;
+    }
+
+    if let Some(progress) = latest_progress {
+        (progress_cb)(progress);
     }
 
     Ok(consumed)
