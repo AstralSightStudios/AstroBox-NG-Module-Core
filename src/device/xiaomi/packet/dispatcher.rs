@@ -1,8 +1,11 @@
 use std::{
     collections::HashMap,
-    sync::{OnceLock, RwLock},
+    io::Cursor,
+    sync::{Arc, OnceLock, RwLock},
 };
 
+use pb::xiaomi::protocol::WearPacket;
+use prost::Message;
 use tokio::runtime::Handle;
 
 use crate::device::xiaomi::XiaomiDevice;
@@ -16,9 +19,48 @@ use super::{
 };
 
 static RECV_BUFFERS: OnceLock<RwLock<HashMap<String, Vec<u8>>>> = OnceLock::new();
+static PACKET_OBSERVERS: OnceLock<RwLock<Vec<Arc<dyn Fn(XiaomiPacketEvent) + Send + Sync>>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+pub struct XiaomiPacketEvent {
+    pub device_id: String,
+    pub channel_id: u32,
+    pub opcode_id: u32,
+    pub payload: Vec<u8>,
+    pub protobuf_type_id: Option<u32>,
+    pub protobuf_packet_id: Option<u32>,
+}
 
 fn recv_buffer_registry() -> &'static RwLock<HashMap<String, Vec<u8>>> {
     RECV_BUFFERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn packet_observer_registry() -> &'static RwLock<Vec<Arc<dyn Fn(XiaomiPacketEvent) + Send + Sync>>> {
+    PACKET_OBSERVERS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+pub fn register_observer(observer: Arc<dyn Fn(XiaomiPacketEvent) + Send + Sync>) {
+    match packet_observer_registry().write() {
+        Ok(mut guard) => guard.push(observer),
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.push(observer);
+        }
+    }
+}
+
+fn emit_packet_event(event: XiaomiPacketEvent) {
+    let observers = match packet_observer_registry().read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if observers.is_empty() {
+        return;
+    }
+    for observer in observers {
+        observer(event.clone());
+    }
 }
 
 pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
@@ -110,6 +152,33 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                         let ch = l2p.channel;
                         let op = l2p.opcode;
                         let payload = l2p.payload;
+                        let (protobuf_type_id, protobuf_packet_id) = if ch == super::v2::layer2::L2Channel::Pb {
+                            match WearPacket::decode(Cursor::new(&payload)) {
+                                Ok(packet) => (
+                                    u32::try_from(packet.r#type).ok(),
+                                    Some(packet.id),
+                                ),
+                                Err(err) => {
+                                    log::debug!(
+                                        "failed to decode observed Xiaomi PB packet ({} bytes): {}",
+                                        payload.len(),
+                                        err
+                                    );
+                                    (None, None)
+                                }
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                        emit_packet_event(XiaomiPacketEvent {
+                            device_id: device_id.clone(),
+                            channel_id: ch as u32,
+                            opcode_id: op as u32,
+                            payload: payload.clone(),
+                            protobuf_type_id,
+                            protobuf_packet_id,
+                        });
 
                         crate::ecs::with_rt_mut({
                             let device_id_dispatch = device_id.clone();
