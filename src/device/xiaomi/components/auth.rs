@@ -7,7 +7,7 @@ use crate::ecs::Component;
 use crate::ecs::access::with_device_component_mut;
 use crate::{anyhow_site, bail_site};
 use anyhow::Context;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::Mutex;
 use pb::xiaomi::protocol::WearPacket;
 use prost::Message;

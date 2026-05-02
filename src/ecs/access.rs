@@ -1,4 +1,8 @@
-use bevy_ecs::{component::Component, entity::Entity, world::World};
+use bevy_ecs::{
+    component::{Component, Mutable},
+    entity::Entity,
+    world::World,
+};
 
 use crate::ecs::runtime::Runtime;
 
@@ -26,7 +30,7 @@ where
 
 pub fn with_device_component_mut<T, R, F>(owner_id: String, f: F) -> Result<R, EcsAccessError>
 where
-    T: Component + 'static,
+    T: Component<Mutability = Mutable> + 'static,
     F: FnOnce(&mut T) -> R + Send + 'static,
     R: Send + 'static,
 {

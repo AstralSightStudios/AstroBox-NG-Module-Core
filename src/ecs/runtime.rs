@@ -1,6 +1,6 @@
 use bevy_ecs::{
     bundle::Bundle,
-    component::Component,
+    component::{Component, Mutable},
     entity::Entity,
     world::{EntityWorldMut, World},
 };
@@ -63,7 +63,10 @@ impl Runtime {
         Some(self.world.entity_mut(entity))
     }
 
-    pub fn component_mut<T: Component>(&mut self, id: &str) -> Option<bevy_ecs::world::Mut<'_, T>> {
+    pub fn component_mut<T: Component<Mutability = Mutable>>(
+        &mut self,
+        id: &str,
+    ) -> Option<bevy_ecs::world::Mut<'_, T>> {
         let entity = self.device_entity(id)?;
         self.world.get_mut::<T>(entity)
     }

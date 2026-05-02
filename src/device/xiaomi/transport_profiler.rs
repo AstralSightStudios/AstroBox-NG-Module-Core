@@ -101,14 +101,17 @@ impl TransportProfilerHandle {
                 events: session.events,
             }
         } else {
-            state.last_report.clone().unwrap_or_else(|| TransportProfilerReport {
-                active: false,
-                session_started_at_epoch_ms: None,
-                duration_ms: 0,
-                event_count: 0,
-                dropped_event_count: 0,
-                events: Vec::new(),
-            })
+            state
+                .last_report
+                .clone()
+                .unwrap_or_else(|| TransportProfilerReport {
+                    active: false,
+                    session_started_at_epoch_ms: None,
+                    duration_ms: 0,
+                    event_count: 0,
+                    dropped_event_count: 0,
+                    events: Vec::new(),
+                })
         };
         state.last_report = Some(report.clone());
         report

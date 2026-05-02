@@ -7,17 +7,21 @@ use std::{
     sync::{OnceLock, RwLock},
 };
 
-use bevy_ecs::{component::Component, entity::Entity, world::World};
+use bevy_ecs::{
+    component::{Component, Mutable},
+    entity::Entity,
+    world::World,
+};
 
 use crate::device::xiaomi::packet::v2::layer2::{L2Channel, L2OpCode};
 
 // 收L2包的System扩展trait
-pub trait XiaomiSystemExt: Component {
+pub trait XiaomiSystemExt: Component<Mutability = Mutable> {
     fn on_layer2_packet(&mut self, channel: L2Channel, opcode: L2OpCode, payload: &[u8]);
 }
 
 // 收PB包的System扩展trait，基于L2
-pub trait L2PbExt: Component {
+pub trait L2PbExt: Component<Mutability = Mutable> {
     fn on_pb_packet(&mut self, payload: WearPacket);
 }
 
@@ -58,9 +62,9 @@ fn xiaomi_ext_on_l2packet_registry() -> &'static RwLock<HashMap<TypeId, OnL2Pack
 
 fn make_xiaomi_ext_on_l2packet_dispatcher<T>() -> OnL2PacketDispatcher
 where
-    T: XiaomiSystemExt + Component + 'static,
+    T: XiaomiSystemExt + Component<Mutability = Mutable> + 'static,
 {
-    fn inner<T: XiaomiSystemExt + Component + 'static>(
+    fn inner<T: XiaomiSystemExt + Component<Mutability = Mutable> + 'static>(
         world: &mut World,
         entity: Entity,
         ch: L2Channel,
@@ -76,7 +80,7 @@ where
 
 pub fn register_xiaomi_system_ext_on_l2packet<T>()
 where
-    T: XiaomiSystemExt + Component + 'static,
+    T: XiaomiSystemExt + Component<Mutability = Mutable> + 'static,
 {
     let mut map = xiaomi_ext_on_l2packet_registry()
         .write()
