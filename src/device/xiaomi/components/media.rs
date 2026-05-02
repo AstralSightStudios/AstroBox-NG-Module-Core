@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use pb::xiaomi::protocol::{self, WearPacket};
 use prost::{
     Message,
-    encoding::{DecodeContext, WireType, decode_key, decode_length_delimiter, skip_field},
+    encoding::{
+        DecodeContext, WireType, decode_key, decode_length_delimiter, skip_field,
+    },
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -28,13 +30,9 @@ use crate::{
     ecs::{Component, access::with_device_component_mut},
 };
 
-#[cfg(target_arch = "wasm32")]
-pub type MediaUploadFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<MediaUploadResult>>>>;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub type MediaUploadFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<MediaUploadResult>> + Send>>;
+pub type MediaUploadFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<MediaUploadResult>> + Send>,
+>;
 
 #[derive(Debug, Clone)]
 pub struct MediaUploadResult {
@@ -97,7 +95,9 @@ impl MediaSystem {
         }
     }
 
-    pub fn request_song_summary(&mut self) -> oneshot::Receiver<Result<protocol::SongSummary>> {
+    pub fn request_song_summary(
+        &mut self,
+    ) -> oneshot::Receiver<Result<protocol::SongSummary>> {
         let (rx, should_enqueue) = self.song_summary_wait.prepare();
         if should_enqueue {
             self.enqueue_request(build_media_packet(
@@ -148,14 +148,20 @@ impl MediaSystem {
         Ok(rx)
     }
 
-    pub fn request_media_file(&mut self, identifier: protocol::media_file::Identifier) {
+    pub fn request_media_file(
+        &mut self,
+        identifier: protocol::media_file::Identifier,
+    ) {
         self.enqueue_request(build_media_packet(
             protocol::media::MediaId::RequestMediaFile,
             Some(protocol::media::Payload::MediaFileIdentifier(identifier)),
         ));
     }
 
-    pub fn request_media_files(&mut self, identifiers: Vec<protocol::media_file::Identifier>) {
+    pub fn request_media_files(
+        &mut self,
+        identifiers: Vec<protocol::media_file::Identifier>,
+    ) {
         self.enqueue_request(build_media_packet(
             protocol::media::MediaId::RequestMediaFileList,
             Some(protocol::media::Payload::MediaFileIdentifiers(
@@ -164,7 +170,10 @@ impl MediaSystem {
         ));
     }
 
-    pub fn confirm_media_file(&mut self, identifier: protocol::media_file::Identifier) {
+    pub fn confirm_media_file(
+        &mut self,
+        identifier: protocol::media_file::Identifier,
+    ) {
         self.enqueue_request(build_media_packet(
             protocol::media::MediaId::ConfirmMediaFile,
             Some(protocol::media::Payload::MediaFileIdentifier(identifier)),
@@ -221,7 +230,9 @@ impl MediaSystem {
         self.enqueue_request(build_media_packet(
             protocol::media::MediaId::AddSong,
             Some(protocol::media::Payload::SongAddRequest(
-                protocol::song::AddRequest { song: song.clone() },
+                protocol::song::AddRequest {
+                    song: song.clone(),
+                },
             )),
         ));
 
@@ -242,10 +253,8 @@ impl MediaSystem {
                 }
             };
 
-            let status =
-                protocol::PrepareStatus::try_from(add_resp.prepare_status).map_err(|_| {
-                    anyhow_site!("unknown song prepare status: {}", add_resp.prepare_status)
-                })?;
+            let status = protocol::PrepareStatus::try_from(add_resp.prepare_status)
+                .map_err(|_| anyhow_site!("unknown song prepare status: {}", add_resp.prepare_status))?;
 
             match status {
                 protocol::PrepareStatus::Ready => {}
@@ -270,12 +279,9 @@ impl MediaSystem {
                 log::warn!(
                     "music upload add response returned slice length 0, falling back to MASS prepare"
                 );
-                send_file_for_owner(
-                    owner.clone(),
-                    file_data,
-                    MassDataType::Music,
-                    move |progress| (progress_cb)(progress),
-                )
+                send_file_for_owner(owner.clone(), file_data, MassDataType::Music, move |progress| {
+                    (progress_cb)(progress)
+                })
                 .await
                 .context("failed to send music MASS payload with prepare fallback")?;
             } else {
@@ -483,12 +489,11 @@ impl XiaomiSystemExt for MediaSystem {
 
         let packet_id = extract_varint_field(payload, 2).unwrap_or(None);
         if packet_id == Some(protocol::media::MediaId::ReportMediaFileList as u64) {
-            match extract_length_delimited_field(payload, 20).and_then(|media_bytes| {
-                match media_bytes {
+            match extract_length_delimited_field(payload, 20)
+                .and_then(|media_bytes| match media_bytes {
                     Some(bytes) => extract_length_delimited_field(&bytes, 14),
                     None => Ok(None),
-                }
-            }) {
+                }) {
                 Ok(Some(list_payload)) => self.handle_media_file_list_payload(&list_payload),
                 Ok(None) => {
                     log::warn!(
@@ -575,8 +580,8 @@ fn emit_media_state_changed(device_addr: String) {
 fn extract_varint_field(raw: &[u8], target_tag: u32) -> Result<Option<u64>> {
     let mut buf = raw;
     while !buf.is_empty() {
-        let (tag, wire_type) = decode_key(&mut buf)
-            .map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
+        let (tag, wire_type) =
+            decode_key(&mut buf).map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
         match wire_type {
             WireType::Varint if tag == target_tag => {
                 return prost::encoding::decode_varint(&mut buf)
@@ -597,8 +602,8 @@ fn extract_length_delimited_field(raw: &[u8], target_tag: u32) -> Result<Option<
     let mut last = None;
 
     while !buf.is_empty() {
-        let (tag, wire_type) = decode_key(&mut buf)
-            .map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
+        let (tag, wire_type) =
+            decode_key(&mut buf).map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
         match wire_type {
             WireType::LengthDelimited => {
                 let len = decode_length_delimiter(&mut buf)
@@ -631,8 +636,8 @@ fn extract_repeated_length_delimited_fields(raw: &[u8], target_tag: u32) -> Resu
     let mut fields = Vec::new();
 
     while !buf.is_empty() {
-        let (tag, wire_type) = decode_key(&mut buf)
-            .map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
+        let (tag, wire_type) =
+            decode_key(&mut buf).map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
         match wire_type {
             WireType::LengthDelimited => {
                 let len = decode_length_delimiter(&mut buf)
@@ -678,8 +683,8 @@ fn decode_media_file_descriptor(raw: &[u8]) -> Result<MediaFileDescriptor> {
     let mut duration_secs = None;
 
     while !buf.is_empty() {
-        let (tag, wire_type) = decode_key(&mut buf)
-            .map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
+        let (tag, wire_type) =
+            decode_key(&mut buf).map_err(|err| anyhow_site!("decode protobuf key failed: {err}"))?;
         match wire_type {
             WireType::Varint => {
                 let value = prost::encoding::decode_varint(&mut buf)
@@ -784,7 +789,9 @@ fn display_name_from_identifier(value: &str) -> String {
         .to_string()
 }
 
-fn infer_media_file_type(fields: &[(u32, u64)]) -> Option<protocol::media_file::Type> {
+fn infer_media_file_type(
+    fields: &[(u32, u64)],
+) -> Option<protocol::media_file::Type> {
     fields.iter().find_map(|(_, value)| {
         if *value > i32::MAX as u64 {
             return None;
@@ -848,10 +855,7 @@ fn infer_media_file_duration(
             None
         };
         if let Some(candidate) = secs.filter(|candidate| *candidate > 0) {
-            best = Some(
-                best.map(|current| current.min(candidate))
-                    .unwrap_or(candidate),
-            );
+            best = Some(best.map(|current| current.min(candidate)).unwrap_or(candidate));
         }
     }
 
@@ -889,9 +893,7 @@ fn looks_like_media_name(value: &str) -> bool {
     if trimmed.contains('.') || trimmed.contains(' ') {
         return true;
     }
-    let ascii = trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    let ascii = trimmed.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-');
     !ascii
 }
 

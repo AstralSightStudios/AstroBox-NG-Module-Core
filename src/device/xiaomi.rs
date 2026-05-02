@@ -108,8 +108,7 @@ impl XiaomiDevice {
                         if packet.len() <= chunk_size_max {
                             chunks.push(packet);
                         } else {
-                            chunks
-                                .extend(packet.chunks(chunk_size_max).map(|chunk| chunk.to_vec()));
+                            chunks.extend(packet.chunks(chunk_size_max).map(|chunk| chunk.to_vec()));
                         }
                     }
                     let packet_count = chunks.len() as u32;
@@ -147,11 +146,9 @@ impl XiaomiDevice {
         // 不知道为什么傻逼小米针对SPP连接要发这么一个神秘Hello
         if connect_type == ConnectType::SPP {
             universal_block_on(|| async {
-                sender(vec![
-                    crate::tools::hex_stream_to_bytes("badcfe00c00300000100ef").unwrap(),
-                ])
-                .await
-                .unwrap();
+                sender(vec![crate::tools::hex_stream_to_bytes("badcfe00c00300000100ef").unwrap()])
+                    .await
+                    .unwrap();
             });
         }
 

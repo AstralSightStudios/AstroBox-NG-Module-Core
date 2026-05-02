@@ -24,9 +24,9 @@ use crate::device::xiaomi::packet::{
     v2::layer2::{L2Channel, L2OpCode, L2Packet},
 };
 use crate::device::xiaomi::system::{XiaomiSystemExt, register_xiaomi_system_ext_on_l2packet};
-use crate::device::xiaomi::transport_profiler::TransportProfilerHandle;
 use crate::ecs::{Component, access::with_device_component_mut};
 use parking_lot::Mutex;
+use crate::device::xiaomi::transport_profiler::TransportProfilerHandle;
 
 #[derive(Clone, serde::Serialize)]
 struct ResumeState {
@@ -173,7 +173,8 @@ impl MassSystem {
 
         for channel in channels {
             let key = *channel as u8;
-            let other_siblings: Vec<u8> = siblings.iter().cloned().filter(|s| *s != key).collect();
+            let other_siblings: Vec<u8> =
+                siblings.iter().cloned().filter(|s| *s != key).collect();
             self.reverse_mass_waits.insert(
                 key,
                 ReverseMassWaiter {
@@ -777,7 +778,11 @@ async fn flush_mass_batch(
     }
 
     if let Some(profiler) = profiler {
-        let packet_count = pending_parts.iter().rev().take(meta_len).count() as u32;
+        let packet_count = pending_parts
+            .iter()
+            .rev()
+            .take(meta_len)
+            .count() as u32;
         let total_bytes = pending_parts
             .iter()
             .rev()
@@ -847,13 +852,7 @@ where
                 profiler.record(
                     "mass",
                     "flow_wait",
-                    Some(
-                        wait_started_at
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                    ),
+                    Some(wait_started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
                     None,
                     None,
                     Some(u32::from(front_seq)),

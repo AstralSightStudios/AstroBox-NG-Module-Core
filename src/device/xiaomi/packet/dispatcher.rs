@@ -36,8 +36,7 @@ fn recv_buffer_registry() -> &'static RwLock<HashMap<String, Vec<u8>>> {
     RECV_BUFFERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn packet_observer_registry() -> &'static RwLock<Vec<Arc<dyn Fn(XiaomiPacketEvent) + Send + Sync>>>
-{
+fn packet_observer_registry() -> &'static RwLock<Vec<Arc<dyn Fn(XiaomiPacketEvent) + Send + Sync>>> {
     PACKET_OBSERVERS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
@@ -153,11 +152,12 @@ pub fn on_packet(tk_handle: Handle, device_id: String, data: Vec<u8>) {
                         let ch = l2p.channel;
                         let op = l2p.opcode;
                         let payload = l2p.payload;
-                        let (protobuf_type_id, protobuf_packet_id) = if ch
-                            == super::v2::layer2::L2Channel::Pb
-                        {
+                        let (protobuf_type_id, protobuf_packet_id) = if ch == super::v2::layer2::L2Channel::Pb {
                             match WearPacket::decode(Cursor::new(&payload)) {
-                                Ok(packet) => (u32::try_from(packet.r#type).ok(), Some(packet.id)),
+                                Ok(packet) => (
+                                    u32::try_from(packet.r#type).ok(),
+                                    Some(packet.id),
+                                ),
                                 Err(err) => {
                                     log::debug!(
                                         "failed to decode observed Xiaomi PB packet ({} bytes): {}",
