@@ -98,12 +98,6 @@ where
 
             crate::ecs::with_rt_mut(move |rt| {
                 let mut device_config = XiaomiDeviceConfig::default();
-                #[cfg(target_os = "ios")]
-                let tx_win_overrun_allowance = if matches!(connect_type, ConnectType::BLE) {
-                    Some(0)
-                } else {
-                    tx_win_overrun_allowance
-                };
                 if let Some(allowance) = tx_win_overrun_allowance {
                     device_config.sar.tx_win_overrun_allowance = allowance.min(16);
                 }
