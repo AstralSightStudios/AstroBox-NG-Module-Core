@@ -204,9 +204,18 @@ impl InstallSystem {
                 .context("failed to send MASS payload")?;
 
                 if let Some(result_rx) = result_rx_opt {
-                    let event = result_rx
-                        .await
-                        .map_err(|_| anyhow_site!("install result message missing"))?;
+                    let event = match result_rx.await {
+                        Ok(event) => event,
+                        Err(_) if matches!(r#type, MassDataType::Firmare) => {
+                            log::info!(
+                                "[Install] firmware payload sent; install result message missing because the device may be rebooting"
+                            );
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            return Err(anyhow_site!("install result message missing"));
+                        }
+                    };
                     handle_install_result(r#type, event)?;
                     refresh_post_install_state(owner_for_future.clone(), r#type).await;
                 }
