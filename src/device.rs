@@ -1,3 +1,7 @@
+use crate::device::vivo::{
+    VivoConnectType, VivoDevice, VivoDeviceConfig,
+    components::auth::{AuthComponent as VivoAuthComponent, AuthSystem as VivoAuthSystem},
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::device::xiaomi::components::network::NetworkComponent;
 #[cfg(not(target_arch = "wasm32"))]
@@ -18,16 +22,18 @@ use crate::device::xiaomi::config::XiaomiDeviceConfig;
 use crate::device::xiaomi::r#type::ConnectType;
 use crate::device::xiaomi::{SendError, XiaomiDevice, cleanup_cached_state};
 use crate::ecs::Component;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::runtime::Handle;
 
+pub mod vivo;
 pub mod xiaomi;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKind {
     Xiaomi,
+    Vivo,
 }
 
 #[derive(Component, Serialize)]
@@ -64,6 +70,7 @@ pub struct DeviceConnectionInfo {
 pub fn cleanup_device_state(kind: DeviceKind, addr: &str) {
     match kind {
         DeviceKind::Xiaomi => cleanup_cached_state(addr),
+        DeviceKind::Vivo => vivo::cleanup_cached_state(addr),
     }
 }
 
@@ -86,6 +93,11 @@ where
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
     match device_kind {
+        DeviceKind::Vivo => {
+            bail!(
+                "Vivo devices require create_vivo_device because they do not use Xiaomi authkey/SAR options"
+            )
+        }
         DeviceKind::Xiaomi => {
             let device_id_for_auth = addr.clone();
             #[cfg(not(target_arch = "wasm32"))]
@@ -209,4 +221,65 @@ where
             })
         }
     }
+}
+
+pub async fn create_vivo_device<F, Fut>(
+    tk_handle: Handle,
+    name: String,
+    addr: String,
+    connect_type: VivoConnectType,
+    config: VivoDeviceConfig,
+    sender: F,
+) -> anyhow::Result<DeviceConnectionInfo>
+where
+    F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), vivo::SendError>> + Send + 'static,
+{
+    let device_id_for_auth = addr.clone();
+    let addr_for_entity = addr.clone();
+    let name_for_entity = name.clone();
+    let auth_component = VivoAuthComponent::from_config(&config);
+    cleanup_device_state(DeviceKind::Vivo, &addr);
+
+    crate::ecs::with_rt_mut(move |rt| {
+        let dev = VivoDevice::new(
+            name_for_entity.clone(),
+            addr_for_entity.clone(),
+            connect_type,
+            config,
+            sender,
+        );
+        let device_id = addr_for_entity.clone();
+        let entity = rt.spawn_device(
+            addr_for_entity.clone(),
+            (
+                dev,
+                Device::new(name_for_entity, addr_for_entity, DeviceKind::Vivo),
+            ),
+        );
+        let mut entity_ref = rt.world_mut().entity_mut(entity);
+        entity_ref.insert((
+            auth_component,
+            VivoAuthSystem::new(device_id, tk_handle.clone()),
+        ));
+    })
+    .await;
+
+    let auth_rx = crate::ecs::with_rt_mut(move |rt| {
+        rt.with_device_mut(&device_id_for_auth, |world, entity| {
+            let mut auth_system = world
+                .get_mut::<VivoAuthSystem>(entity)
+                .expect("VivoAuthSystem missing");
+            auth_system.prepare_auth().map(Some)
+        })
+        .unwrap_or_else(|| Ok(None))
+    })
+    .await?;
+
+    if let Some(rx) = auth_rx {
+        let auth_result = rx.await.context("Vivo auth await response not received")?;
+        auth_result?;
+    }
+
+    Ok(DeviceConnectionInfo { name, addr })
 }
