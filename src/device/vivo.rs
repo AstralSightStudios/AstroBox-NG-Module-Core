@@ -72,6 +72,21 @@ pub enum VivoConnectType {
     BLE = 1,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VivoBindStartType {
+    Bind,
+    UserConnect,
+    AutoConnect,
+    ReconnInner,
+    ReconnBackup,
+}
+
+impl Default for VivoBindStartType {
+    fn default() -> Self {
+        Self::UserConnect
+    }
+}
+
 #[derive(Debug)]
 pub enum SendError {
     Disconnected,
@@ -87,7 +102,7 @@ pub struct VivoDeviceConfig {
     pub phone_device_id: String,
     pub app_version: String,
     pub phone_model: String,
-    pub is_first_bind: bool,
+    pub bind_start_type: VivoBindStartType,
     pub has_backup_list: bool,
     pub magic_phone: Option<String>,
     pub product_series_type: Option<i32>,
@@ -102,7 +117,7 @@ impl Default for VivoDeviceConfig {
             phone_device_id: "astrobox-vivo-phone".to_string(),
             app_version: "1".to_string(),
             phone_model: "AstroBox".to_string(),
-            is_first_bind: false,
+            bind_start_type: VivoBindStartType::default(),
             has_backup_list: false,
             magic_phone: None,
             product_series_type: None,
@@ -150,13 +165,18 @@ impl VivoDevice {
     }
 
     pub fn encode_message_packets(&self, message: VscpMessage) -> Result<Vec<Vec<u8>>, SendError> {
-        let frames = self
-            .sar
-            .lock()
-            .encode_message(&message)
-            .map_err(|err| SendError::Io(err.to_string()))?;
+        let (frames, pack_size, max_data_length) = {
+            let mut sar = self.sar.lock();
+            let pack_size = sar.config().pack_size;
+            let max_data_length = sar.config().max_data_length;
+            let frames = sar
+                .encode_message(&message)
+                .map_err(|err| SendError::Io(err.to_string()))?;
+            (frames, pack_size, max_data_length)
+        };
 
         let mut packets = Vec::new();
+        let frame_count = frames.len();
         for frame in frames {
             match self.connect_type {
                 VivoConnectType::SPP => packets.push(frame.into_bytes()),
@@ -167,6 +187,22 @@ impl VivoDevice {
                 }
             }
         }
+
+        let packet_lens = packets.iter().map(Vec::len).collect::<Vec<_>>();
+        log::info!(
+            "[VivoDevice.Transport] TX addr={} bid={} cid={} encrypted={} payload_len={} connect_type={:?} vscp_pack_size={} vscp_max_data_length={} frame_count={} packet_count={} packet_lens={:?}",
+            self.addr(),
+            message.bid,
+            message.cid,
+            message.encrypted,
+            message.payload.len(),
+            self.connect_type,
+            pack_size,
+            max_data_length,
+            frame_count,
+            packets.len(),
+            packet_lens
+        );
 
         Ok(packets)
     }
@@ -192,7 +228,26 @@ impl VivoDevice {
     }
 
     pub fn on_transport_data(&self, data: &[u8]) -> VivoProtocolResult<Vec<VscpMessage>> {
-        self.sar.lock().push_bytes(data)
+        let messages = self.sar.lock().push_bytes(data)?;
+        if messages.is_empty() {
+            log::debug!(
+                "[VivoDevice.Transport] RX addr={} raw_len={} buffered/no complete message yet",
+                self.addr(),
+                data.len()
+            );
+        } else {
+            for message in &messages {
+                log::info!(
+                    "[VivoDevice.Transport] RX addr={} bid={} cid={} encrypted={} payload_len={}",
+                    self.addr(),
+                    message.bid,
+                    message.cid,
+                    message.encrypted,
+                    message.payload.len()
+                );
+            }
+        }
+        Ok(messages)
     }
 
     pub fn base(&self) -> &Device {

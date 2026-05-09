@@ -1,6 +1,26 @@
 use crate::device::vivo::{
     VivoConnectType, VivoDevice, VivoDeviceConfig,
     components::auth::{AuthComponent as VivoAuthComponent, AuthSystem as VivoAuthSystem},
+    components::cloud_bridge::{
+        CloudBridgeComponent as VivoCloudBridgeComponent,
+        CloudBridgeSystem as VivoCloudBridgeSystem,
+    },
+    components::erpc::{ErpcComponent as VivoErpcComponent, ErpcSystem as VivoErpcSystem},
+    components::info::{InfoComponent as VivoInfoComponent, InfoSystem as VivoInfoSystem},
+    components::install::{
+        InstallComponent as VivoInstallComponent, InstallSystem as VivoInstallSystem,
+    },
+    components::resource::{
+        ResourceComponent as VivoResourceComponent, ResourceSystem as VivoResourceSystem,
+    },
+    components::sync::{SyncComponent as VivoSyncComponent, SyncSystem as VivoSyncSystem},
+    components::thirdparty_app::{
+        ThirdpartyAppComponent as VivoThirdpartyAppComponent,
+        ThirdpartyAppSystem as VivoThirdpartyAppSystem,
+    },
+    components::watchface::{
+        WatchfaceComponent as VivoWatchfaceComponent, WatchfaceSystem as VivoWatchfaceSystem,
+    },
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::device::xiaomi::components::network::NetworkComponent;
@@ -27,13 +47,25 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::runtime::Handle;
 
+pub mod data;
+pub mod install;
+pub mod resource;
+pub mod sync;
+pub mod thirdparty_app;
 pub mod vivo;
+pub mod watchface;
 pub mod xiaomi;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKind {
     Xiaomi,
     Vivo,
+}
+
+impl Default for DeviceKind {
+    fn default() -> Self {
+        Self::Xiaomi
+    }
 }
 
 #[derive(Component, Serialize)]
@@ -65,6 +97,8 @@ impl Device {
 pub struct DeviceConnectionInfo {
     pub name: String,
     pub addr: String,
+    #[serde(default)]
+    pub kind: DeviceKind,
 }
 
 pub fn cleanup_device_state(kind: DeviceKind, addr: &str) {
@@ -218,6 +252,7 @@ where
             Ok(DeviceConnectionInfo {
                 name: name.clone(),
                 addr: addr.clone(),
+                kind: DeviceKind::Xiaomi,
             })
         }
     }
@@ -260,7 +295,25 @@ where
         let mut entity_ref = rt.world_mut().entity_mut(entity);
         entity_ref.insert((
             auth_component,
-            VivoAuthSystem::new(device_id, tk_handle.clone()),
+            VivoAuthSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoInfoComponent::new(),
+            VivoInfoSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoInstallComponent::new(),
+            VivoInstallSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoResourceComponent::new(),
+            VivoResourceSystem::new(device_id.clone(), tk_handle.clone()),
+        ));
+        entity_ref.insert((
+            VivoWatchfaceComponent::new(),
+            VivoWatchfaceSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoThirdpartyAppComponent::new(),
+            VivoThirdpartyAppSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoCloudBridgeComponent::new(),
+            VivoCloudBridgeSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoErpcComponent::new(),
+            VivoErpcSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoSyncComponent::new(),
+            VivoSyncSystem::new(device_id, tk_handle.clone()),
         ));
     })
     .await;
@@ -281,5 +334,9 @@ where
         auth_result?;
     }
 
-    Ok(DeviceConnectionInfo { name, addr })
+    Ok(DeviceConnectionInfo {
+        name,
+        addr,
+        kind: DeviceKind::Vivo,
+    })
 }

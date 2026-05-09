@@ -10,7 +10,9 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 
 use crate::{
-    anyhow_site, bail_site,
+    anyhow_site,
+    asyncrt::timeout,
+    bail_site,
     device::xiaomi::{
         components::{
             mass::{
@@ -28,6 +30,11 @@ use crate::{
     ecs::{Component, access::with_device_component_mut},
 };
 
+#[cfg(target_arch = "wasm32")]
+pub type MediaUploadFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<MediaUploadResult>>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub type MediaUploadFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<MediaUploadResult>> + Send>>;
 
@@ -221,7 +228,7 @@ impl MediaSystem {
         ));
 
         Ok(Box::pin(async move {
-            let add_resp = match tokio::time::timeout(Duration::from_secs(15), add_rx).await {
+            let add_resp = match timeout(Duration::from_secs(15), add_rx).await {
                 Ok(Ok(Ok(resp))) => resp,
                 Ok(Ok(Err(err))) => {
                     clear_song_add_waiter_for_owner(owner.clone()).await;
@@ -285,7 +292,7 @@ impl MediaSystem {
                 .context("failed to send music MASS payload")?;
             }
 
-            let report = match tokio::time::timeout(Duration::from_secs(90), report_rx).await {
+            let report = match timeout(Duration::from_secs(90), report_rx).await {
                 Ok(Ok(Ok(report))) => report,
                 Ok(Ok(Err(err))) => {
                     clear_song_report_waiter_for_owner(owner.clone()).await;

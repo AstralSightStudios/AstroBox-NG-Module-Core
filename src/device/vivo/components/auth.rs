@@ -23,7 +23,8 @@ use vivo_msgpack::{
 use crate::{
     anyhow_site, bail_site,
     device::vivo::{
-        VivoDevice, VivoDeviceConfig,
+        VivoBindStartType, VivoDevice, VivoDeviceConfig,
+        components::info::update_first_sync_component,
         crypto::{bind_aes_sign, verify_bind_aes_sign},
         system::{VivoSystemExt, register_vivo_system_ext_on_message},
         transport::vscp::VscpMessage,
@@ -98,6 +99,7 @@ pub struct AuthComponent {
     pub open_id: String,
     pub is_authed: bool,
     pub is_first_bind: bool,
+    pub bind_start_type: VivoBindStartType,
     pub has_backup_list: bool,
     pub last_phone_random: Option<u16>,
     pub watch_sn: Option<String>,
@@ -127,6 +129,7 @@ impl AuthComponent {
             open_id,
             is_authed: false,
             is_first_bind: false,
+            bind_start_type: VivoBindStartType::default(),
             has_backup_list: false,
             last_phone_random: None,
             watch_sn: None,
@@ -153,7 +156,8 @@ impl AuthComponent {
 
     pub fn from_config(config: &VivoDeviceConfig) -> Self {
         let mut comp = Self::new(config.open_id.clone());
-        comp.is_first_bind = config.is_first_bind;
+        comp.is_first_bind = true;
+        comp.bind_start_type = config.bind_start_type;
         comp.has_backup_list = config.has_backup_list;
         comp.magic_phone = config.magic_phone.clone();
         comp
@@ -197,6 +201,12 @@ impl AuthSystem {
 
         let aes_sign = bind_aes_sign(&open_id, random)
             .map_err(|err| anyhow_site!("failed to build vivo bind aesSign: {err}"))?;
+        log::info!(
+            "[VivoDevice.Auth] sending BindAuthRequest open_id_len={} random={} magic_phone_present={}",
+            open_id.len(),
+            random,
+            magic_phone.as_ref().is_some_and(|value| !value.is_empty())
+        );
         let payload = BindAuthRequest {
             open_id,
             random: i32::from(random),
@@ -242,6 +252,12 @@ impl AuthSystem {
         let auth_seq = resp.seq;
         let sn = resp.sn;
         let bid_version = resp.bid_version;
+        log::info!(
+            "[VivoDevice.Auth] BindAuthResponse accepted seq={} bid_version={} sn_len={}",
+            auth_seq,
+            bid_version,
+            sn.len()
+        );
         with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
             comp.watch_sn = Some(sn);
             comp.watch_random = Some(watch_random);
@@ -281,29 +297,56 @@ impl AuthSystem {
         let last_app_version = resp.last_app_version;
         let magic_phone = resp.magic_phone;
         let watch_open_id_for_comp = watch_open_id.clone();
-        with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
-            comp.init_seq = Some(init_seq);
-            comp.watch_open_id = Some(watch_open_id_for_comp);
-            comp.watch_version = Some(watch_version);
-            comp.watch_state = Some(watch_state);
-            comp.phone_device_id = Some(phone_device_id);
-            comp.last_app_version = Some(last_app_version);
-            comp.pack_size = Some(pack_size);
-            comp.max_data_length = Some(max_data_length);
-            comp.magic_phone = magic_phone;
-            if watch_state == WATCH_STATE_INIT {
-                comp.is_first_bind = true;
-            }
-        })
-        .map_err(|err| anyhow_site!("failed to update vivo init response state: {err:?}"))?;
+        let (is_first_bind, bind_start_type) =
+            with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
+                comp.init_seq = Some(init_seq);
+                comp.watch_open_id = Some(watch_open_id_for_comp);
+                comp.watch_version = Some(watch_version);
+                comp.watch_state = Some(watch_state);
+                comp.phone_device_id = Some(phone_device_id);
+                comp.last_app_version = Some(last_app_version);
+                comp.pack_size = Some(pack_size);
+                comp.max_data_length = Some(max_data_length);
+                comp.magic_phone = magic_phone;
+                if watch_state == WATCH_STATE_INIT {
+                    comp.is_first_bind = true;
+                }
+                (comp.is_first_bind, comp.bind_start_type)
+            })
+            .map_err(|err| anyhow_site!("failed to update vivo init response state: {err:?}"))?;
 
         with_device_component_mut::<VivoDevice, _, _>(self.owner_id.clone(), move |dev| {
             dev.update_vscp_limits(pack_size, max_data_length);
         })
         .map_err(|err| anyhow_site!("failed to apply vivo VSCP limits: {err:?}"))?;
 
+        let should_send_bind_confirm =
+            should_send_bind_confirm(is_first_bind, bind_start_type, watch_state);
+        log::info!(
+            "[VivoDevice.Auth] BindInitResponse accepted state={} first_bind={} bind_start_type={:?} watch_open_id_len={} pack_size={} max_data_length={} next_step={}",
+            watch_state,
+            is_first_bind,
+            bind_start_type,
+            watch_open_id.len(),
+            pack_size,
+            max_data_length,
+            if should_send_bind_confirm {
+                "BindBindRequest"
+            } else {
+                "BidVersionSync"
+            }
+        );
+
         match watch_state {
             WATCH_STATE_INIT => self.send_bind_confirm(true),
+            WATCH_STATE_BIND
+            | WATCH_STATE_MID_CONN
+            | WATCH_STATE_MID_FACTORY
+            | WATCH_STATE_MID_REPAIR
+                if should_send_bind_confirm =>
+            {
+                self.send_bind_confirm(true)
+            }
             WATCH_STATE_BIND
             | WATCH_STATE_MID_CONN
             | WATCH_STATE_MID_FACTORY
@@ -317,6 +360,7 @@ impl AuthSystem {
         if code != 0 {
             bail_site!("vivo bind confirm rejected by watch: code={code}");
         }
+        log::info!("[VivoDevice.Auth] BindBindResponse accepted");
 
         let _init_seq =
             with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), |comp| {
@@ -354,6 +398,13 @@ impl AuthSystem {
             .map(|item| item.version)
             .unwrap_or(0);
         let phone_bid_version = resp.phone_bid_version;
+        log::info!(
+            "[VivoDevice.Auth] WatchBidVersionResponse accepted phone_bid_version={} bid_versions={} features={} device_info_bid_version={}",
+            phone_bid_version,
+            bid_versions_for_comp.len(),
+            features_for_comp.len(),
+            device_info_bid_version
+        );
         with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
             comp.phone_bid_version = Some(phone_bid_version);
             comp.bid_versions = bid_versions_for_comp;
@@ -372,9 +423,20 @@ impl AuthSystem {
         }
         validate_watch_device_info(&resp)?;
 
+        if let Err(err) = update_first_sync_component(self.owner_id.clone(), &resp) {
+            log::warn!("[VivoDevice] failed to mirror first-sync info component: {err:?}");
+        }
+
         let device_name = resp.device_name;
         let ble_mac = resp.ble_mac;
         let product_id = resp.product_id;
+        log::info!(
+            "[VivoDevice.Auth] WatchFirstSyncResp accepted device_name={} product_id={} mac_len={} ble_mac_len={}",
+            device_name,
+            product_id,
+            resp.mac.len(),
+            ble_mac.len()
+        );
         with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
             comp.watch_device_name = Some(device_name);
             comp.watch_ble_mac = Some(ble_mac);
@@ -399,6 +461,10 @@ impl AuthSystem {
         if resp.code != 0 {
             bail_site!("vivo connect confirm rejected by watch: code={}", resp.code);
         }
+        log::info!(
+            "[VivoDevice.Auth] BindConnectConfirmResponse accepted seq={} ; auth complete",
+            resp.seq
+        );
 
         with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), |comp| {
             comp.is_authed = true;
@@ -414,11 +480,12 @@ impl AuthSystem {
     }
 
     fn send_bind_init(&self, auth_seq: i64) -> anyhow::Result<()> {
-        let is_first_bind =
+        let (is_first_bind, bind_start_type) =
             with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), |comp| {
-                comp.is_first_bind
+                (comp.is_first_bind, comp.bind_start_type)
             })
             .map_err(|err| anyhow_site!("failed to read vivo bind mode: {err:?}"))?;
+        let is_first_bind = is_first_bind || bind_start_type == VivoBindStartType::Bind;
         let (app_version, phone_model, phone_device_id) =
             with_device_component_mut::<VivoDevice, _, _>(self.owner_id.clone(), |dev| {
                 (
@@ -429,6 +496,14 @@ impl AuthSystem {
             })
             .map_err(|err| anyhow_site!("failed to read vivo init config: {err:?}"))?;
 
+        log::info!(
+            "[VivoDevice.Auth] sending BindInitRequest is_first_bind={} bind_start_type={:?} seq={} app_version={} phone_device_id_len={}",
+            is_first_bind,
+            bind_start_type,
+            auth_seq + 21,
+            app_version,
+            phone_device_id.len()
+        );
         let payload = BindInitRequest {
             os: 1,
             is_bind: !is_first_bind,
@@ -444,6 +519,10 @@ impl AuthSystem {
     }
 
     fn send_bind_confirm(&self, confirm: bool) -> anyhow::Result<()> {
+        log::info!(
+            "[VivoDevice.Auth] sending BindBindRequest confirm={}",
+            confirm
+        );
         let payload = BindBindRequest { confirm }
             .payload()
             .map_err(|err| anyhow_site!("failed to encode vivo bind confirm request: {err}"))?;
@@ -465,6 +544,10 @@ impl AuthSystem {
         }
         .payload()
         .map_err(|err| anyhow_site!("failed to encode vivo BID version sync request: {err}"))?;
+        log::info!(
+            "[VivoDevice.Auth] sending WatchBidVersionRequest product_series_type={:?}",
+            product_series_type
+        );
         self.send_message(VscpMessage::new(
             BID_DEVICE_INFO,
             CID_WATCH_BID_VERSION,
@@ -489,6 +572,12 @@ impl AuthSystem {
         }
         .payload()
         .map_err(|err| anyhow_site!("failed to encode vivo device info request: {err}"))?;
+        log::info!(
+            "[VivoDevice.Auth] sending DeviceInfoRequest unix_time={} millis={} tz_offset={:?}",
+            unix_time_sec,
+            millis,
+            timezone_offset_field
+        );
         self.send_message(VscpMessage::new(BID_DEVICE_INFO, CID_DEVICE_INFO, payload))
     }
 
@@ -505,10 +594,16 @@ impl AuthSystem {
         }
         .payload()
         .map_err(|err| anyhow_site!("failed to encode vivo connect confirm request: {err}"))?;
+        log::info!(
+            "[VivoDevice.Auth] sending BindConnectConfirmRequest seq={} has_backup_list={}",
+            init_seq + 61,
+            has_backup_list
+        );
         self.send_message(VscpMessage::new(BID_BIND, CID_CONNECT_CONFIRM, payload))
     }
 
     fn send_hfp_connect_notice(&self) -> anyhow::Result<()> {
+        log::info!("[VivoDevice.Auth] sending BindHFPConnRequest");
         let payload = BindHFPConnRequest {}
             .payload()
             .map_err(|err| anyhow_site!("failed to encode vivo HFP connect notice: {err}"))?;
@@ -516,6 +611,13 @@ impl AuthSystem {
     }
 
     fn send_message(&self, message: VscpMessage) -> anyhow::Result<()> {
+        log::info!(
+            "[VivoDevice.Auth] TX message bid={} cid={} payload_len={} encrypted={}",
+            message.bid,
+            message.cid,
+            message.payload.len(),
+            message.encrypted
+        );
         let send_parts =
             with_device_component_mut::<VivoDevice, _, _>(self.owner_id.clone(), move |dev| {
                 dev.transport_send_parts(message)
@@ -537,11 +639,18 @@ impl AuthSystem {
             log::warn!("Vivo auth flow failed without a pending waiter: {err:?}");
         }
     }
+
+    fn auth_in_progress(&self) -> bool {
+        self.auth_wait.lock().is_some()
+    }
 }
 
 impl VivoSystemExt for AuthSystem {
     fn on_vivo_message(&mut self, message: &VscpMessage) {
         if message.bid != BID_BIND && message.bid != BID_DEVICE_INFO {
+            return;
+        }
+        if !self.auth_in_progress() {
             return;
         }
 
@@ -609,6 +718,23 @@ fn is_watch_open_id_compatible_for_state(
             watch_open_id == local_open_id
         }
         _ => true,
+    }
+}
+
+fn should_send_bind_confirm(
+    is_first_bind: bool,
+    bind_start_type: VivoBindStartType,
+    watch_state: i32,
+) -> bool {
+    if is_first_bind {
+        return true;
+    }
+
+    match bind_start_type {
+        VivoBindStartType::Bind => true,
+        VivoBindStartType::AutoConnect | VivoBindStartType::ReconnInner => false,
+        VivoBindStartType::UserConnect => watch_state != WATCH_STATE_BIND,
+        VivoBindStartType::ReconnBackup => true,
     }
 }
 

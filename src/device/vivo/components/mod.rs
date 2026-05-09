@@ -1,1 +1,10 @@
 pub mod auth;
+pub mod cloud_bridge;
+pub mod erpc;
+pub mod info;
+pub mod install;
+pub mod resource;
+pub mod shared;
+pub mod sync;
+pub mod thirdparty_app;
+pub mod watchface;
