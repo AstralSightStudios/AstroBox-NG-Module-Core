@@ -117,7 +117,7 @@ impl InfoSystem {
             resp.battry
         );
 
-        let info = device_info_from_first_sync(&resp);
+        let info = device_info_from_first_sync(&self.owner_id, &resp);
         let status = device_status_from_parts(resp.battry, -1);
         let storage = storage_from_parts(resp.total_storage, resp.free_storage);
 
@@ -272,7 +272,7 @@ pub fn update_first_sync_component(
         bail_site!("vivo first-sync rejected by watch: code={}", resp.code);
     }
 
-    let info = device_info_from_first_sync(resp);
+    let info = device_info_from_first_sync(&owner_id, resp);
     let status = device_status_from_parts(resp.battry, -1);
     let storage = storage_from_parts(resp.total_storage, resp.free_storage);
     crate::ecs::access::with_device_component_mut::<InfoComponent, _, _>(owner_id, move |comp| {
@@ -284,18 +284,56 @@ pub fn update_first_sync_component(
     Ok(())
 }
 
-fn device_info_from_first_sync(resp: &WatchFirstSyncResp) -> DeviceInfoData {
+fn device_info_from_first_sync(owner_id: &str, resp: &WatchFirstSyncResp) -> DeviceInfoData {
+    let ota_device = resp.ota_device.trim();
+    let product_device = if ota_device.is_empty() {
+        resp.model.clone()
+    } else {
+        resp.ota_device.clone()
+    };
+    let hard_version = if ota_device.is_empty() {
+        vivo_hard_version(&resp.version)
+    } else {
+        resp.ota_device.clone()
+    };
+
     DeviceInfoData {
         serial_number: resp.sn.clone(),
         firmware_version: resp.version.clone(),
         imei: resp.imei.clone(),
         model: resp.model.clone(),
-        product_device: if resp.ota_device.is_empty() {
-            resp.model.clone()
-        } else {
-            resp.ota_device.clone()
-        },
+        product_device,
+        mac_address: Some(owner_id.to_string()),
+        version_type: Some(resp.version_type),
+        hard_version: Some(hard_version).filter(|value| !value.trim().is_empty()),
+        os_version: Some(vivo_os_version(&resp.version)).filter(|value| !value.trim().is_empty()),
     }
+}
+
+fn vivo_os_version(version: &str) -> String {
+    let version = version.trim();
+    if version.is_empty() || !version.contains('_') {
+        return version.to_string();
+    }
+
+    let parts: Vec<&str> = version.split('_').collect();
+    if parts.len() < 3 {
+        return version.to_string();
+    }
+    parts.get(2).copied().unwrap_or(version).to_string()
+}
+
+fn vivo_hard_version(version: &str) -> String {
+    let version = version.trim();
+    if version.is_empty() || !version.contains('_') {
+        return String::new();
+    }
+
+    let parts: Vec<&str> = version.split('_').collect();
+    if parts.len() < 3 {
+        return String::new();
+    }
+    parts[..2].join("_")
 }
 
 fn device_status_from_parts(battery: i32, battery_state: i32) -> DeviceStatusData {

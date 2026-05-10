@@ -24,6 +24,14 @@ pub struct DeviceInfoData {
     pub imei: String,
     pub model: String,
     pub product_device: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_type: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hard_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

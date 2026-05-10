@@ -1,8 +1,8 @@
 use tokio::{runtime::Handle, sync::oneshot};
 use vivo_msgpack::messages::{
     generated::typed::{
-        CloudSupportRequest, CloudSupportResponse, CloudWatchMsgRequest, CloudWatchSwitchRequest,
-        CloudWatchSwitchResp,
+        CloudPhoneMsgRequest, CloudSupportRequest, CloudSupportResponse, CloudWatchMsgRequest,
+        CloudWatchSwitchRequest, CloudWatchSwitchResp,
     },
     response_cid,
 };
@@ -20,6 +20,7 @@ use super::shared::{HasVivoRequestContext, RequestSlot, VivoRequestExt};
 
 const BID_CLOUD: u8 = 47;
 const CID_CLOUD_MSG: u8 = 1;
+const CID_PHONE_MSG: u8 = 2;
 const CID_SUPPORT: u8 = 3;
 const CID_SWITCH: u8 = 5;
 
@@ -84,7 +85,7 @@ impl CloudBridgeSystem {
         if msg.trim().is_empty() {
             bail_site!("vivo cloud message is empty");
         }
-        let payload = CloudWatchMsgRequest { msg: msg.clone() }
+        let payload = CloudPhoneMsgRequest { msg: msg.clone() }
             .payload()
             .map_err(|err| anyhow_site!("failed to encode vivo cloud message: {err}"))?;
         let (rx, should_enqueue) = self.message_wait.prepare();
@@ -94,7 +95,7 @@ impl CloudBridgeSystem {
                 msg.len()
             );
             if let Err(err) = self.send_vivo_message(
-                VscpMessage::new(BID_CLOUD, CID_CLOUD_MSG, payload),
+                VscpMessage::new(BID_CLOUD, CID_PHONE_MSG, payload),
                 "VivoCloudBridgeSystem::send_cloud_message",
             ) {
                 self.message_wait.fail(err);
