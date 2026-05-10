@@ -11,7 +11,9 @@ use crate::{
 
 pub mod components;
 pub mod crypto;
+pub mod dial_manifest;
 pub mod packet;
+pub mod quickapp_manifest;
 pub mod system;
 pub mod transport;
 

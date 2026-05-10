@@ -6,10 +6,15 @@ use crate::device::vivo::{
         CloudBridgeSystem as VivoCloudBridgeSystem,
     },
     components::erpc::{ErpcComponent as VivoErpcComponent, ErpcSystem as VivoErpcSystem},
+    components::file_v2_transfer::{
+        FileV2TransferComponent as VivoFileV2TransferComponent,
+        FileV2TransferSystem as VivoFileV2TransferSystem,
+    },
     components::info::{InfoComponent as VivoInfoComponent, InfoSystem as VivoInfoSystem},
     components::install::{
         InstallComponent as VivoInstallComponent, InstallSystem as VivoInstallSystem,
     },
+    components::ota::{OtaComponent as VivoOtaComponent, OtaSystem as VivoOtaSystem},
     components::resource::{
         ResourceComponent as VivoResourceComponent, ResourceSystem as VivoResourceSystem,
     },
@@ -313,7 +318,11 @@ where
             VivoErpcComponent::new(),
             VivoErpcSystem::new(device_id.clone(), tk_handle.clone()),
             VivoSyncComponent::new(),
-            VivoSyncSystem::new(device_id, tk_handle.clone()),
+            VivoSyncSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoFileV2TransferComponent::new(),
+            VivoFileV2TransferSystem::new(device_id.clone(), tk_handle.clone()),
+            VivoOtaComponent::new(),
+            VivoOtaSystem::new(device_id, tk_handle.clone()),
         ));
     })
     .await;

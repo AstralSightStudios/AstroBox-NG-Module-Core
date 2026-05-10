@@ -41,9 +41,9 @@ impl VivoQuickAppInstallRequest {
         if self.app_name.trim().is_empty() {
             bail_site!("vivo quick-app appName is empty");
         }
-        if self.app_url.trim().is_empty() {
-            bail_site!("vivo quick-app appUrl is empty");
-        }
+        // appUrl 在「云端 URL 安装」场景里手表会用来追踪/续传，但本地安装下手表不会去
+        // fetch（文件由 file_v2 直接推到 /sdcard/apps/apparch/）。允许空值，让本地
+        // 安装场景能复用此 V2 预登记请求。
         if self.app_file_size < 0 {
             bail_site!("vivo quick-app appFileSize is negative");
         }

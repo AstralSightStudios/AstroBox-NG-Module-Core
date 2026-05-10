@@ -1,7 +1,7 @@
 use tokio::{runtime::Handle, sync::oneshot};
 use vivo_msgpack::{
     messages::{generated::typed::DialManageBleReq, response_cid},
-    msgpack::MsgpackReader,
+    msgpack::{MsgpackReader, write_bool, write_i64, write_str},
 };
 
 use crate::{
@@ -17,8 +17,17 @@ use crate::{
 use super::shared::{HasVivoRequestContext, RequestSlot, VivoRequestExt};
 
 const BID_DIAL: u8 = 1;
+const CID_INSTALL_DIAL: u8 = 1;
 const CID_MANAGE_DIAL: u8 = 4;
 const CID_SET_CURRENT_DIAL: u8 = 5;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DialInstallResult {
+    pub dial_id: i64,
+    pub order: i32,
+    pub support_config: bool,
+}
 
 #[derive(Component)]
 pub struct WatchfaceSystem {
@@ -26,6 +35,7 @@ pub struct WatchfaceSystem {
     tk_handle: Handle,
     set_current_wait: RequestSlot<()>,
     uninstall_wait: RequestSlot<()>,
+    install_wait: RequestSlot<DialInstallResult>,
 }
 
 impl WatchfaceSystem {
@@ -36,7 +46,63 @@ impl WatchfaceSystem {
             tk_handle,
             set_current_wait: RequestSlot::new(),
             uninstall_wait: RequestSlot::new(),
+            install_wait: RequestSlot::new(),
         }
+    }
+
+    /// 发 BID 1 / CID 1 `DialInstallBleRequest`。需要在 file_v2 把表盘 zip 推完后调用。
+    /// `file_id` 是云端给的资源 ID 字符串（与 SetUpRequestV2.fileId 不是一码事；后者
+    /// 由 file_v2 driver 自动管理）。如果是从本地直接安装，可以传 `dial_id` 的字符串。
+    pub fn send_install_request(
+        &mut self,
+        dial_id: i64,
+        file_id: String,
+        personalized: bool,
+        trial: bool,
+        signature: String,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<DialInstallResult>>> {
+        let payload = build_dial_install_payload(dial_id, file_id, personalized, trial, signature)?;
+        let (rx, should_enqueue) = self.install_wait.prepare();
+        if should_enqueue {
+            log::info!(
+                "[VivoDevice.Watchface] sending DialInstallBleRequest dial_id={} personalized={} trial={}",
+                dial_id,
+                personalized,
+                trial
+            );
+            if let Err(err) = self.send_vivo_message(
+                VscpMessage::new(BID_DIAL, CID_INSTALL_DIAL, payload),
+                "VivoWatchfaceSystem::send_install_request",
+            ) {
+                self.install_wait.fail(err);
+            }
+        }
+        Ok(rx)
+    }
+
+    fn handle_install_response(&mut self, message: &VscpMessage) -> anyhow::Result<()> {
+        let mut reader = MsgpackReader::new(&message.payload);
+        let code = reader
+            .read_i32()
+            .map_err(|err| anyhow_site!("failed to decode dial install code: {err}"))?;
+        if code != 0 {
+            bail_site!("vivo dial install rejected by watch: code={code}");
+        }
+        let dial_id = reader.read_i64().unwrap_or(0);
+        let order = reader.read_i32().unwrap_or(0);
+        let support_config = reader.read_i32().unwrap_or(0) == 1;
+        log::info!(
+            "[VivoDevice.Watchface] dial install accepted dial_id={} order={} support_config={}",
+            dial_id,
+            order,
+            support_config
+        );
+        self.install_wait.fulfill(DialInstallResult {
+            dial_id,
+            order,
+            support_config,
+        });
+        Ok(())
     }
 
     pub fn set_watchface(
@@ -143,6 +209,7 @@ impl VivoSystemExt for WatchfaceSystem {
                 self.handle_set_current_response(message)
             }
             cid if cid == response_cid(CID_MANAGE_DIAL) => self.handle_manage_response(message),
+            cid if cid == response_cid(CID_INSTALL_DIAL) => self.handle_install_response(message),
             _ => Ok(()),
         };
 
@@ -154,6 +221,9 @@ impl VivoSystemExt for WatchfaceSystem {
                 }
                 cid if cid == response_cid(CID_MANAGE_DIAL) => {
                     self.uninstall_wait.fail(anyhow_site!("{err:#}"));
+                }
+                cid if cid == response_cid(CID_INSTALL_DIAL) => {
+                    self.install_wait.fail(anyhow_site!("{err:#}"));
                 }
                 _ => {}
             }
@@ -234,4 +304,25 @@ fn decode_common_response_code(payload: &[u8]) -> anyhow::Result<i32> {
     reader
         .read_i32()
         .map_err(|err| anyhow_site!("failed to decode vivo common response code: {err}"))
+}
+
+fn build_dial_install_payload(
+    dial_id: i64,
+    file_id: String,
+    personalized: bool,
+    trial: bool,
+    signature: String,
+) -> anyhow::Result<Vec<u8>> {
+    // 字段顺序见 jadx DialInstallBleRequest#c：
+    //   long dialId, bool deleted, bool personalized, str fileId, bool trial, str extraJson
+    let mut out = Vec::with_capacity(64);
+    write_i64(&mut out, dial_id);
+    write_bool(&mut out, false); // deleted=false
+    write_bool(&mut out, personalized);
+    write_str(&mut out, &file_id)
+        .map_err(|err| anyhow_site!("failed to encode dial install fileId: {err}"))?;
+    write_bool(&mut out, trial);
+    write_str(&mut out, &signature)
+        .map_err(|err| anyhow_site!("failed to encode dial install signature: {err}"))?;
+    Ok(out)
 }

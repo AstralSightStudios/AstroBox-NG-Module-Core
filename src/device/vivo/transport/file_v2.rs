@@ -131,14 +131,27 @@ pub struct FileTransferProgressResponse {
 }
 
 impl FileTransferProgressResponse {
+    /// 容错解码：error 路径上手表只填 code 和 fileId（见 jadx
+    /// `SetUpResponseV2#parsePayload` 的 catch — 它静默吃掉剩余字段的解码异常）。
+    /// 我们至少要拿到 code 才能告诉上层「为什么被拒绝」。
     pub fn decode(payload: &[u8]) -> anyhow::Result<Self> {
         let mut reader = MsgpackReader::new(payload);
+        let code = reader.read_i32().map_err(|err| {
+            anyhow::Error::msg(format!(
+                "failed to decode file_v2 response code: {err}; raw payload (hex)={}",
+                hex(payload)
+            ))
+        })?;
+        let file_id = reader.read_str().unwrap_or_default();
+        let offset = reader.read_i64().unwrap_or(0);
+        let file_accumulate_crc = reader.read_i32().unwrap_or(0);
+        let resp_pack_num = reader.read_i32().unwrap_or(0);
         Ok(Self {
-            code: reader.read_i32()?,
-            file_id: reader.read_str()?,
-            offset: reader.read_i64()?,
-            file_accumulate_crc: reader.read_i32()?,
-            resp_pack_num: reader.read_i32()?,
+            code,
+            file_id,
+            offset,
+            file_accumulate_crc,
+            resp_pack_num,
         })
     }
 
@@ -149,6 +162,15 @@ impl FileTransferProgressResponse {
             bail_site!("{ctx} failed: code={}", self.code)
         }
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
