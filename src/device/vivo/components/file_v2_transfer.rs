@@ -4,16 +4,6 @@
 // `FtSendTaskV3` / `FtSendTaskProtocolV2`。它把一个内存中的字节流通过 BID 62
 // (BLE) / 64 (BT) 推到手表上：先发 SetUpRequestV2 拿到 watch 的 offset+resp_pack_num，
 // 再循环发 SendRequestV2 (按 resp_pack_num 节奏要求 ACK)，最后发 EndRequestV2。
-//
-// 注意：目前还没有真机调试过，阈值 (chunk size, ACK 周期, timeout) 全部按 jadx 里
-// 默认值填的。如果手表 reject，最常见的原因是 chunk size 与 SAR/MTU 的关系。
-//
-// 调试时需要重点关注：
-//   * `FtRespCountManager.getBleRespCountV2() = 240`，BT 默认 240。
-//   * `MtuManager.getMtuBt()` 在 jadx 里取的是协商后的 max_data_length / pack_size
-//     的子集，这里我们直接取 VivoDeviceConfig.vscp.max_biz_payload_len，应该接近。
-//   * SendResponseV2.offset 在 SPP 上是 i64，BLE 上是 i32 — 我们一律按 i64 解码，
-//     msgpack reader 会自动 widen。
 use std::{
     convert::TryFrom,
     sync::{

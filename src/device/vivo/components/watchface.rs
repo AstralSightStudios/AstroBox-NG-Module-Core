@@ -51,8 +51,6 @@ impl WatchfaceSystem {
     }
 
     /// 发 BID 1 / CID 1 `DialInstallBleRequest`。需要在 file_v2 把表盘 zip 推完后调用。
-    /// `file_id` 是云端给的资源 ID 字符串（与 SetUpRequestV2.fileId 不是一码事；后者
-    /// 由 file_v2 driver 自动管理）。如果是从本地直接安装，可以传 `dial_id` 的字符串。
     pub fn send_install_request(
         &mut self,
         dial_id: i64,

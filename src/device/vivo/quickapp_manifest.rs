@@ -4,7 +4,7 @@
 //   META-INF/CERT
 //   META-INF/build.txt
 //   <package>.vru
-//   manifest.json   ← 我们关心这个
+//   manifest.json
 //
 // manifest 形如：
 //   {

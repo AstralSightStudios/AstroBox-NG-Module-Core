@@ -11,7 +11,7 @@ use crate::{
                     send_file_v2,
                 },
                 install::{InstallSystem as VivoInstallSystem, VivoQuickAppInstallRequest},
-                ota::OtaSystem as VivoOtaSystem,
+                ota::{OtaBtClearRequest, OtaSystem as VivoOtaSystem},
                 thirdparty_app::ThirdpartyAppSystem as VivoThirdpartyAppSystem,
             },
             quickapp_manifest::parse_vivo_quick_app_manifest,
@@ -77,21 +77,21 @@ pub async fn cancel_vivo_quick_app_install(
     }
 }
 
-/// 把本地 .pkg 固件推到 Vivo 手表，然后让手表立刻安装。
-/// `version_name` 必须与 .pkg 内 metadata 一致，否则手表会拒绝；通常是 e.g. "1.0.5.6"。
+/// 把本地 OTA 固件推到 Vivo 手表，然后触发安装。
+/// `version_name` 必须与固件内 metadata 一致，否则手表会拒绝；通常是 e.g. "1.0.5.6"。
 ///
-/// **未完整实现**：jadx 里 OTA 推包流程其实有 3 步骤：
-///   1. `OTABleHelper.clearBtChannel(...)` 把 BT 通道切到 OTA 子通道，并把
-///      isAuto/isNow/versionName 这几个语义参数发给手表（这步我们目前 **没做**）
-///   2. file_v2 push，`extra = [isAuto, isNow, versionLen, ...versionBytes]`
+/// 与 jadx `OTAHelper.z0()` -> `OTAFileSendRequest.n()/o()` 顺序对齐：
+///   1. `OTABleHelper.clearBtChannel(3, isSilent, isFull, otaLen, versionName, filePath, fileName)`
+///   2. file_v2 push，`TYPE_OTA`，`extra = [isSilent, isFull, versionNameLen, ...versionNameBytes]`
 ///   3. `OTAInstallRequest` 通知手表装上
 ///
-/// 我们目前只做了 (2) + (3)，且 (2) 的 extra 还是空。手表如果需要 step 1 才肯接受
-/// 文件，本流程会卡在 SetUpResponseV2 上。需要先收齐 SetUp 错码，再决定补哪些步骤。
+/// 官方 `fileName` 来自下载后的 OTA 文件名，不是 `versionName`；如果 caller 提供
+/// `remote_file_name`，这里会优先沿用它。
 pub async fn install_vivo_firmware_local(
     addr: String,
     pkg_data: Vec<u8>,
     version_name: String,
+    remote_file_name: Option<String>,
     install_now: bool,
     progress_cb: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 ) -> anyhow::Result<()> {
@@ -106,6 +106,8 @@ pub async fn install_vivo_firmware_local(
     }
 
     let file_id = compute_file_id_v2(&pkg_data);
+    let file_size = i64::try_from(pkg_data.len())
+        .map_err(|_| anyhow_site!("vivo OTA install: pkg_data length overflows i64"))?;
 
     let bridge: Option<ProgressCb> = progress_cb.as_ref().map(|cb| {
         let cb = cb.clone();
@@ -117,16 +119,37 @@ pub async fn install_vivo_firmware_local(
     // jadx OTAFileSendRequest.o(): fileParam.w("/sdcard/" + str)；
     // version_type==1 走 /sdcard/，否则 /update/。WatchV3/GT2 默认按 /sdcard/ 试。
     // 切到 /update/ 需要 version_type 信息，目前没有这个字段，先用 /sdcard/。
-    let file_name = format!("{version_name}.pkg");
-    let extra = build_ota_setup_extra(
-        &version_name,
-        /*is_auto=*/ true,
-        /*is_now=*/ install_now,
-    );
+    const OTA_TRANSFER_TYPE: i32 = 3;
+    const OTA_FILE_PATH: &str = "/sdcard/";
+    let file_name = normalize_ota_remote_file_name(remote_file_name.as_deref(), &version_name);
+    let is_silent = true;
+    let is_full_package = true;
+
+    let clear_rx = with_vivo_ota_system(addr.clone(), {
+        let version_name = version_name.clone();
+        let file_name = file_name.clone();
+        move |sys| {
+            Ok(sys.clear_bt_channel(OtaBtClearRequest {
+                type_code: OTA_TRANSFER_TYPE,
+                is_silent,
+                is_full: is_full_package,
+                version_len: file_size,
+                version_name,
+                file_path: OTA_FILE_PATH.to_string(),
+                file_name,
+            }))
+        }
+    })
+    .await?;
+    clear_rx
+        .await
+        .map_err(|_| anyhow_site!("Vivo OTA BTClear response not received"))??;
+
+    let extra = build_ota_setup_extra(&version_name, is_silent, is_full_package);
 
     let params = FileV2SendParams {
         file_id: file_id.clone(),
-        file_path: "/sdcard/".to_string(),
+        file_path: OTA_FILE_PATH.to_string(),
         file_name,
         business_label: "TYPE_OTA",
         extra: Some(extra),
@@ -143,17 +166,31 @@ pub async fn install_vivo_firmware_local(
     Ok(())
 }
 
-/// jadx OTAFileSendRequest.o() 把 [isAuto, isNow, versionLen, ...versionBytes] 拼成
-/// SetUpRequestV2.extra；手表用它判断「这次 OTA 是后台还是即时」。
-fn build_ota_setup_extra(version_name: &str, is_auto: bool, is_now: bool) -> Vec<u8> {
+/// jadx OTAFileSendRequest.o() 把 [isSilent, isFull, versionNameLen, ...versionNameBytes]
+/// 拼成 SetUpRequestV2.extra；这里的第二个布尔值是完整包/随机包标记，不是 installNow。
+fn build_ota_setup_extra(version_name: &str, is_silent: bool, is_full: bool) -> Vec<u8> {
     let bytes = version_name.as_bytes();
     let len = u8::try_from(bytes.len().min(255)).unwrap_or(255);
     let mut out = Vec::with_capacity(3 + bytes.len());
-    out.push(if is_auto { 1 } else { 2 });
-    out.push(if is_now { 1 } else { 2 });
+    out.push(if is_silent { 1 } else { 2 });
+    out.push(if is_full { 1 } else { 2 });
     out.push(len);
     out.extend_from_slice(&bytes[..len as usize]);
     out
+}
+
+fn normalize_ota_remote_file_name(remote_file_name: Option<&str>, version_name: &str) -> String {
+    remote_file_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .and_then(|name| {
+            std::path::Path::new(name)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("{version_name}.pkg"))
 }
 
 /// 把本地 .rpk 快应用装到 Vivo 手表上。
@@ -163,11 +200,6 @@ fn build_ota_setup_extra(version_name: &str, is_auto: bool, is_now: bool) -> Vec
 ///   1. **先 file_v2 push** 把 rpk 推到 `/sdcard/apps/apparch/{appId}.rpk`
 ///   2. **再发 `BleAppInstallReq`** (BID 40 / CID 1)，payload 为
 ///      `(appId, fileName, fileId, appVerCode)`，告诉手表安装刚传完的本地文件。
-///
-/// WatchV3/GT2 支持的 `BleAppInstallV2Req` (BID 41 / CID 3) 是官方应用商店的 URL
-/// 安装入口，手表会按 `appUrl` 自行下载；它不是本地已传文件的 commit 指令。给本地
-/// rpk 填 `local://...` 虽然会收到 code=0，但手表没有可下载 URL，也不会消费
-/// apparch 里的文件。
 pub async fn install_vivo_quick_app_local(
     addr: String,
     rpk_data: Vec<u8>,

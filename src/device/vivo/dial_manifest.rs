@@ -1,12 +1,12 @@
 // Vivo 表盘 rpk 包内嵌的 manifest.json 解析。
 //
-// 一个典型的 rpk 是 zip：
+// zip（rpk）结构示例：
 //   META-INF/CERT
 //   META-INF/build.txt
 //   com.vivo.wf.watch107475.vru
-//   manifest.json   ← 我们关心这个
+//   manifest.json
 //
-// manifest.json 大致长这样：
+// manifest.json 示例：
 //   {
 //     "package":"com.vivo.wf.watch107475",
 //     "versionName":"1.0.0.2",
@@ -19,7 +19,7 @@
 //     }
 //   }
 //
-// 装表盘的 BID 1 / CID 1 `DialInstallBleRequest.dialId` 就是这个 id 字段。
+// 装表盘的 BID 1 / CID 1 中id字段对应 `DialInstallBleRequest.dialId`
 
 use std::io::Cursor;
 

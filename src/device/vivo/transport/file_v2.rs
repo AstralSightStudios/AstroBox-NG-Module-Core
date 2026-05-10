@@ -131,9 +131,8 @@ pub struct FileTransferProgressResponse {
 }
 
 impl FileTransferProgressResponse {
-    /// 容错解码：error 路径上手表只填 code 和 fileId（见 jadx
-    /// `SetUpResponseV2#parsePayload` 的 catch — 它静默吃掉剩余字段的解码异常）。
-    /// 我们至少要拿到 code 才能告诉上层「为什么被拒绝」。
+    /// 容错解码：error 路径上手表只填 code 和 fileId
+    /// 傻逼vivo自己在官方app写了一堆解析容错。
     pub fn decode(payload: &[u8]) -> anyhow::Result<Self> {
         let mut reader = MsgpackReader::new(payload);
         let code = reader.read_i32().map_err(|err| {

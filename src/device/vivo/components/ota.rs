@@ -1,15 +1,13 @@
 // Vivo OTA (BID 23) install command pipeline.
 //
-// 配合 file_v2 transfer 使用：先把固件 .pkg 推到手表（业务名 TYPE_OTA，BID 64/62），
-// 再通过 BID 23 / CID 2 `OTAInstallRequest` 通知手表「文件已就绪，请安装」。
+// 1. BID 23 / CID 7 `BTClearRequest` 切到 OTA 传输上下文
+// 2. file_v2 transfer 使用 TYPE_OTA 推 OTA 文件
+// 3. BID 23 / CID 2 `OTAInstallRequest` 通知手表「文件已就绪，请安装」
 // 手表回 BID 23 / CID 0x82 `OTAInstallResponse`，仅含一个 retCode。
-//
-// 这块未真机调试，固件版本字段（versionName）是关键 — 手表会把它和 `OTA.unzip()`
-// 出的 metadata 做对比，对不上会拒绝。需要 caller 提供真实版本号。
 
 use tokio::{runtime::Handle, sync::oneshot};
 use vivo_msgpack::{
-    messages::response_cid,
+    messages::{generated::typed::BTClearRequest, response_cid},
     msgpack::{MsgpackReader, write_bool, write_i32, write_i64, write_str},
 };
 
@@ -26,6 +24,7 @@ use crate::{
 const BID_OTA: u8 = 23;
 const CID_OTA_FILE_STATUS: u8 = 1;
 const CID_OTA_INSTALL: u8 = 2;
+const CID_BT_CLEAR: u8 = 7;
 
 #[derive(Component)]
 pub struct OtaSystem {
@@ -33,6 +32,18 @@ pub struct OtaSystem {
     tk_handle: Handle,
     install_wait: RequestSlot<()>,
     file_status_wait: RequestSlot<i32>,
+    bt_clear_wait: RequestSlot<()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OtaBtClearRequest {
+    pub type_code: i32,
+    pub is_silent: bool,
+    pub is_full: bool,
+    pub version_len: i64,
+    pub version_name: String,
+    pub file_path: String,
+    pub file_name: String,
 }
 
 impl OtaSystem {
@@ -43,7 +54,47 @@ impl OtaSystem {
             tk_handle,
             install_wait: RequestSlot::new(),
             file_status_wait: RequestSlot::new(),
+            bt_clear_wait: RequestSlot::new(),
         }
+    }
+
+    /// BID 23 / CID 7：WatchV3 OTA 文件推送前的 `BTClearRequest`。
+    ///
+    /// jadx `OTAFileSendRequest.n()` 在 WatchV3 上会先调用
+    /// `OTABleHelper.clearBtChannel(type, isSilent, isFull, otaLen, versionName, filePath, fileName)`；
+    /// 手表只有接受这一步后，后面的 TYPE_OTA FileV2 才会进入 OTA 业务上下文。
+    pub fn clear_bt_channel(
+        &mut self,
+        req: OtaBtClearRequest,
+    ) -> oneshot::Receiver<anyhow::Result<()>> {
+        let payload = match build_bt_clear_payload(&req) {
+            Ok(p) => p,
+            Err(err) => {
+                let (rx, _) = self.bt_clear_wait.prepare();
+                self.bt_clear_wait.fail(err);
+                return rx;
+            }
+        };
+        let (rx, should_enqueue) = self.bt_clear_wait.prepare();
+        if should_enqueue {
+            log::info!(
+                "[VivoDevice.Ota] clearing BT channel type={} silent={} full={} len={} version={} path={} file={}",
+                req.type_code,
+                req.is_silent,
+                req.is_full,
+                req.version_len,
+                req.version_name,
+                req.file_path,
+                req.file_name
+            );
+            if let Err(err) = self.send_vivo_message(
+                VscpMessage::new(BID_OTA, CID_BT_CLEAR, payload),
+                "VivoOtaSystem::clear_bt_channel",
+            ) {
+                self.bt_clear_wait.fail(err);
+            }
+        }
+        rx
     }
 
     /// BID 23 / CID 1：查询某个固件文件在手表上的 OTA 状态，
@@ -133,6 +184,16 @@ impl OtaSystem {
         self.file_status_wait.fulfill(code);
         Ok(())
     }
+
+    fn handle_bt_clear_response(&mut self, message: &VscpMessage) -> anyhow::Result<()> {
+        let code = decode_code(&message.payload)?;
+        if code != 0 {
+            bail_site!("vivo OTA BTClearRequest rejected by watch: code={code}");
+        }
+        log::info!("[VivoDevice.Ota] BTClearRequest accepted");
+        self.bt_clear_wait.fulfill(());
+        Ok(())
+    }
 }
 
 impl HasVivoRequestContext for OtaSystem {
@@ -155,6 +216,7 @@ impl VivoSystemExt for OtaSystem {
             cid if cid == response_cid(CID_OTA_FILE_STATUS) => {
                 self.handle_file_status_response(message)
             }
+            cid if cid == response_cid(CID_BT_CLEAR) => self.handle_bt_clear_response(message),
             _ => Ok(()),
         };
         if let Err(err) = result {
@@ -165,6 +227,9 @@ impl VivoSystemExt for OtaSystem {
                 }
                 cid if cid == response_cid(CID_OTA_FILE_STATUS) => {
                     self.file_status_wait.fail(anyhow_site!("{err:#}"));
+                }
+                cid if cid == response_cid(CID_BT_CLEAR) => {
+                    self.bt_clear_wait.fail(anyhow_site!("{err:#}"));
                 }
                 _ => {}
             }
@@ -208,9 +273,65 @@ fn build_file_status_payload(
     Ok(out)
 }
 
+fn build_bt_clear_payload(req: &OtaBtClearRequest) -> anyhow::Result<Vec<u8>> {
+    if req.version_len < 0 {
+        bail_site!("vivo OTA BTClearRequest: version_len is negative");
+    }
+    if req.version_name.trim().is_empty() {
+        bail_site!("vivo OTA BTClearRequest: version_name is empty");
+    }
+    if req.file_path.trim().is_empty() {
+        bail_site!("vivo OTA BTClearRequest: file_path is empty");
+    }
+    if req.file_name.trim().is_empty() {
+        bail_site!("vivo OTA BTClearRequest: file_name is empty");
+    }
+
+    BTClearRequest {
+        type_: req.type_code,
+        is_silent: if req.is_silent { 1 } else { 2 },
+        is_full: if req.is_full { 1 } else { 2 },
+        version_len: req.version_len,
+        version_name: req.version_name.clone(),
+        file_path: req.file_path.clone(),
+        file_name: req.file_name.clone(),
+    }
+    .payload()
+    .map_err(|err| anyhow_site!("failed to encode OTA BTClearRequest: {err}"))
+}
+
 fn decode_code(payload: &[u8]) -> anyhow::Result<i32> {
     let mut reader = MsgpackReader::new(payload);
     reader
         .read_i32()
         .map_err(|err| anyhow_site!("failed to decode OTA response code: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bt_clear_payload_follows_official_field_order() {
+        let payload = build_bt_clear_payload(&OtaBtClearRequest {
+            type_code: 3,
+            is_silent: true,
+            is_full: true,
+            version_len: 123456,
+            version_name: "1.2.3".to_string(),
+            file_path: "/sdcard/".to_string(),
+            file_name: "2605_deadbeef.ota.zip".to_string(),
+        })
+        .unwrap();
+
+        let mut reader = MsgpackReader::new(&payload);
+        assert_eq!(reader.read_i32().unwrap(), 3);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i64().unwrap(), 123456);
+        assert_eq!(reader.read_str().unwrap(), "1.2.3");
+        assert_eq!(reader.read_str().unwrap(), "/sdcard/");
+        assert_eq!(reader.read_str().unwrap(), "2605_deadbeef.ota.zip");
+        assert!(!reader.has_next());
+    }
 }

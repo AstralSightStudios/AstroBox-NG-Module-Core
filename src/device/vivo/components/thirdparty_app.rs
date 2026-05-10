@@ -38,8 +38,7 @@ impl ThirdpartyAppSystem {
         }
     }
 
-    /// 发 BID 40 / CID 1 `BleAppInstallReq`，告诉手表「我已经把这个 .rpk 推完了，
-    /// 装上吧」。手表会回 `CommonResponse`（仅 retCode）。
+    /// 发 BID 40 / CID 1 `BleAppInstallReq`，让手表开始执行安装任务
     /// `file_id` 必须与 file_v2 SetUpRequestV2.fileId 相同（CRC32 hex）。
     pub fn send_v1_install(
         &mut self,
