@@ -286,13 +286,14 @@ pub fn update_first_sync_component(
 
 fn device_info_from_first_sync(owner_id: &str, resp: &WatchFirstSyncResp) -> DeviceInfoData {
     let ota_device = resp.ota_device.trim();
+    let parsed_hard_version = vivo_hard_version(&resp.version);
     let product_device = if ota_device.is_empty() {
-        resp.model.clone()
+        parsed_hard_version.clone()
     } else {
         resp.ota_device.clone()
     };
     let hard_version = if ota_device.is_empty() {
-        vivo_hard_version(&resp.version)
+        parsed_hard_version
     } else {
         resp.ota_device.clone()
     };
@@ -422,4 +423,67 @@ fn local_timezone_offset_sec() -> i32 {
 fn gmt_timezone_from_offset(offset_sec: i32) -> i32 {
     let hours = offset_sec / 3600;
     if hours < 0 { hours + 24 } else { hours }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_sync_resp(version: &str, model: &str, ota_device: &str) -> WatchFirstSyncResp {
+        WatchFirstSyncResp {
+            code: 0,
+            battry: 80,
+            total_storage: 1024,
+            free_storage: 512,
+            device_name: "vivo WATCH GT2".to_string(),
+            version: version.to_string(),
+            sn: "SN".to_string(),
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            model: model.to_string(),
+            version_type: 0,
+            ble_mac: "AA:BB:CC:DD:EE:00".to_string(),
+            product_id: 4,
+            eid: String::new(),
+            imei: String::new(),
+            iccid: String::new(),
+            rtos: String::new(),
+            rtos_ver: String::new(),
+            hard_ver: String::new(),
+            ota_device: ota_device.to_string(),
+            brand: "vivo".to_string(),
+            country: "CN".to_string(),
+            region: "CN".to_string(),
+            commit_id: String::new(),
+            net_show: false,
+            net_allow: false,
+            online_trial_1: String::new(),
+            online_trial_2: String::new(),
+            sport_plan: 0,
+            watch_lang: 0,
+            is_support_esport: 0,
+            other_json: String::new(),
+            is_support_power_level: 0,
+            is_need_dial_untar: 0,
+            is_support_pay: 0,
+        }
+    }
+
+    #[test]
+    fn vivo_info_product_device_uses_hard_version_when_ota_device_empty() {
+        let resp = first_sync_resp("DPD2508AB_A_1.0.0", "vivo WATCH GT2", "");
+        let info = device_info_from_first_sync("aa:bb:cc:dd:ee:ff", &resp);
+
+        assert_eq!(info.product_device, "DPD2508AB_A");
+        assert_eq!(info.hard_version.as_deref(), Some("DPD2508AB_A"));
+        assert_eq!(info.os_version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn vivo_info_product_device_uses_ota_device_override() {
+        let resp = first_sync_resp("DPD2508AB_A_1.0.0", "vivo WATCH GT2", "DPD2508AB_B");
+        let info = device_info_from_first_sync("aa:bb:cc:dd:ee:ff", &resp);
+
+        assert_eq!(info.product_device, "DPD2508AB_B");
+        assert_eq!(info.hard_version.as_deref(), Some("DPD2508AB_B"));
+    }
 }
