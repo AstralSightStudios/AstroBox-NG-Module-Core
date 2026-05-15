@@ -4,7 +4,10 @@ use tokio::sync::oneshot;
 use crate::{
     anyhow_site,
     device::{
-        Device, DeviceKind, vivo::components::info::InfoSystem as VivoInfoSystem,
+        Device, DeviceKind,
+        vivo::components::info::{
+            InfoComponent as VivoInfoComponent, InfoSystem as VivoInfoSystem,
+        },
         xiaomi::components::info::InfoSystem as XiaomiInfoSystem,
     },
 };
@@ -188,4 +191,16 @@ async fn await_slot<T>(
     missing_msg: &'static str,
 ) -> anyhow::Result<T> {
     rx.await.map_err(|_| anyhow_site!("{missing_msg}"))?
+}
+
+pub async fn read_cached_vivo_device_info(addr: String) -> Option<DeviceInfoData> {
+    crate::ecs::with_rt_mut(move |rt| {
+        rt.with_device_mut(&addr, |world, entity| {
+            world
+                .get::<VivoInfoComponent>(entity)
+                .and_then(|comp| comp.info.clone())
+        })
+        .flatten()
+    })
+    .await
 }

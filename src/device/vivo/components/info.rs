@@ -107,11 +107,14 @@ impl InfoSystem {
             return Err(err);
         }
 
-        log::debug!(
-            "[VivoDevice.Info] first-sync received model={} sn={} version={} total={} free={} battery={}",
+        log::info!(
+            "[VivoDevice.Info] first-sync received model={} sn={} version={} hardVer={} otaDevice={} versionType={} total={} free={} battery={}",
             resp.model,
             resp.sn,
             resp.version,
+            resp.hard_ver,
+            resp.ota_device,
+            resp.version_type,
             resp.total_storage,
             resp.free_storage,
             resp.battry
