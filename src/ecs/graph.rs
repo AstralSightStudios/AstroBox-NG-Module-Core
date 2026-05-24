@@ -1,4 +1,4 @@
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
 use crate::device::xiaomi::components::network::{NetworkComponent, NetworkSystem};
 use crate::{
     device::xiaomi::{
@@ -242,7 +242,7 @@ fn build_graph(rt: &mut Runtime) -> ReactFlowGraph {
             &mut nodes,
             &mut edges,
         );
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
         add_component_node::<NetworkComponent>(
             world,
             entity,
@@ -355,7 +355,7 @@ fn build_graph(rt: &mut Runtime) -> ReactFlowGraph {
             &mut nodes,
             &mut edges,
         );
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
         add_system_node::<NetworkSystem, NetworkComponent>(
             world,
             entity,

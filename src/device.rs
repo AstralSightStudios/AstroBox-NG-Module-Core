@@ -27,9 +27,9 @@ use crate::device::vivo::{
         WatchfaceComponent as VivoWatchfaceComponent, WatchfaceSystem as VivoWatchfaceSystem,
     },
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
 use crate::device::xiaomi::components::network::NetworkComponent;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
 use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::components::{
     auth::{AuthComponent, AuthSystem},
@@ -139,7 +139,7 @@ where
         }
         DeviceKind::Xiaomi => {
             let device_id_for_auth = addr.clone();
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
             let device_id_for_network = addr.clone();
             let addr_for_entity = addr.clone();
             let name_for_entity = name.clone();
@@ -158,7 +158,7 @@ where
                 if let Some(chunk_size_ble) = transport_chunk_size_ble {
                     device_config.transport.chunk_size_ble = chunk_size_ble.max(1);
                 }
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
                 let network_config = device_config.network.clone();
                 let authkey_for_component = authkey.clone();
                 let dev = XiaomiDevice::new(
@@ -208,7 +208,7 @@ where
                     SyncComponent::new(),
                     SyncSystem::new(device_id.clone()),
                 ));
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
                 {
                     let network_config_for_runtime = network_config.clone();
                     entity_ref.insert((
@@ -242,7 +242,7 @@ where
                 auth_result?;
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
             // 在Auth完成后同步网络状态以确保蓝牙联网可用
             crate::ecs::with_rt_mut(move |rt| {
                 rt.with_device_mut(&device_id_for_network, |world, entity| {

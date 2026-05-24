@@ -42,6 +42,18 @@ nanorand = "0.8"
 hex = "0.4.3"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
+[features]
+default = ["xiaomi-network-stack"]
+xiaomi-network-stack = [
+    "dep:ipstack",
+    "dep:udp-stream",
+    "dep:pcap-file",
+    "dep:packet_crafter",
+    "dep:dhcproto",
+    "dep:etherparse",
+    "tokio/net",
+]
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "rt",
@@ -50,15 +62,14 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "sync",
     "io-util",
-    "net",
 ] }
 tokio-util = "0.7"
-ipstack = { git = "http://github.com/searchstars/ipstack-astrobox/", branch = "main" }
-udp-stream = { version = "0.0", default-features = false }
-pcap-file = "2.0.0"
-packet_crafter = "0.2.0"
-dhcproto = "0.14.0"
-etherparse = { version = "0.19", default-features = false, features = ["std"] }
+ipstack = { git = "http://github.com/searchstars/ipstack-astrobox/", branch = "main", optional = true }
+udp-stream = { version = "0.0", default-features = false, optional = true }
+pcap-file = { version = "2.0.0", optional = true }
+packet_crafter = { version = "0.2.0", optional = true }
+dhcproto = { version = "0.14.0", optional = true }
+etherparse = { version = "0.19", default-features = false, features = ["std"], optional = true }
 chrono = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
