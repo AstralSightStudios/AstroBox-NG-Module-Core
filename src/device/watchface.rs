@@ -196,6 +196,24 @@ pub struct EditSlotItem {
     pub widget_id: String,
 }
 
+/// 相册/人像表盘的一组图 WatchFaceImage.Group
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditImageGroup {
+    /// 无fg时即bg md5，有fg时为MD5(bgMd5 + fgMd5)
+    pub id: String,
+    #[serde(default)]
+    pub content_pos_index: u32,
+    /// 背景md5
+    pub bg_image: String,
+    #[serde(default)]
+    pub bg_image_size: u32,
+    #[serde(default)]
+    pub fg_image: Option<String>,
+    #[serde(default)]
+    pub fg_image_size: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WatchfaceEditParams {
@@ -226,6 +244,9 @@ pub struct WatchfaceEditParams {
     pub order_image_list: Vec<String>,
     #[serde(default)]
     pub delete_all_images: Option<bool>,
+    /// 相册/人像表盘图组列表 EditRequest.image_group_list（field 15）
+    #[serde(default)]
+    pub image_groups: Vec<EditImageGroup>,
 }
 
 impl WatchfaceEditParams {
@@ -257,10 +278,38 @@ impl WatchfaceEditParams {
             slot_item_list,
             foreground_color,
             style_color_index: self.style_color_index,
-            image_group_list: None,
+            image_group_list: build_image_group_list(self.image_groups),
             literal: None,
         }
     }
+}
+
+fn build_image_group_list(
+    groups: Vec<EditImageGroup>,
+) -> Option<protocol::watch_face_image::GroupList> {
+    if groups.is_empty() {
+        return None;
+    }
+    let list = groups
+        .into_iter()
+        .map(|g| protocol::watch_face_image::Group {
+            id: g.id,
+            content_pos_index: g.content_pos_index,
+            bg_image: protocol::WatchFaceImage {
+                id: g.bg_image,
+                size: Some(g.bg_image_size),
+            },
+            fg_image: g.fg_image.map(|id| protocol::WatchFaceImage {
+                id,
+                size: g.fg_image_size,
+            }),
+        })
+        .collect();
+    // 官方逻辑逆向：requestEdit只填list，support_max_count写死0。何意味。
+    Some(protocol::watch_face_image::GroupList {
+        list,
+        support_max_count: 0,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
