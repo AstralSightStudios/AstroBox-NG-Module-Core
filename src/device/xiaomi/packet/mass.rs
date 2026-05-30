@@ -12,6 +12,7 @@ use crate::tools::{calc_crc32_bytes, calc_md5, to_hex_string};
 pub enum MassDataType {
     Watchface = 16,
     Firmare = 32,
+    WatchfaceImage = 48,
     NotificationIcon = 50,
     Music = 52,
     ThirdPartyApp = 64,
@@ -30,6 +31,7 @@ impl TryFrom<u8> for MassDataType {
         match value {
             16 => Ok(MassDataType::Watchface),
             32 => Ok(MassDataType::Firmare),
+            48 => Ok(MassDataType::WatchfaceImage),
             50 => Ok(MassDataType::NotificationIcon),
             52 => Ok(MassDataType::Music),
             64 => Ok(MassDataType::ThirdPartyApp),

@@ -150,6 +150,11 @@ impl InstallSystem {
                 MassDataType::Music => {
                     bail_site!("music payloads are not supported by InstallSystem")
                 }
+                MassDataType::WatchfaceImage => {
+                    bail_site!(
+                        "watchface background images are not installed via InstallSystem; use device::watchface::transfer_watchface_image"
+                    )
+                }
                 MassDataType::ThirdPartyApp => {
                     let pkg =
                         package_name.context("package_name is required for third-party app")?;
@@ -367,7 +372,10 @@ async fn refresh_post_install_state(owner: String, data_type: MassDataType) {
             refresh_quick_app_list(owner.clone()).await;
             refresh_storage_info(owner).await;
         }
-        MassDataType::Firmare | MassDataType::NotificationIcon | MassDataType::Music => {}
+        MassDataType::Firmare
+        | MassDataType::NotificationIcon
+        | MassDataType::Music
+        | MassDataType::WatchfaceImage => {}
     }
 }
 

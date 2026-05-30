@@ -12,9 +12,15 @@ use crate::{
             },
             dial_manifest::parse_vivo_dial_manifest,
         },
-        xiaomi::components::watchface::WatchfaceSystem as XiaomiWatchfaceSystem,
+        xiaomi::components::{
+            mass::{SendMassCallbackData, send_file_for_owner_with_known_slice_length},
+            watchface::WatchfaceSystem as XiaomiWatchfaceSystem,
+        },
+        xiaomi::packet::mass::MassDataType,
     },
 };
+use pb::xiaomi::protocol;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub async fn set_current(addr: String, watchface_id: String) -> anyhow::Result<()> {
@@ -181,4 +187,213 @@ where
         .ok_or_else(|| anyhow_site!("Device not found"))?
     })
     .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSlotItem {
+    pub slot_id: String,
+    pub widget_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchfaceEditParams {
+    pub id: String,
+    #[serde(default)]
+    pub set_current: bool,
+    #[serde(default)]
+    pub background_color: Option<String>,
+    #[serde(default)]
+    pub foreground_color: Option<String>,
+    #[serde(default)]
+    pub style: String,
+    #[serde(default)]
+    pub style_color_index: Option<u32>,
+    #[serde(default)]
+    pub data_list: Vec<i32>,
+    #[serde(default)]
+    pub slot_item_list: Vec<EditSlotItem>,
+    #[serde(default)]
+    pub background_image: Option<String>,
+    #[serde(default)]
+    pub background_image_size: Option<u32>,
+    #[serde(default)]
+    pub background_image_list: Vec<String>,
+    #[serde(default)]
+    pub background_image_size_list: Vec<u32>,
+    #[serde(default)]
+    pub order_image_list: Vec<String>,
+    #[serde(default)]
+    pub delete_all_images: Option<bool>,
+}
+
+impl WatchfaceEditParams {
+    fn into_edit_request(self) -> protocol::EditRequest {
+        let foreground_color = self
+            .foreground_color
+            .as_deref()
+            .and_then(parse_accent_color_bytes);
+        let slot_item_list = self
+            .slot_item_list
+            .into_iter()
+            .map(|item| protocol::watch_face_slot::Item {
+                slot_id: item.slot_id,
+                widget_id: item.widget_id,
+            })
+            .collect();
+        protocol::EditRequest {
+            id: self.id,
+            set_current: self.set_current,
+            background_color: self.background_color.unwrap_or_default(),
+            background_image: self.background_image.unwrap_or_default(),
+            background_image_size: self.background_image_size,
+            style: self.style,
+            data_list: self.data_list,
+            background_image_list: self.background_image_list,
+            background_image_size_list: self.background_image_size_list,
+            order_image_list: self.order_image_list,
+            delete_all_images: self.delete_all_images,
+            slot_item_list,
+            foreground_color,
+            style_color_index: self.style_color_index,
+            image_group_list: None,
+            literal: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditResponseInfo {
+    pub code: i32,
+    pub can_accept_image_count: u32,
+    pub expected_slice_length: u32,
+}
+
+impl From<protocol::EditResponse> for EditResponseInfo {
+    fn from(resp: protocol::EditResponse) -> Self {
+        Self {
+            code: resp.code,
+            can_accept_image_count: resp.can_accept_image_count.unwrap_or(0),
+            expected_slice_length: resp.expected_slice_length.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgImageResultInfo {
+    pub code: i32,
+    pub id: String,
+    pub background_image: String,
+}
+
+impl From<protocol::BgImageResult> for BgImageResultInfo {
+    fn from(result: protocol::BgImageResult) -> Self {
+        Self {
+            code: result.code,
+            id: result.id,
+            background_image: result.background_image,
+        }
+    }
+}
+
+pub async fn edit_watchface(
+    addr: String,
+    params: WatchfaceEditParams,
+) -> anyhow::Result<EditResponseInfo> {
+    match device_kind(&addr).await? {
+        DeviceKind::Xiaomi => {
+            let request = params.into_edit_request();
+            let rx =
+                with_xiaomi_watchface_system(addr, move |sys| Ok(sys.request_edit(request))).await?;
+            let resp = rx
+                .await
+                .map_err(|_| anyhow_site!("Xiaomi watchface edit response not received"))??;
+            Ok(EditResponseInfo::from(resp))
+        }
+        DeviceKind::Vivo => bail_site!("watchface edit is only supported on Xiaomi devices"),
+    }
+}
+
+pub async fn transfer_watchface_image(
+    addr: String,
+    encoded: Vec<u8>,
+    slice_len: usize,
+    progress_cb: Option<Arc<dyn Fn(SendMassCallbackData) + Send + Sync>>,
+) -> anyhow::Result<BgImageResultInfo> {
+    if device_kind(&addr).await? != DeviceKind::Xiaomi {
+        bail_site!("watchface image transfer is only supported on Xiaomi devices");
+    }
+    if encoded.is_empty() {
+        bail_site!("watchface image transfer: encoded image is empty");
+    }
+    let slice_len = if slice_len == 0 { 4096 } else { slice_len };
+
+    let rx =
+        with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_bg_image_wait()))
+            .await?;
+
+    let cb = move |d: SendMassCallbackData| {
+        if let Some(cb) = progress_cb.as_ref() {
+            cb(d);
+        }
+    };
+    send_file_for_owner_with_known_slice_length(
+        addr.clone(),
+        encoded,
+        MassDataType::WatchfaceImage,
+        slice_len,
+        cb,
+    )
+    .await?;
+
+    let result = rx
+        .await
+        .map_err(|_| anyhow_site!("Xiaomi watchface bg image result not received"))??;
+    Ok(BgImageResultInfo::from(result))
+}
+
+pub async fn resolve_xiaomi_watchface_id(
+    addr: String,
+    data: Vec<u8>,
+) -> anyhow::Result<Option<String>> {
+    use crate::device::xiaomi::{XiaomiDevice, resutils};
+    let res_config = crate::ecs::with_rt_mut(move |rt| {
+        rt.component_ref::<XiaomiDevice>(&addr)
+            .map(|dev| dev.config.res.clone())
+    })
+    .await;
+    Ok(res_config.and_then(|cfg| resutils::get_watchface_id(&data, &cfg)))
+}
+
+pub async fn get_watchface_support_data(addr: String) -> anyhow::Result<Vec<i32>> {
+    match device_kind(&addr).await? {
+        DeviceKind::Xiaomi => {
+            let rx = with_xiaomi_watchface_system(addr, move |sys| Ok(sys.request_support_data()))
+                .await?;
+            rx.await
+                .map_err(|_| anyhow_site!("Xiaomi watchface support data not received"))?
+        }
+        DeviceKind::Vivo => bail_site!("watchface support data is only supported on Xiaomi devices"),
+    }
+}
+
+fn parse_accent_color_bytes(input: &str) -> Option<Vec<u8>> {
+    let hex = input.trim().strip_prefix('#')?;
+    let (r, g, b) = match hex.len() {
+        6 => (
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ),
+        8 => (
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+            u8::from_str_radix(&hex[6..8], 16).ok()?,
+        ),
+        _ => return None,
+    };
+    Some(vec![0xFF, r, g, b])
 }
