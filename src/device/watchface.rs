@@ -400,8 +400,8 @@ pub async fn edit_watchface(
     match device_kind(&addr).await? {
         DeviceKind::Xiaomi => {
             let request = params.into_edit_request();
-            let rx =
-                with_xiaomi_watchface_system(addr, move |sys| Ok(sys.request_edit(request))).await?;
+            let rx = with_xiaomi_watchface_system(addr, move |sys| Ok(sys.request_edit(request)))
+                .await?;
             let resp = rx
                 .await
                 .map_err(|_| anyhow_site!("Xiaomi watchface edit response not received"))??;
@@ -425,9 +425,8 @@ pub async fn transfer_watchface_image(
     }
     let slice_len = if slice_len == 0 { 4096 } else { slice_len };
 
-    let rx =
-        with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_bg_image_wait()))
-            .await?;
+    let rx = with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_bg_image_wait()))
+        .await?;
 
     let cb = move |d: SendMassCallbackData| {
         if let Some(cb) = progress_cb.as_ref() {
@@ -479,8 +478,8 @@ pub async fn transfer_watchface_font(
     }
     let slice_len = if slice_len == 0 { 4096 } else { slice_len };
 
-    let rx = with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_font_wait()))
-        .await?;
+    let rx =
+        with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_font_wait())).await?;
 
     let cb = move |d: SendMassCallbackData| {
         if let Some(cb) = progress_cb.as_ref() {
@@ -523,7 +522,9 @@ pub async fn get_watchface_support_data(addr: String) -> anyhow::Result<Vec<i32>
             rx.await
                 .map_err(|_| anyhow_site!("Xiaomi watchface support data not received"))?
         }
-        DeviceKind::Vivo => bail_site!("watchface support data is only supported on Xiaomi devices"),
+        DeviceKind::Vivo => {
+            bail_site!("watchface support data is only supported on Xiaomi devices")
+        }
     }
 }
 

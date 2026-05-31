@@ -101,7 +101,11 @@ impl L2PbExt for WatchfaceSystem {
                     self.support_data_wait.fulfill(list.list);
                 }
                 Some(protocol::watch_face::Payload::FontResult(result)) => {
-                    log::debug!("[Watchface] font result: code={} id={}", result.code, result.id);
+                    log::debug!(
+                        "[Watchface] font result: code={} id={}",
+                        result.code,
+                        result.id
+                    );
                     self.font_wait.fulfill(result);
                 }
                 Some(protocol::watch_face::Payload::InstallResult(result)) => {
