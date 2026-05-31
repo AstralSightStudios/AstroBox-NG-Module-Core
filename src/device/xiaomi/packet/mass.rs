@@ -15,6 +15,7 @@ pub enum MassDataType {
     WatchfaceImage = 48,
     NotificationIcon = 50,
     Music = 52,
+    WatchfaceFont = 53,
     ThirdPartyApp = 64,
 }
 
@@ -34,6 +35,7 @@ impl TryFrom<u8> for MassDataType {
             48 => Ok(MassDataType::WatchfaceImage),
             50 => Ok(MassDataType::NotificationIcon),
             52 => Ok(MassDataType::Music),
+            53 => Ok(MassDataType::WatchfaceFont),
             64 => Ok(MassDataType::ThirdPartyApp),
             _ => Err("invalid MassDataType value"),
         }

@@ -247,6 +247,30 @@ pub struct WatchfaceEditParams {
     /// 相册/人像表盘图组列表 EditRequest.image_group_list（field 15）
     #[serde(default)]
     pub image_groups: Vec<EditImageGroup>,
+    /// 文字表盘文案 EditRequest.literal（field 16）
+    #[serde(default)]
+    pub literal: Option<EditLiteral>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditLiteral {
+    pub items: Vec<EditLiteralItem>,
+    #[serde(default)]
+    pub font: String,
+    #[serde(default)]
+    pub font_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditLiteralItem {
+    /// DataItemText id 解析自uidmap.map
+    pub id: String,
+    pub text_list: Vec<String>,
+    /// 数据源 id（slogan=0）
+    #[serde(default)]
+    pub source: Option<u32>,
 }
 
 impl WatchfaceEditParams {
@@ -279,9 +303,30 @@ impl WatchfaceEditParams {
             foreground_color,
             style_color_index: self.style_color_index,
             image_group_list: build_image_group_list(self.image_groups),
-            literal: None,
+            literal: build_watchface_literal(self.literal),
         }
     }
+}
+
+fn build_watchface_literal(literal: Option<EditLiteral>) -> Option<protocol::WatchFaceLiteral> {
+    let literal = literal?;
+    if literal.items.is_empty() {
+        return None;
+    }
+    let literal_items = literal
+        .items
+        .into_iter()
+        .map(|item| protocol::watch_face_literal::Item {
+            id: item.id,
+            text_list: item.text_list,
+            source: item.source,
+        })
+        .collect();
+    Some(protocol::WatchFaceLiteral {
+        items: protocol::watch_face_literal::item::List { literal_items },
+        font: literal.font,
+        font_size: literal.font_size,
+    })
 }
 
 fn build_image_group_list(
@@ -402,6 +447,59 @@ pub async fn transfer_watchface_image(
         .await
         .map_err(|_| anyhow_site!("Xiaomi watchface bg image result not received"))??;
     Ok(BgImageResultInfo::from(result))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FontResultInfo {
+    pub code: i32,
+    pub id: String,
+}
+
+impl From<protocol::FontResult> for FontResultInfo {
+    fn from(result: protocol::FontResult) -> Self {
+        Self {
+            code: result.code as i32,
+            id: result.id,
+        }
+    }
+}
+
+pub async fn transfer_watchface_font(
+    addr: String,
+    font_bytes: Vec<u8>,
+    slice_len: usize,
+    progress_cb: Option<Arc<dyn Fn(SendMassCallbackData) + Send + Sync>>,
+) -> anyhow::Result<FontResultInfo> {
+    if device_kind(&addr).await? != DeviceKind::Xiaomi {
+        bail_site!("watchface font transfer is only supported on Xiaomi devices");
+    }
+    if font_bytes.is_empty() {
+        bail_site!("watchface font transfer: font is empty");
+    }
+    let slice_len = if slice_len == 0 { 4096 } else { slice_len };
+
+    let rx = with_xiaomi_watchface_system(addr.clone(), move |sys| Ok(sys.prepare_font_wait()))
+        .await?;
+
+    let cb = move |d: SendMassCallbackData| {
+        if let Some(cb) = progress_cb.as_ref() {
+            cb(d);
+        }
+    };
+    send_file_for_owner_with_known_slice_length(
+        addr.clone(),
+        font_bytes,
+        MassDataType::WatchfaceFont,
+        slice_len,
+        cb,
+    )
+    .await?;
+
+    let result = rx
+        .await
+        .map_err(|_| anyhow_site!("Xiaomi watchface font result not received"))??;
+    Ok(FontResultInfo::from(result))
 }
 
 pub async fn resolve_xiaomi_watchface_id(

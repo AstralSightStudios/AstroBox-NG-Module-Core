@@ -155,6 +155,11 @@ impl InstallSystem {
                         "watchface background images are not installed via InstallSystem; use device::watchface::transfer_watchface_image"
                     )
                 }
+                MassDataType::WatchfaceFont => {
+                    bail_site!(
+                        "watchface literal fonts are not installed via InstallSystem; use device::watchface::transfer_watchface_font"
+                    )
+                }
                 MassDataType::ThirdPartyApp => {
                     let pkg =
                         package_name.context("package_name is required for third-party app")?;
@@ -375,7 +380,8 @@ async fn refresh_post_install_state(owner: String, data_type: MassDataType) {
         MassDataType::Firmare
         | MassDataType::NotificationIcon
         | MassDataType::Music
-        | MassDataType::WatchfaceImage => {}
+        | MassDataType::WatchfaceImage
+        | MassDataType::WatchfaceFont => {}
     }
 }
 

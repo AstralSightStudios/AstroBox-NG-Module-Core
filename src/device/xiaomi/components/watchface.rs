@@ -13,6 +13,7 @@ pub struct WatchfaceSystem {
     owner_id: String,
     edit_wait: RequestSlot<protocol::EditResponse>,
     bg_image_wait: RequestSlot<protocol::BgImageResult>,
+    font_wait: RequestSlot<protocol::FontResult>,
     support_data_wait: RequestSlot<Vec<i32>>,
 }
 
@@ -29,6 +30,7 @@ impl WatchfaceSystem {
             owner_id,
             edit_wait: RequestSlot::new(),
             bg_image_wait: RequestSlot::new(),
+            font_wait: RequestSlot::new(),
             support_data_wait: RequestSlot::new(),
         }
     }
@@ -56,6 +58,11 @@ impl WatchfaceSystem {
         &mut self,
     ) -> oneshot::Receiver<anyhow::Result<protocol::BgImageResult>> {
         let (rx, _should_enqueue) = self.bg_image_wait.prepare();
+        rx
+    }
+
+    pub fn prepare_font_wait(&mut self) -> oneshot::Receiver<anyhow::Result<protocol::FontResult>> {
+        let (rx, _should_enqueue) = self.font_wait.prepare();
         rx
     }
 
@@ -95,6 +102,7 @@ impl L2PbExt for WatchfaceSystem {
                 }
                 Some(protocol::watch_face::Payload::FontResult(result)) => {
                     log::debug!("[Watchface] font result: code={} id={}", result.code, result.id);
+                    self.font_wait.fulfill(result);
                 }
                 Some(protocol::watch_face::Payload::InstallResult(result)) => {
                     log::debug!(
