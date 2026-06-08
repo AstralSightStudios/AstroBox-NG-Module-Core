@@ -83,16 +83,23 @@ impl MassPacket {
     /// Format: comp_data (1B) | data_type (1B) | md5 (16B) | length (4B LE) |
     /// original_file_data (...) | crc32_of_previous_fields (4B LE)
     pub fn encode_with_crc32(&self) -> Vec<u8> {
+        self.encode_with_crc32_from(0)
+    }
+
+    pub fn encode_with_crc32_from(&self, sent_length: usize) -> Vec<u8> {
+        let start = sent_length.min(self.original_file_data.len());
+        let remaining = &self.original_file_data[start..];
+
         let mut crc_payload_buf =
-            Vec::with_capacity(1 + 1 + self.md5.len() + 4 + self.original_file_data.len() + 4);
+            Vec::with_capacity(1 + 1 + self.md5.len() + 4 + remaining.len() + 4);
 
         crc_payload_buf.push(0x00);
         crc_payload_buf.push(self.data_type as u8);
         crc_payload_buf.extend_from_slice(&self.md5);
         crc_payload_buf
-            .write_u32::<LittleEndian>(self.length)
+            .write_u32::<LittleEndian>(remaining.len() as u32)
             .unwrap();
-        crc_payload_buf.extend_from_slice(&self.original_file_data);
+        crc_payload_buf.extend_from_slice(remaining);
 
         let crc32_val = u32::from_be_bytes(calc_crc32_bytes(&crc_payload_buf));
         crc_payload_buf

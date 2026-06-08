@@ -28,13 +28,6 @@ use crate::device::xiaomi::transport_profiler::TransportProfilerHandle;
 use crate::ecs::{Component, access::with_device_component_mut};
 use parking_lot::Mutex;
 
-#[derive(Clone, serde::Serialize)]
-struct ResumeState {
-    device_addr: String,
-    mass_id: Vec<u8>,
-    current_part: u16,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMassCallbackData {
     pub progress: f32,
@@ -320,14 +313,12 @@ impl XiaomiSystemExt for MassSystem {
 pub struct MassComponent {
     #[serde(skip_serializing)]
     prepare_wait: Mutex<Option<oneshot::Sender<protocol::PrepareResponse>>>, // 等 Prepare 回包的单次通道
-    resume_state: Option<ResumeState>, // 断点续传需要的“我现在传到哪了”
 }
 
 impl MassComponent {
     pub fn new() -> Self {
         Self {
             prepare_wait: Mutex::new(None),
-            resume_state: None,
         }
     }
 }
@@ -360,13 +351,6 @@ fn build_mass_prepare_request(
     }
 }
 
-/// 通过 owner_id 驱动 MASS 文件发送（核心逻辑基本都在这）
-/// 流程小抄：
-/// 1) 发 Prepare，拿设备切片能力；
-/// 2) 把文件做成 MassPayload，再按设备给的大小切片；
-/// 3) 持续把分片丢给底层 SAR（它有窗口控制，负责限速/重传等）；
-/// 4) 盯 ACK、更新进度；卡住就等一等；
-/// 5) 断点续传：随进度更新 current_part。
 pub async fn send_file_for_owner<F>(
     owner_id: String,
     file_data: Vec<u8>,
@@ -397,12 +381,12 @@ where
 
     log::info!("Sending MASS Prepare...");
     let prepare_started_at = Instant::now();
-    // 2) 发 Prepare 请求，同时取下设备地址（断点续传用来校验是不是同一台设备）
-    let device_addr = crate::ecs::with_rt_mut({
+    // 2) 发 Prepare 请求（data_id = 整文件 md5，当全世界最尊重手环的主机。）
+    crate::ecs::with_rt_mut({
         let owner = owner_id.clone();
         let file_md5_clone = file_md5.clone();
         move |rt| {
-            rt.with_device_mut(&owner, |world, entity| {
+            let _ = rt.with_device_mut(&owner, |world, entity| {
                 if let Some(mut dev) = world.get_mut::<XiaomiDevice>(entity) {
                     let prepare_pkt =
                         build_mass_prepare_request(data_type, &file_md5_clone, file_len);
@@ -411,12 +395,8 @@ where
                         prepare_pkt,
                         "MassSystem::send_file_for_owner.prepare",
                     );
-                    dev.addr().to_string()
-                } else {
-                    String::new()
                 }
-            })
-            .unwrap_or_default()
+            });
         }
     })
     .await;
@@ -462,13 +442,21 @@ where
         );
     }
     let expected_slice_length = prepare_resp.expected_slice_length() as usize;
+
+    let sent_length = (prepare_resp.remained_data_length() as usize).min(file_len);
+    if sent_length > 0 {
+        log::info!(
+            "[Mass] device retained {} / {} bytes from a previous transfer, resuming from there",
+            sent_length,
+            file_len
+        );
+    }
     send_file_for_owner_with_slice_length(
         owner_id,
         file_data,
         data_type,
         expected_slice_length,
-        file_md5,
-        device_addr,
+        sent_length,
         progress_cb,
     )
     .await
@@ -484,28 +472,12 @@ pub async fn send_file_for_owner_with_known_slice_length<F>(
 where
     F: Fn(SendMassCallbackData) + Send + Sync,
 {
-    let file_md5 = crate::tools::calc_md5(&file_data);
-    let device_addr = crate::ecs::with_rt_mut({
-        let owner = owner_id.clone();
-        move |rt| {
-            rt.with_device_mut(&owner, |world, entity| {
-                world
-                    .get::<XiaomiDevice>(entity)
-                    .map(|dev| dev.addr().to_string())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
-        }
-    })
-    .await;
-
     send_file_for_owner_with_slice_length(
         owner_id,
         file_data,
         data_type,
         expected_slice_length,
-        file_md5,
-        device_addr,
+        0,
         progress_cb,
     )
     .await
@@ -516,8 +488,7 @@ async fn send_file_for_owner_with_slice_length<F>(
     file_data: Vec<u8>,
     data_type: MassDataType,
     expected_slice_length: usize,
-    file_md5: Vec<u8>,
-    device_addr: String,
+    sent_length: usize,
     progress_cb: F,
 ) -> Result<()>
 where
@@ -529,9 +500,17 @@ where
         bail_site!("Device reported expected_slice_length of 0, cannot proceed.");
     }
 
-    // 把文件包成 MASS 内部负载，并附带 CRC32（设备端用于校验）
+    let file_len = file_data.len();
+    let sent_length = sent_length.min(file_len);
+
+    let progress_base = if file_len == 0 {
+        0.0
+    } else {
+        (sent_length as f32 / file_len as f32).clamp(0.0, 1.0)
+    };
+
     let mass_inner_payload = MassPacket::build(file_data, data_type)?;
-    let mass_inner_payload_with_crc32 = mass_inner_payload.encode_with_crc32();
+    let mass_inner_payload_with_crc32 = mass_inner_payload.encode_with_crc32_from(sent_length);
 
     // MiWearPacket Body 结构：Channel(1) | Op(1) | blocks_num(2) | resume_block(2) | MassFragment
     // 所以真正能放分片的空间要减去上面 1+1+2+2 的头部
@@ -549,32 +528,6 @@ where
     if total_parts == 0 && !mass_inner_payload_with_crc32.is_empty() {
         bail_site!("Calculated total_parts is 0 for non-empty payload.");
     }
-
-    // 断点续传：如果有之前记录且 data/device 都匹配，就从记录的分片号继续
-    let start_part = crate::ecs::with_rt_mut({
-        let owner = owner_id.clone();
-        let file_md5_for_resume = file_md5.clone();
-        let device_addr_for_resume = device_addr.clone();
-        move |rt| {
-            rt.with_device_mut(&owner, |world, entity| {
-                if let Some(mut comp) = world.get_mut::<MassComponent>(entity) {
-                    if let Some(state) = comp.resume_state.as_ref().filter(|s| {
-                        s.mass_id == file_md5_for_resume && s.device_addr == device_addr_for_resume
-                    }) {
-                        return state.current_part;
-                    }
-                    comp.resume_state = Some(ResumeState {
-                        device_addr: device_addr_for_resume.clone(),
-                        mass_id: file_md5_for_resume.clone(),
-                        current_part: 1,
-                    });
-                }
-                1u16
-            })
-            .unwrap_or(1u16)
-        }
-    })
-    .await;
 
     // 从 SAR 拿窗口大小 & 发送超时，便于自适应批量/等待策略
     let sar_hints = crate::ecs::with_rt_mut({
@@ -652,7 +605,7 @@ where
     let mut last_progress_at = Instant::now();
     let mut flush_count = 0usize;
 
-    for i in (start_part - 1)..total_parts {
+    for i in 0..total_parts {
         let current_part_num = i + 1;
         let start_index = i as usize * mass_fragment_max_len;
         let end_index = std::cmp::min(
@@ -693,6 +646,7 @@ where
                 &owner_id,
                 &mut pending_parts,
                 total_parts,
+                progress_base,
                 &progress_cb,
                 &mass_config,
                 ack_stall_deadline,
@@ -723,6 +677,7 @@ where
         &owner_id,
         &mut pending_parts,
         total_parts,
+        progress_base,
         &progress_cb,
         &mass_config,
         ack_stall_deadline,
@@ -735,7 +690,14 @@ where
     // 最后把队头一个个等 ACK，直到清空
     while let Some(front_seq) = pending_parts.front().map(|p| p.seq) {
         wait_for_seq_ack(&owner_id, front_seq, &mass_config).await?;
-        consume_acked_parts(&owner_id, &mut pending_parts, total_parts, &progress_cb).await?;
+        consume_acked_parts(
+            &owner_id,
+            &mut pending_parts,
+            total_parts,
+            progress_base,
+            &progress_cb,
+        )
+        .await?;
     }
 
     Ok(())
@@ -805,6 +767,7 @@ async fn enforce_flow_control<F>(
     owner_id: &str,
     pending_parts: &mut VecDeque<PendingMassPart>,
     total_parts: u16,
+    progress_base: f32,
     progress_cb: &F,
     config: &MassConfig,
     ack_stall_deadline: Duration,
@@ -816,7 +779,9 @@ where
     F: Fn(SendMassCallbackData) + Send + Sync,
 {
     // 先看看能不能把队头消费一波
-    let consumed = consume_acked_parts(owner_id, pending_parts, total_parts, progress_cb).await?;
+    let consumed =
+        consume_acked_parts(owner_id, pending_parts, total_parts, progress_base, progress_cb)
+            .await?;
     if consumed > 0 {
         *last_progress_at = Instant::now();
     }
@@ -865,8 +830,14 @@ where
                     )),
                 );
             }
-            let consumed_after_wait =
-                consume_acked_parts(owner_id, pending_parts, total_parts, progress_cb).await?;
+            let consumed_after_wait = consume_acked_parts(
+                owner_id,
+                pending_parts,
+                total_parts,
+                progress_base,
+                progress_cb,
+            )
+            .await?;
             if consumed_after_wait > 0 {
                 *last_progress_at = Instant::now();
             }
@@ -997,11 +968,13 @@ async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Resul
     Ok(())
 }
 
-/// 把已经 ACK 的队头逐个弹出，顺便更新断点续传状态 & 进度回调
+/// 把已经 ACK 的队头逐个弹出，顺便更新进度回调。
+/// `progress_base` 对应手环侧续传进度
 async fn consume_acked_parts<F>(
     owner_id: &str,
     pending_parts: &mut VecDeque<PendingMassPart>,
     total_parts: u16,
+    progress_base: f32,
     progress_cb: &F,
 ) -> Result<usize>
 where
@@ -1018,10 +991,8 @@ where
             };
 
             if !front.acked {
-                // 如果队头还没标记 acked，就去底层查一下；
-                // ack 了就更新续传状态，并把该 seq 标记“可消费”。
+                // 如果队头还没标记 acked，就去底层查一下；ack 了就把该 seq 标可消费
                 let seq = front.seq;
-                let next_part = front.part_num.saturating_add(1);
                 let owner = owner_id.to_string();
                 let acked = crate::ecs::with_rt_mut({
                     let owner = owner.clone();
@@ -1033,14 +1004,6 @@ where
                                 false
                             };
                             if acked {
-                                if let Some(mut comp) = world.get_mut::<MassComponent>(entity) {
-                                    if let Some(state) = comp.resume_state.as_mut() {
-                                        state.current_part = next_part;
-                                        if state.current_part > total_parts {
-                                            comp.resume_state = None;
-                                        }
-                                    }
-                                }
                                 if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
                                     dev.sar.lock().mark_ack_consumed(seq);
                                 }
@@ -1063,11 +1026,15 @@ where
         };
 
         pending_parts.pop_front();
-        let progress = if total_parts == 0 {
+        // 本次剩余分片内部的进度比例
+        let local_progress = if total_parts == 0 {
             1.0
         } else {
             part_num as f32 / total_parts as f32
         };
+        // base + 剩余区间 * 区间内比例
+        let progress =
+            (progress_base + (1.0 - progress_base) * local_progress).clamp(0.0, 1.0);
         latest_progress = Some(SendMassCallbackData {
             progress,
             total_parts,
