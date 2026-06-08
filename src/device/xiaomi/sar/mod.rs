@@ -51,21 +51,25 @@ pub struct SarController {
     tx_queue: VecDeque<SendItem>,
     tx_next_seq: u8,
     tx_base: u8,
+    /// 设备端TX，不参与主机节流
     tx_win: u8,
+    /// 主机端TX，根据运动健康默认写死32，可通过txoverrun增加
     tx_win_effective: u8,
     send_timeout: Duration,
     rx_expect_seq: u8,
     rx_cum_ack_index: u8,
     rx_cum_ack_seq: u8,
     rx_cum_ack_timer: Option<TaskHandle>,
+    cmd_exchanged: bool,
     /// 记录已经确认的 seq，供上层查询（会在 seq 重用或消费后清理）。
     acked: HashSet<u8>,
     ack_notify: Arc<Notify>,
     profiler: TransportProfilerHandle,
-    config: SarConfig,
 }
 
 impl SarController {
+    const LOCAL_TX_WIN: u8 = 32;
+
     pub fn new(
         tk_handle: Handle,
         sender: SendFn,
@@ -85,18 +89,18 @@ impl SarController {
             tx_base: 0,
             tx_win: 16,
             tx_win_effective: Self::compute_soft_cap_with_allowance(
-                16,
+                Self::LOCAL_TX_WIN,
                 config.tx_win_overrun_allowance,
             ),
-            send_timeout: Duration::from_millis(15_000),
+            send_timeout: Duration::from_millis(10_000),
             rx_expect_seq: 0,
             rx_cum_ack_index: 0,
             rx_cum_ack_seq: 0,
             rx_cum_ack_timer: None,
+            cmd_exchanged: false,
             acked: HashSet::new(),
             ack_notify: Arc::new(Notify::new()),
             profiler,
-            config,
         };
 
         // 启动定时检查超时任务
@@ -108,10 +112,9 @@ impl SarController {
         let start_req = L1CmdBuilder::new()
             .cmd(CmdCode::CmdL1startReq)
             .version(1, 0, 0)
-            .mps(0xFFFF)
-            .tx_win(16)
-            .send_timeout(15_000)
-            .device_type(0)
+            .mps(64512)
+            .tx_win(u16::from(Self::LOCAL_TX_WIN))
+            .send_timeout(10_000)
             .build()
             .unwrap();
         ctrl.command_pool
@@ -370,21 +373,17 @@ impl SarController {
                 // 根据发来的CmdRsp调整自身发包参数
                 if let Some(cmd) = L1CmdPacket::from_payload_bytes(&l1.payload) {
                     if cmd.cmd == CmdCode::CmdL1startRsp {
+                        self.cmd_exchanged = true;
                         if let Some(win) = cmd.get_tx_win() {
-                            let normalized = win.clamp(1, u16::from(u8::MAX)) as u8;
-                            self.tx_win = normalized;
-                            self.tx_win_effective = Self::compute_soft_cap_with_allowance(
-                                normalized,
-                                self.config.tx_win_overrun_allowance,
-                            );
+                            self.tx_win = win.clamp(1, u16::from(u8::MAX)) as u8;
                         }
                         if let Some(to) = cmd.get_send_timeout() {
                             self.send_timeout = Duration::from_millis(to as u64);
                         }
                         log::info!(
-                            "[SarController] L1StartRsp applied: tx_win={} soft_cap={} send_timeout_ms={}",
+                            "[SarController] L1StartRsp applied: local_send_win={} remote_tx_win={} send_timeout_ms={}",
+                            self.effective_tx_win(),
                             self.tx_win,
-                            self.tx_win_effective,
                             self.send_timeout.as_millis()
                         );
                         self.profiler.record(
@@ -396,9 +395,9 @@ impl SarController {
                             None,
                             Some(true),
                             Some(format!(
-                                "tx_win={},soft_cap={},send_timeout_ms={}",
+                                "local_send_win={},remote_tx_win={},send_timeout_ms={}",
+                                self.effective_tx_win(),
                                 self.tx_win,
-                                self.tx_win_effective,
                                 self.send_timeout.as_millis()
                             )),
                         );
@@ -409,35 +408,38 @@ impl SarController {
             L1DataType::Data => {
                 let channel = l1.payload.get(0).and_then(|b| L2Channel::try_from(*b).ok());
 
-                if matches!(channel, Some(L2Channel::Network)) {
-                    // Network 频道的所有包seq均为0，因此不做seq校验
+                let ackable = self.cmd_exchanged
+                    && !matches!(channel, Some(L2Channel::Network | L2Channel::MultiModal));
+                if !ackable {
                     return true;
                 }
 
                 if l1.frx {
-                    // 快速接收不需要 ACK
-                    self.rx_expect_seq = self.rx_expect_seq.wrapping_add(1);
+                    // 快速接收(frx)不需要 ACK，也不占用顺序序号空间——与官方一致不推进
+                    // rx_expect_seq，否则一旦设备走 frx，期望序号会与设备永久错位致后续误 NAK。
                     return true;
                 }
 
                 if l1.seq != self.rx_expect_seq {
-                    // 收到的 seq 不是预期的，回 NAK 请求重传
-                    self.send_nak(self.rx_expect_seq);
+                    // 只有 seq 超前才回 NAK 请求重传 seq落后则静默丢弃，避免出现NAK DDOS
+                    // onDataReceive：(seq - expect) 无符号 >= 128 视为你跑不过我我信了
+                    let ahead = l1.seq.wrapping_sub(self.rx_expect_seq) < 128;
+                    if ahead {
+                        self.send_nak(self.rx_expect_seq);
+                    }
                     return false;
                 }
 
-                if channel != Some(L2Channel::Network) {
-                    let immediate = u32::from(self.rx_cum_ack_index)
-                        >= (u32::from(self.effective_tx_win()) * 2 / 3)
-                        || matches!(channel, Some(L2Channel::Pb | L2Channel::Lyra));
-                    if immediate {
-                        self.stop_cum_ack_timer();
-                        self.send_ack(l1.seq);
-                    } else {
-                        self.rx_cum_ack_index = self.rx_cum_ack_index.saturating_add(1);
-                        self.rx_cum_ack_seq = l1.seq;
-                        self.start_cum_ack_timer(self.device_id.clone());
-                    }
+                let immediate = u32::from(self.rx_cum_ack_index)
+                    >= (u32::from(self.raw_tx_window_size()) * 2 / 3)
+                    || matches!(channel, Some(L2Channel::Pb | L2Channel::Lyra));
+                if immediate {
+                    self.stop_cum_ack_timer();
+                    self.send_ack(l1.seq);
+                } else {
+                    self.rx_cum_ack_index = self.rx_cum_ack_index.saturating_add(1);
+                    self.rx_cum_ack_seq = l1.seq;
+                    self.start_cum_ack_timer(self.device_id.clone());
                 }
 
                 self.rx_expect_seq = self.rx_expect_seq.wrapping_add(1);
@@ -560,8 +562,6 @@ impl SarController {
             );
         }
 
-        // 再发数据，受窗口限制
-        // 仅根据当前正在等待 ACK 的数量控制窗口，允许上层一次性排队更多数据。
         let mut data_batch = Vec::new();
         while self.tx_queue.len() < usize::from(self.effective_tx_win()) {
             let Some(qd) = self.command_pool.pop_data() else {

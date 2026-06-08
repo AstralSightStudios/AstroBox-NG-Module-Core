@@ -21,7 +21,7 @@ pub struct SarConfig {
 impl Default for SarConfig {
     fn default() -> Self {
         Self {
-            tx_win_overrun_allowance: 6,
+            tx_win_overrun_allowance: 0,
         }
     }
 }

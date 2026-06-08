@@ -17,6 +17,7 @@ pub enum L2Channel {
     Network = 7,     // TRANSPORT_CHANNEL_NETWORK
     Lyra = 8,        // TRANSPORT_CHANNEL_LYRA
     Research = 9,    // TRANSPORT_CHANNEL_RESEARCH
+    MultiModal = 10, // TRANSPORT_CHANNEL_MULTI_MODAL
 }
 
 impl TryFrom<u8> for L2Channel {
@@ -33,6 +34,7 @@ impl TryFrom<u8> for L2Channel {
             7 => Network,
             8 => Lyra,
             9 => Research,
+            10 => MultiModal,
             _ => return Err(L2Error::InvalidChannel(v)),
         })
     }
