@@ -12,22 +12,32 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     }
     let field = &data[offset..offset + field_len];
 
-    let start = field.iter().position(|&b| (b as char).is_ascii_digit())?;
-    let digits: String = field[start..]
-        .iter()
-        .take_while(|&&b| (b as char).is_ascii_digit())
-        .map(|&b| b as char)
-        .collect();
+    // 表盘 ID 可能是 9 位或 12 位的字母数字组合，前面可能存在非 ID 的填充字节。
+    // 扫描字段中的字母数字连续段，返回第一个长度合法的段作为 ID。
+    let mut i = 0;
+    while i < field.len() {
+        if !(field[i] as char).is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < field.len() && (field[i] as char).is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if VALID_WATCHFACE_ID_LENGTHS.contains(&(i - run_start)) {
+            return Some(field[run_start..i].iter().map(|&b| b as char).collect());
+        }
+    }
 
-    Some(digits)
+    None
 }
 
 pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Result<(), String> {
-    if !new_id.as_bytes().iter().all(u8::is_ascii_digit) {
-        return Err("Watchface ID must contain only digits".to_string());
+    if !new_id.as_bytes().iter().all(u8::is_ascii_alphanumeric) {
+        return Err("Watchface ID must contain only letters and digits".to_string());
     }
     if !VALID_WATCHFACE_ID_LENGTHS.contains(&new_id.len()) {
-        return Err("Watchface ID must be 9 or 12 digits".to_string());
+        return Err("Watchface ID must be 9 or 12 characters".to_string());
     }
 
     let offset = config.watchface_id_offset;
@@ -41,6 +51,7 @@ pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Re
     }
 
     let field = &data[offset..field_end];
+    // 原始资源文件中的 ID 始终为数字，借此定位 ID 在字段中的起始位置。
     let start = field
         .iter()
         .position(|&b| (b as char).is_ascii_digit())
@@ -48,7 +59,7 @@ pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Re
 
     if start + new_id.len() > field_len {
         return Err(format!(
-            "Watchface ID field is too short for {} digits",
+            "Watchface ID field is too short for {} characters",
             new_id.len()
         ));
     }
@@ -133,7 +144,43 @@ mod tests {
 
         let err = set_watchface_id(&mut data, &config, "123").unwrap_err();
 
-        assert_eq!(err, "Watchface ID must be 9 or 12 digits");
+        assert_eq!(err, "Watchface ID must be 9 or 12 characters");
+    }
+
+    #[test]
+    fn set_watchface_id_rejects_non_alphanumeric() {
+        let config = test_config();
+        let mut data = data_with_field(b"123456789");
+
+        let err = set_watchface_id(&mut data, &config, "abc-123-xyz").unwrap_err();
+
+        assert_eq!(err, "Watchface ID must contain only letters and digits");
+    }
+
+    #[test]
+    fn set_watchface_id_accepts_alphanumeric_9() {
+        let config = test_config();
+        let mut data = data_with_field(b"123456789");
+
+        set_watchface_id(&mut data, &config, "aB3dE6gH9").unwrap();
+
+        assert_eq!(
+            get_watchface_id(&data, &config),
+            Some("aB3dE6gH9".to_string())
+        );
+    }
+
+    #[test]
+    fn set_watchface_id_accepts_alphanumeric_12() {
+        let config = test_config();
+        let mut data = data_with_field(b"123456789");
+
+        set_watchface_id(&mut data, &config, "aB3dE6gH9jK2").unwrap();
+
+        assert_eq!(
+            get_watchface_id(&data, &config),
+            Some("aB3dE6gH9jK2".to_string())
+        );
     }
 }
 
