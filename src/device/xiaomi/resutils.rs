@@ -73,6 +73,99 @@ pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Re
     Ok(())
 }
 
+/// 小米可穿戴固件的最小可信大小（字节）。小于此值的文件不会被识别为固件。
+pub const MIN_FIRMWARE_SIZE: usize = 1_000_000;
+/// 从文件头部读取的最大字节数，用于固件类型判断。
+pub const MAX_FIRMWARE_SCAN_BYTES: usize = 200_000_000;
+
+const FACTORY_MAGIC: &[u8] = b"\x60ZZ~";
+const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
+
+/// 判断一段数据是否为小米可穿戴固件。
+///
+/// 同时覆盖两种形态：
+/// - 工厂裸镜像：以 `\x60ZZ~` 开头，32 字节版本号仅含数字与 `.`，含 `vela_ap.bin`
+///   且出现多于一个 `PK\x03\x04`；
+/// - OTA JAR：以 `PK\x03\x04` 开头，同时含 `vela_ap.bin`、`vela_bl2.bin`、`ota.sh`。
+///
+/// `full_size` 为文件原始大小，用于排除过小的文件。若传入 `None`，则使用 `data.len()`。
+pub fn is_xiaomi_firmware(data: &[u8], full_size: Option<usize>) -> bool {
+    let size = full_size.unwrap_or(data.len());
+    if size < MIN_FIRMWARE_SIZE {
+        return false;
+    }
+
+    let scan = &data[..data.len().min(MAX_FIRMWARE_SCAN_BYTES)];
+    is_miwear_factory(scan) || is_miwear_ota(scan)
+}
+
+/// 判断一段数据是否为小米可穿戴工厂裸镜像。
+///
+/// 匹配规则：
+/// - 以 `\x60ZZ~` 开头；
+/// - 紧跟 32 字节的版本号，仅由数字与 `.` 组成；
+/// - 数据中含 `vela_ap.bin`；
+/// - 数据中出现多于一个 ZIP 本地文件头 `PK\x03\x04`。
+fn is_miwear_factory(data: &[u8]) -> bool {
+    if data.len() < FACTORY_MAGIC.len() + 32 {
+        return false;
+    }
+    if &data[..FACTORY_MAGIC.len()] != FACTORY_MAGIC {
+        return false;
+    }
+
+    let ver_field = &data[FACTORY_MAGIC.len()..FACTORY_MAGIC.len() + 32];
+    let ver: Vec<u8> = ver_field
+        .iter()
+        .take_while(|&&b| b != 0)
+        .copied()
+        .collect();
+    if ver.is_empty() || !ver.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+
+    if !contains_subsequence(data, b"vela_ap.bin") {
+        return false;
+    }
+
+    count_subsequence(data, ZIP_MAGIC) > 1
+}
+
+/// 判断一段数据是否为小米可穿戴 OTA JAR。
+///
+/// 匹配规则：
+/// - 以 `PK\x03\x04` 开头；
+/// - 同时包含 `vela_ap.bin`、`vela_bl2.bin` 与 `ota.sh`。
+fn is_miwear_ota(data: &[u8]) -> bool {
+    if data.len() < ZIP_MAGIC.len() {
+        return false;
+    }
+    if &data[..ZIP_MAGIC.len()] != ZIP_MAGIC {
+        return false;
+    }
+
+    [b"vela_ap.bin" as &[u8], b"vela_bl2.bin", b"ota.sh"]
+        .iter()
+        .all(|needle| contains_subsequence(data, needle))
+}
+
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn count_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return haystack.len() + 1;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,9 +275,95 @@ mod tests {
             Some("aB3dE6gH9jK2".to_string())
         );
     }
+
+    fn firmware_sized(payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; MIN_FIRMWARE_SIZE];
+        let len = payload.len().min(data.len());
+        data[..len].copy_from_slice(&payload[..len]);
+        data
+    }
+
+    #[test]
+    fn recognizes_miwear_factory_raw() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x60ZZ~");
+        // 32-byte version field
+        let ver = b"1.0.0";
+        payload.extend_from_slice(ver);
+        payload.resize(payload.len() + (32 - ver.len()), 0);
+        // Two ZIP local headers + vela_ap.bin
+        payload.extend_from_slice(b"PK\x03\x04");
+        payload.extend_from_slice(b"vela_ap.bin");
+        payload.extend_from_slice(b"PK\x03\x04");
+
+        let data = firmware_sized(&payload);
+
+        assert!(is_xiaomi_firmware(&data, Some(data.len())));
+    }
+
+    #[test]
+    fn recognizes_miwear_ota_jar() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PK\x03\x04");
+        payload.extend_from_slice(b"vela_ap.bin");
+        payload.extend_from_slice(b"vela_bl2.bin");
+        payload.extend_from_slice(b"ota.sh");
+
+        let data = firmware_sized(&payload);
+
+        assert!(is_xiaomi_firmware(&data, Some(data.len())));
+    }
+
+    #[test]
+    fn rejects_too_small() {
+        let payload = b"PK\x03\x04vela_ap.binvela_bl2.binota.sh";
+        assert!(!is_xiaomi_firmware(payload, Some(payload.len())));
+    }
+
+    #[test]
+    fn rejects_factory_with_single_zip() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x60ZZ~");
+        payload.extend_from_slice(b"1.0.0");
+        payload.resize(payload.len() + (32 - 5), 0);
+        payload.extend_from_slice(b"PK\x03\x04");
+        payload.extend_from_slice(b"vela_ap.bin");
+
+        let data = firmware_sized(&payload);
+
+        assert!(!is_xiaomi_firmware(&data, Some(data.len())));
+    }
+
+    #[test]
+    fn rejects_factory_with_bad_version() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x60ZZ~");
+        payload.extend_from_slice(b"v1.0.0");
+        payload.resize(payload.len() + (32 - 6), 0);
+        payload.extend_from_slice(b"PK\x03\x04");
+        payload.extend_from_slice(b"vela_ap.bin");
+        payload.extend_from_slice(b"PK\x03\x04");
+
+        let data = firmware_sized(&payload);
+
+        assert!(!is_xiaomi_firmware(&data, Some(data.len())));
+    }
+
+    #[test]
+    fn get_file_type_recognizes_miwear_ota_as_firmware() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PK\x03\x04");
+        payload.extend_from_slice(b"vela_ap.bin");
+        payload.extend_from_slice(b"vela_bl2.bin");
+        payload.extend_from_slice(b"ota.sh");
+
+        let data = firmware_sized(&payload);
+
+        assert_eq!(get_file_type(&data), FileType::Firmware);
+    }
 }
 
-#[derive(Clone, Copy, Serialize_repr, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize_repr, PartialEq)]
 #[repr(u8)]
 pub enum FileType {
     Text,
@@ -200,6 +379,10 @@ pub enum FileType {
 pub fn get_file_type(data: &[u8]) -> FileType {
     if data.is_empty() {
         return FileType::Null;
+    }
+    // 0. 检查是不是小米可穿戴固件（OTA JAR 也 PK 开头，必须优先判断）
+    if is_xiaomi_firmware(data, Some(data.len())) {
+        return FileType::Firmware;
     }
     // 1. 检查是不是 ZIP 格式
     if data.len() >= 4 && &data[..4] == [0x50, 0x4B, 0x03, 0x04] {
