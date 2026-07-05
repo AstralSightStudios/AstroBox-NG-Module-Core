@@ -1,4 +1,5 @@
 use serde_repr::Serialize_repr;
+use std::io::Cursor;
 
 use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
 
@@ -86,7 +87,7 @@ const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 /// 同时覆盖两种形态：
 /// - 工厂裸镜像：以 `\x60ZZ~` 开头，32 字节版本号仅含数字与 `.`，含 `vela_ap.bin`
 ///   且出现多于一个 `PK\x03\x04`；
-/// - OTA JAR：以 `PK\x03\x04` 开头，同时含 `vela_ap.bin`、`vela_bl2.bin`、`ota.sh`。
+/// - OTA JAR：以 `PK\x03\x04` 开头，ZIP 条目中存在 `vela_ap.bin`。
 ///
 /// `full_size` 为文件原始大小，用于排除过小的文件。若传入 `None`，则使用 `data.len()`。
 pub fn is_xiaomi_firmware(data: &[u8], full_size: Option<usize>) -> bool {
@@ -96,7 +97,7 @@ pub fn is_xiaomi_firmware(data: &[u8], full_size: Option<usize>) -> bool {
     }
 
     let scan = &data[..data.len().min(MAX_FIRMWARE_SCAN_BYTES)];
-    is_miwear_factory(scan) || is_miwear_ota(scan)
+    is_miwear_factory(scan) || is_miwear_ota(data)
 }
 
 /// 判断一段数据是否为小米可穿戴工厂裸镜像。
@@ -131,11 +132,12 @@ fn is_miwear_factory(data: &[u8]) -> bool {
     count_subsequence(data, ZIP_MAGIC) > 1
 }
 
-/// 判断一段数据是否为小米可穿戴 OTA JAR。
+/// 判断一段数据是否为小米可穿戴 OTA ZIP/JAR。
 ///
 /// 匹配规则：
 /// - 以 `PK\x03\x04` 开头；
-/// - 同时包含 `vela_ap.bin`、`vela_bl2.bin` 与 `ota.sh`。
+/// - 能作为 ZIP 打开；
+/// - ZIP 条目中存在文件名为 `vela_ap.bin` 的文件。
 fn is_miwear_ota(data: &[u8]) -> bool {
     if data.len() < ZIP_MAGIC.len() {
         return false;
@@ -144,9 +146,18 @@ fn is_miwear_ota(data: &[u8]) -> bool {
         return false;
     }
 
-    [b"vela_ap.bin" as &[u8], b"vela_bl2.bin", b"ota.sh"]
-        .iter()
-        .all(|needle| contains_subsequence(data, needle))
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(data)) else {
+        return false;
+    };
+
+    (0..archive.len()).any(|index| {
+        archive.by_index(index).is_ok_and(|file| {
+            file.name()
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "vela_ap.bin")
+        })
+    })
 }
 
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
@@ -169,6 +180,7 @@ fn count_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
 
     fn test_config() -> ResConfig {
         ResConfig {
@@ -283,6 +295,16 @@ mod tests {
         data
     }
 
+    fn zip_with_entry(name: &str, data_len: usize) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&vec![0u8; data_len]).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn recognizes_miwear_factory_raw() {
         let mut payload = Vec::new();
@@ -303,15 +325,9 @@ mod tests {
 
     #[test]
     fn recognizes_miwear_ota_jar() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"PK\x03\x04");
-        payload.extend_from_slice(b"vela_ap.bin");
-        payload.extend_from_slice(b"vela_bl2.bin");
-        payload.extend_from_slice(b"ota.sh");
+        let data = zip_with_entry("vela_ap.bin", 1);
 
-        let data = firmware_sized(&payload);
-
-        assert!(is_xiaomi_firmware(&data, Some(data.len())));
+        assert!(is_xiaomi_firmware(&data, Some(MIN_FIRMWARE_SIZE)));
     }
 
     #[test]
@@ -351,13 +367,14 @@ mod tests {
 
     #[test]
     fn get_file_type_recognizes_miwear_ota_as_firmware() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"PK\x03\x04");
-        payload.extend_from_slice(b"vela_ap.bin");
-        payload.extend_from_slice(b"vela_bl2.bin");
-        payload.extend_from_slice(b"ota.sh");
+        let data = zip_with_entry("vela_ap.bin", MIN_FIRMWARE_SIZE);
 
-        let data = firmware_sized(&payload);
+        assert_eq!(get_file_type(&data), FileType::Firmware);
+    }
+
+    #[test]
+    fn get_file_type_recognizes_zip_with_vela_ap_entry_as_firmware() {
+        let data = zip_with_entry("firmware/vela_ap.bin", MIN_FIRMWARE_SIZE);
 
         assert_eq!(get_file_type(&data), FileType::Firmware);
     }
