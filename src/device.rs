@@ -161,6 +161,7 @@ where
                 #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
                 let network_config = device_config.network.clone();
                 let authkey_for_component = authkey.clone();
+                let install_config = device_config.install.clone();
                 let dev = XiaomiDevice::new(
                     tk_handle_clone.clone(),
                     name_for_entity.clone(),
@@ -189,7 +190,7 @@ where
                     AuthComponent::new(authkey_for_component),
                     AuthSystem::new(device_id.clone()),
                     InstallComponent::new(),
-                    InstallSystem::new(device_id.clone()),
+                    InstallSystem::new(device_id.clone(), install_config),
                     MassComponent::new(),
                     MassSystem::new(device_id.clone()),
                     MediaComponent::default(),
