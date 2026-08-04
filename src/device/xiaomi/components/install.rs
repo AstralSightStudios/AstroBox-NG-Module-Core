@@ -8,13 +8,13 @@ use anyhow::{Context, Result};
 use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
-use crate::asyncrt::universal_block_on;
+use crate::asyncrt::{Duration, timeout, universal_block_on};
 use crate::device::xiaomi::components::{
     info::InfoSystem,
     mass::{SendMassCallbackData, send_file_for_owner},
     resource::ResourceSystem,
 };
-use crate::device::xiaomi::config::ResConfig;
+use crate::device::xiaomi::config::{InstallConfig, ResConfig};
 use crate::device::xiaomi::packet::{self, mass::MassDataType};
 use crate::device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet};
 use crate::device::xiaomi::{XiaomiDevice, resutils};
@@ -30,6 +30,7 @@ type InstallFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 #[derive(Component)]
 pub struct InstallSystem {
     owner_id: String,
+    config: InstallConfig,
 }
 
 struct InstallWaiters {
@@ -46,14 +47,14 @@ enum InstallResultEvent {
 
 impl Default for InstallSystem {
     fn default() -> Self {
-        Self::new(String::new())
+        Self::new(String::new(), InstallConfig::default())
     }
 }
 
 impl InstallSystem {
-    pub fn new(owner_id: String) -> Self {
+    pub fn new(owner_id: String, config: InstallConfig) -> Self {
         register_xiaomi_system_ext_on_l2packet::<Self>();
-        Self { owner_id }
+        Self { owner_id, config }
     }
 
     pub fn send_install_request(
@@ -193,11 +194,14 @@ impl InstallSystem {
 
         let owner_for_future = owner.clone();
         let progress_cb_future = progress_cb.clone();
+        let prepare_timeout = Duration::from_secs(self.config.prepare_timeout_secs);
+        let result_timeout = Duration::from_secs(self.config.result_timeout_secs);
 
         let fut = async move {
             let result = async {
-                let prepare_status = prepare_rx
+                let prepare_status = timeout(prepare_timeout, prepare_rx)
                     .await
+                    .map_err(|_| anyhow_site!("timed out waiting for install prepare response"))?
                     .map_err(|_| anyhow_site!("prepare response channel closed unexpectedly"))?;
 
                 let prepare_enum = protocol::PrepareStatus::try_from(prepare_status)
@@ -214,16 +218,19 @@ impl InstallSystem {
                 .context("failed to send MASS payload")?;
 
                 if let Some(result_rx) = result_rx_opt {
-                    let event = match result_rx.await {
-                        Ok(event) => event,
-                        Err(_) if matches!(r#type, MassDataType::Firmare) => {
+                    let event = match timeout(result_timeout, result_rx).await {
+                        Ok(Ok(event)) => event,
+                        Ok(Err(_)) if matches!(r#type, MassDataType::Firmare) => {
                             log::info!(
                                 "[Install] firmware payload sent; install result message missing because the device may be rebooting"
                             );
                             return Ok(());
                         }
-                        Err(_) => {
+                        Ok(Err(_)) => {
                             return Err(anyhow_site!("install result message missing"));
+                        }
+                        Err(_) => {
+                            return Err(anyhow_site!("timed out waiting for install result"));
                         }
                     };
                     handle_install_result(r#type, event)?;

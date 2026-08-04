@@ -56,6 +56,21 @@ impl Default for MassConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct InstallConfig {
+    pub prepare_timeout_secs: u64,
+    pub result_timeout_secs: u64,
+}
+
+impl Default for InstallConfig {
+    fn default() -> Self {
+        Self {
+            prepare_timeout_secs: 30,
+            result_timeout_secs: 120,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ResConfig {
     pub watchface_id_offset: usize,
     pub watchface_id_field_len: usize,
@@ -75,6 +90,7 @@ pub struct XiaomiDeviceConfig {
     pub transport: TransportConfig,
     pub sar: SarConfig,
     pub mass: MassConfig,
+    pub install: InstallConfig,
     pub res: ResConfig,
     pub network: NetworkConfig,
 }
@@ -85,6 +101,7 @@ impl Default for XiaomiDeviceConfig {
             transport: TransportConfig::default(),
             sar: SarConfig::default(),
             mass: MassConfig::default(),
+            install: InstallConfig::default(),
             res: ResConfig::default(),
             network: NetworkConfig::default(),
         }
