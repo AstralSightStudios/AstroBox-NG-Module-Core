@@ -1,5 +1,5 @@
 use serde_repr::Serialize_repr;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
 
@@ -81,13 +81,15 @@ pub const MAX_FIRMWARE_SCAN_BYTES: usize = 200_000_000;
 
 const FACTORY_MAGIC: &[u8] = b"\x60ZZ~";
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
+const DDELTA_MAGIC: &[u8] = b"DDELTA50";
 
 /// 判断一段数据是否为小米可穿戴固件。
 ///
 /// 同时覆盖两种形态：
 /// - 工厂裸镜像：以 `\x60ZZ~` 开头，32 字节版本号仅含数字与 `.`，含 `vela_ap.bin`
 ///   且出现多于一个 `PK\x03\x04`；
-/// - OTA JAR：以 `PK\x03\x04` 开头，ZIP 条目中存在 `vela_ap.bin`。
+/// - OTA JAR：以 `PK\x03\x04` 开头，ZIP 条目中存在全量 `vela_ap.bin`，或存在
+///   带 `DDELTA50` 魔数的增量 `vela_ap.patch` 及 OTA 运行文件。
 ///
 /// `full_size` 为文件原始大小，用于排除过小的文件。若传入 `None`，则使用 `data.len()`。
 pub fn is_xiaomi_firmware(data: &[u8], full_size: Option<usize>) -> bool {
@@ -116,11 +118,7 @@ fn is_miwear_factory(data: &[u8]) -> bool {
     }
 
     let ver_field = &data[FACTORY_MAGIC.len()..FACTORY_MAGIC.len() + 32];
-    let ver: Vec<u8> = ver_field
-        .iter()
-        .take_while(|&&b| b != 0)
-        .copied()
-        .collect();
+    let ver: Vec<u8> = ver_field.iter().take_while(|&&b| b != 0).copied().collect();
     if ver.is_empty() || !ver.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
         return false;
     }
@@ -137,7 +135,8 @@ fn is_miwear_factory(data: &[u8]) -> bool {
 /// 匹配规则：
 /// - 以 `PK\x03\x04` 开头；
 /// - 能作为 ZIP 打开；
-/// - ZIP 条目中存在文件名为 `vela_ap.bin` 的文件。
+/// - ZIP 条目中存在文件名为 `vela_ap.bin` 的全量镜像；或
+/// - 同时存在 `ota.sh`、`vela_ota.bin`，且 `vela_ap.patch` 以 `DDELTA50` 开头。
 fn is_miwear_ota(data: &[u8]) -> bool {
     if data.len() < ZIP_MAGIC.len() {
         return false;
@@ -150,21 +149,41 @@ fn is_miwear_ota(data: &[u8]) -> bool {
         return false;
     };
 
-    (0..archive.len()).any(|index| {
-        archive.by_index(index).is_ok_and(|file| {
-            file.name()
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name == "vela_ap.bin")
-        })
-    })
+    let mut has_ota_script = false;
+    let mut has_ota_updater = false;
+    let mut has_incremental_ap_patch = false;
+
+    for index in 0..archive.len() {
+        let Ok(mut file) = archive.by_index(index) else {
+            continue;
+        };
+        let Some(name) = file.name().rsplit('/').next() else {
+            continue;
+        };
+
+        match name {
+            "vela_ap.bin" => return true,
+            "ota.sh" => has_ota_script = true,
+            "vela_ota.bin" => has_ota_updater = true,
+            "vela_ap.patch" => {
+                let mut magic = [0u8; DDELTA_MAGIC.len()];
+                has_incremental_ap_patch |=
+                    file.read_exact(&mut magic).is_ok() && magic.as_slice() == DDELTA_MAGIC;
+            }
+            _ => {}
+        }
+    }
+
+    has_ota_script && has_ota_updater && has_incremental_ap_patch
 }
 
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn count_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
@@ -295,14 +314,34 @@ mod tests {
         data
     }
 
-    fn zip_with_entry(name: &str, data_len: usize) -> Vec<u8> {
+    fn zip_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(cursor);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        writer.start_file(name, options).unwrap();
-        writer.write_all(&vec![0u8; data_len]).unwrap();
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
         writer.finish().unwrap().into_inner()
+    }
+
+    fn zip_with_entry(name: &str, data_len: usize) -> Vec<u8> {
+        zip_with_entries(&[(name, &vec![0u8; data_len])])
+    }
+
+    fn zip_with_unreadable_first_entry() -> Vec<u8> {
+        let mut data = zip_with_entries(&[
+            ("unsupported.bin", b"not firmware"),
+            ("vela_ap.bin", &vec![0u8; MIN_FIRMWARE_SIZE]),
+        ]);
+        data[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let central_header = data
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        data[central_header + 8..central_header + 10].copy_from_slice(&1u16.to_le_bytes());
+        data
     }
 
     #[test]
@@ -377,6 +416,53 @@ mod tests {
         let data = zip_with_entry("firmware/vela_ap.bin", MIN_FIRMWARE_SIZE);
 
         assert_eq!(get_file_type(&data), FileType::Firmware);
+    }
+
+    #[test]
+    fn get_file_type_skips_unreadable_entries_before_full_firmware_image() {
+        let data = zip_with_unreadable_first_entry();
+
+        assert_eq!(get_file_type(&data), FileType::Firmware);
+    }
+
+    #[test]
+    fn get_file_type_recognizes_miwear_incremental_ota_as_firmware() {
+        let mut patch = b"DDELTA50".to_vec();
+        patch.resize(MIN_FIRMWARE_SIZE, 0);
+        let data = zip_with_entries(&[
+            (
+                "ota.sh",
+                b"ddelta_apply /dev/ap /data/ota_tmp/ /ota/vela_ap.patch",
+            ),
+            ("vela_ap.patch", &patch),
+            ("vela_ota.bin", b"ota updater"),
+        ]);
+
+        assert_eq!(get_file_type(&data), FileType::Firmware);
+    }
+
+    #[test]
+    fn get_file_type_rejects_incremental_ota_with_invalid_patch_magic() {
+        let patch = vec![0u8; MIN_FIRMWARE_SIZE];
+        let data = zip_with_entries(&[
+            (
+                "ota.sh",
+                b"ddelta_apply /dev/ap /data/ota_tmp/ /ota/vela_ap.patch",
+            ),
+            ("vela_ap.patch", &patch),
+            ("vela_ota.bin", b"ota updater"),
+        ]);
+
+        assert_eq!(get_file_type(&data), FileType::Zip);
+    }
+
+    #[test]
+    fn get_file_type_rejects_ddelta_zip_without_miwear_ota_files() {
+        let mut patch = b"DDELTA50".to_vec();
+        patch.resize(MIN_FIRMWARE_SIZE, 0);
+        let data = zip_with_entries(&[("vela_ap.patch", &patch)]);
+
+        assert_eq!(get_file_type(&data), FileType::Zip);
     }
 }
 
