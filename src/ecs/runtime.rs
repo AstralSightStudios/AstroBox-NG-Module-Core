@@ -44,7 +44,11 @@ impl Runtime {
 
     pub fn spawn_device<B: Bundle>(&mut self, id: String, bundle: B) -> Entity {
         let entity = self.world.spawn(bundle).id();
-        self.devices.map.insert(id, entity);
+        if let Some(previous) = self.devices.map.insert(id, entity) {
+            if previous != entity {
+                let _ = self.world.despawn(previous);
+            }
+        }
         entity
     }
 
