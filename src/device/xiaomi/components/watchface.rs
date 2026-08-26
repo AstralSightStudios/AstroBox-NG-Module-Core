@@ -2,6 +2,7 @@ use pb::xiaomi::protocol::{self, WearPacket};
 use tokio::sync::oneshot;
 
 use crate::{
+    anyhow_site,
     device::xiaomi::system::{L2PbExt, register_xiaomi_system_ext_on_l2packet},
     ecs::Component,
 };
@@ -11,6 +12,8 @@ use super::shared::{HasOwnerId, RequestSlot, SystemRequestExt};
 #[derive(Component)]
 pub struct WatchfaceSystem {
     owner_id: String,
+    set_current_wait: RequestSlot<()>,
+    uninstall_wait: RequestSlot<()>,
     edit_wait: RequestSlot<protocol::EditResponse>,
     bg_image_wait: RequestSlot<protocol::BgImageResult>,
     font_wait: RequestSlot<protocol::FontResult>,
@@ -28,6 +31,8 @@ impl WatchfaceSystem {
         register_xiaomi_system_ext_on_l2packet::<Self>();
         Self {
             owner_id,
+            set_current_wait: RequestSlot::new(),
+            uninstall_wait: RequestSlot::new(),
             edit_wait: RequestSlot::new(),
             bg_image_wait: RequestSlot::new(),
             font_wait: RequestSlot::new(),
@@ -35,14 +40,44 @@ impl WatchfaceSystem {
         }
     }
 
-    pub fn set_watchface(&mut self, watchface_id: &str) {
-        let packet = build_watchface_set(watchface_id);
-        self.enqueue_request(packet);
+    /// Fire-and-forget variant retained for callers that do not need the
+    /// device acknowledgement.  Xiaomi's WatchFace protocol does expose a
+    /// `Success` response; use `request_set_watchface` when completion matters.
+    pub fn set_watchface(&mut self, watchface_id: &str) -> anyhow::Result<()> {
+        self.enqueue_request(build_watchface_set(watchface_id))
     }
 
-    pub fn uninstall_watchface(&mut self, watchface_id: &str) {
-        let packet = build_watchface_uninstall(watchface_id);
-        self.enqueue_request(packet);
+    /// Fire-and-forget variant retained for callers that do not need the
+    /// device acknowledgement.  Use `request_uninstall_watchface` when
+    /// completion matters.
+    pub fn uninstall_watchface(&mut self, watchface_id: &str) -> anyhow::Result<()> {
+        self.enqueue_request(build_watchface_uninstall(watchface_id))
+    }
+
+    pub fn request_set_watchface(
+        &mut self,
+        watchface_id: &str,
+    ) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (rx, should_enqueue) = self.set_current_wait.prepare();
+        if should_enqueue {
+            if let Err(err) = self.enqueue_request(build_watchface_set(watchface_id)) {
+                self.set_current_wait.fail(err);
+            }
+        }
+        rx
+    }
+
+    pub fn request_uninstall_watchface(
+        &mut self,
+        watchface_id: &str,
+    ) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (rx, should_enqueue) = self.uninstall_wait.prepare();
+        if should_enqueue {
+            if let Err(err) = self.enqueue_request(build_watchface_uninstall(watchface_id)) {
+                self.uninstall_wait.fail(err);
+            }
+        }
+        rx
     }
 
     pub fn request_edit(
@@ -50,7 +85,9 @@ impl WatchfaceSystem {
         request: protocol::EditRequest,
     ) -> oneshot::Receiver<anyhow::Result<protocol::EditResponse>> {
         let (rx, _should_enqueue) = self.edit_wait.prepare();
-        self.enqueue_request(build_watchface_edit(request));
+        if let Err(err) = self.enqueue_request(build_watchface_edit(request)) {
+            self.edit_wait.fail(err);
+        }
         rx
     }
 
@@ -69,20 +106,53 @@ impl WatchfaceSystem {
     pub fn request_support_data(&mut self) -> oneshot::Receiver<anyhow::Result<Vec<i32>>> {
         let (rx, should_enqueue) = self.support_data_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(build_watchface_get_support_data());
+            if let Err(err) = self.enqueue_request(build_watchface_get_support_data()) {
+                self.support_data_wait.fail(err);
+            }
         }
         rx
     }
 
-    fn enqueue_request(&mut self, packet: protocol::WearPacket) {
-        self.enqueue_pb_request(packet, "WatchfaceSystem::enqueue_request");
+    fn enqueue_request(&mut self, packet: protocol::WearPacket) -> anyhow::Result<()> {
+        self.try_enqueue_pb_request(packet, "WatchfaceSystem::enqueue_request")
+    }
+
+    fn handle_set_response(&mut self, success: bool) {
+        if success {
+            self.set_current_wait.fulfill(());
+        } else {
+            self.set_current_wait.fail(anyhow_site!(
+                "Xiaomi watch rejected set-current watchface request"
+            ));
+        }
+    }
+
+    fn handle_uninstall_response(&mut self, success: bool) {
+        if success {
+            self.uninstall_wait.fulfill(());
+        } else {
+            self.uninstall_wait.fail(anyhow_site!(
+                "Xiaomi watch rejected uninstall watchface request"
+            ));
+        }
     }
 }
 
 impl L2PbExt for WatchfaceSystem {
     fn on_pb_packet(&mut self, payload: WearPacket) {
+        let packet_id = payload.id;
         if let Some(protocol::wear_packet::Payload::WatchFace(msg)) = payload.payload {
             match msg.payload {
+                Some(protocol::watch_face::Payload::Success(success))
+                    if packet_id == protocol::watch_face::WatchFaceId::SetWatchFace as u32 =>
+                {
+                    self.handle_set_response(success);
+                }
+                Some(protocol::watch_face::Payload::Success(success))
+                    if packet_id == protocol::watch_face::WatchFaceId::RemoveWatchFace as u32 =>
+                {
+                    self.handle_uninstall_response(success);
+                }
                 Some(protocol::watch_face::Payload::EditResponse(resp)) => {
                     log::debug!(
                         "[Watchface] edit response: {:?}",
@@ -179,5 +249,49 @@ fn build_watchface_get_support_data() -> protocol::WearPacket {
         r#type: protocol::wear_packet::Type::WatchFace as i32,
         id: protocol::watch_face::WatchFaceId::GetSupportData as u32,
         payload: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_ack_resolves_set_waiter() {
+        let mut system = WatchfaceSystem::new(String::new());
+        let (mut rx, should_enqueue) = system.set_current_wait.prepare();
+        assert!(should_enqueue);
+
+        system.on_pb_packet(WearPacket {
+            r#type: protocol::wear_packet::Type::WatchFace as i32,
+            id: protocol::watch_face::WatchFaceId::SetWatchFace as u32,
+            payload: Some(protocol::wear_packet::Payload::WatchFace(
+                protocol::WatchFace {
+                    payload: Some(protocol::watch_face::Payload::Success(true)),
+                },
+            )),
+        });
+
+        assert!(matches!(rx.try_recv().unwrap(), Ok(())));
+    }
+
+    #[test]
+    fn false_success_ack_fails_uninstall_waiter() {
+        let mut system = WatchfaceSystem::new(String::new());
+        let (mut rx, should_enqueue) = system.uninstall_wait.prepare();
+        assert!(should_enqueue);
+
+        system.on_pb_packet(WearPacket {
+            r#type: protocol::wear_packet::Type::WatchFace as i32,
+            id: protocol::watch_face::WatchFaceId::RemoveWatchFace as u32,
+            payload: Some(protocol::wear_packet::Payload::WatchFace(
+                protocol::WatchFace {
+                    payload: Some(protocol::watch_face::Payload::Success(false)),
+                },
+            )),
+        });
+
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(err.to_string().contains("rejected uninstall watchface"));
     }
 }

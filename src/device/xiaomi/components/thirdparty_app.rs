@@ -30,37 +30,49 @@ impl ThirdpartyAppSystem {
         Self { owner_id }
     }
 
-    pub fn send_phone_message(&mut self, app: &AppInfo, payload: Vec<u8>) {
+    /// Send a third-party app command without waiting for a device ACK.  The
+    /// transport enqueue result is still returned to the caller.
+    pub fn send_phone_message(&mut self, app: &AppInfo, payload: Vec<u8>) -> anyhow::Result<()> {
         let packet = build_thirdparty_app_msg_content(app, payload);
-        self.enqueue_request(packet);
+        self.enqueue_request(packet)
     }
 
-    pub fn launch_app(&mut self, app: &AppInfo, page: &str) {
+    /// Launch is fire-and-forget because this Xiaomi command has no confirmed
+    /// response payload.
+    pub fn launch_app(&mut self, app: &AppInfo, page: &str) -> anyhow::Result<()> {
         let packet = build_thirdparty_app_launch(app, page);
-        self.enqueue_request(packet);
+        self.enqueue_request(packet)
     }
 
-    pub fn uninstall_app(&mut self, app: &AppInfo) {
+    /// Uninstall is fire-and-forget because this Xiaomi command has no
+    /// confirmed response payload.
+    pub fn uninstall_app(&mut self, app: &AppInfo) -> anyhow::Result<()> {
         let packet = build_thirdparty_app_uninstall(app);
-        self.enqueue_request(packet);
+        self.enqueue_request(packet)
     }
 
-    pub fn sync_status(&mut self, app: &AppInfo, status: protocol::phone_app_status::Status) {
+    pub fn sync_status(
+        &mut self,
+        app: &AppInfo,
+        status: protocol::phone_app_status::Status,
+    ) -> anyhow::Result<()> {
         let packet = build_thirdparty_app_sync_status(to_basic_info(app), status);
-        self.enqueue_request(packet);
+        self.enqueue_request(packet)
     }
 
-    fn enqueue_request(&mut self, packet: protocol::WearPacket) {
-        self.enqueue_pb_request(packet, "ThirdpartyAppSystem::enqueue_request");
+    fn enqueue_request(&mut self, packet: protocol::WearPacket) -> anyhow::Result<()> {
+        self.try_enqueue_pb_request(packet, "ThirdpartyAppSystem::enqueue_request")
     }
 
     fn handle_basic_info(&mut self, basic_info: protocol::BasicInfo) {
         let info_for_sync = basic_info.clone();
 
-        self.enqueue_request(build_thirdparty_app_sync_status(
+        if let Err(err) = self.enqueue_request(build_thirdparty_app_sync_status(
             info_for_sync,
             protocol::phone_app_status::Status::Connected,
-        ));
+        )) {
+            log::warn!("[ThirdpartyAppSystem] failed to enqueue sync status: {err:#}");
+        }
     }
 
     fn handle_message_content(&mut self, message: protocol::MessageContent) {

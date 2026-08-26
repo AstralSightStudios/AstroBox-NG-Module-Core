@@ -1,5 +1,7 @@
 use crate::{
-    anyhow_site, bail_site,
+    anyhow_site,
+    asyncrt::{Duration, timeout},
+    bail_site,
     device::{
         Device, DeviceKind,
         vivo::{
@@ -22,21 +24,24 @@ use crate::{
 use pb::xiaomi::protocol;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::oneshot;
+
+const WATCHFACE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn set_current(addr: String, watchface_id: String) -> anyhow::Result<()> {
     match device_kind(&addr).await? {
         DeviceKind::Xiaomi => {
-            with_xiaomi_watchface_system(addr, move |sys| {
-                sys.set_watchface(&watchface_id);
-                Ok(())
+            let rx = with_xiaomi_watchface_system(addr, move |sys| {
+                Ok(sys.request_set_watchface(&watchface_id))
             })
-            .await?
+            .await?;
+            await_watchface_response(rx, "Xiaomi set-current watchface response not received")
+                .await?;
         }
         DeviceKind::Vivo => {
             let rx = with_vivo_watchface_system(addr, move |sys| sys.set_watchface(&watchface_id))
                 .await?;
-            rx.await
-                .map_err(|_| anyhow_site!("Vivo set-current dial response not received"))??;
+            await_watchface_response(rx, "Vivo set-current dial response not received").await?;
         }
     }
     Ok(())
@@ -45,18 +50,18 @@ pub async fn set_current(addr: String, watchface_id: String) -> anyhow::Result<(
 pub async fn uninstall(addr: String, watchface_id: String) -> anyhow::Result<()> {
     match device_kind(&addr).await? {
         DeviceKind::Xiaomi => {
-            with_xiaomi_watchface_system(addr, move |sys| {
-                sys.uninstall_watchface(&watchface_id);
-                Ok(())
+            let rx = with_xiaomi_watchface_system(addr, move |sys| {
+                Ok(sys.request_uninstall_watchface(&watchface_id))
             })
-            .await?
+            .await?;
+            await_watchface_response(rx, "Xiaomi uninstall watchface response not received")
+                .await?;
         }
         DeviceKind::Vivo => {
             let rx =
                 with_vivo_watchface_system(addr, move |sys| sys.uninstall_watchface(&watchface_id))
                     .await?;
-            rx.await
-                .map_err(|_| anyhow_site!("Vivo uninstall dial response not received"))??;
+            await_watchface_response(rx, "Vivo uninstall dial response not received").await?;
         }
     }
     Ok(())
@@ -134,15 +139,33 @@ pub async fn install_local_zip_vivo(
         sys.send_install_request(dial_id, install_file_id_field, false, false, String::new())
     })
     .await?;
-    let install_result = rx
-        .await
-        .map_err(|_| anyhow_site!("Vivo dial install response not received"))??;
+    let install_result =
+        await_watchface_response(rx, "Vivo dial install response not received").await?;
     log::info!(
         "[VivoDevice.Watchface] dial install result dial_id={} order={}",
         install_result.dial_id,
         install_result.order
     );
     Ok(())
+}
+
+async fn await_watchface_response<T>(
+    rx: oneshot::Receiver<anyhow::Result<T>>,
+    missing_msg: &'static str,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+{
+    match timeout(WATCHFACE_RESPONSE_TIMEOUT, rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => Err(anyhow_site!(
+            "{missing_msg}: response channel closed: {err:?}"
+        )),
+        Err(_) => Err(anyhow_site!(
+            "{missing_msg}: timed out after {} seconds",
+            WATCHFACE_RESPONSE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 async fn device_kind(addr: &str) -> anyhow::Result<DeviceKind> {

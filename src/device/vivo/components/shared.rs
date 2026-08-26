@@ -22,6 +22,12 @@ impl<T> RequestSlot<T> {
     pub fn prepare(&mut self) -> (oneshot::Receiver<Result<T>>, bool) {
         let (tx, rx) = oneshot::channel();
         let mut waiters = self.waiters.lock();
+
+        // A cancelled caller drops its receiver, but the sender stays in this
+        // slot until it is explicitly fulfilled or failed.  Do not let such a
+        // closed sender make the next request look like a request already in
+        // flight.
+        waiters.retain(|waiter| !waiter.is_closed());
         let should_enqueue = waiters.is_empty();
         waiters.push(tx);
         (rx, should_enqueue)
@@ -92,3 +98,21 @@ pub trait VivoRequestExt: HasVivoRequestContext {
 }
 
 impl<T> VivoRequestExt for T where T: HasVivoRequestContext {}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestSlot;
+
+    #[test]
+    fn dropped_receiver_does_not_block_next_request() {
+        let mut slot = RequestSlot::<u32>::new();
+        let (first, should_enqueue) = slot.prepare();
+        assert!(should_enqueue);
+        drop(first);
+
+        let (mut second, should_enqueue) = slot.prepare();
+        assert!(should_enqueue);
+        slot.fulfill(42);
+        assert_eq!(second.try_recv().unwrap().unwrap(), 42);
+    }
+}

@@ -2,6 +2,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     anyhow_site,
+    asyncrt::{Duration, timeout},
     device::{
         Device, DeviceKind, vivo::components::resource::ResourceSystem as VivoResourceSystem,
         xiaomi::components::resource::ResourceSystem as XiaomiResourceSystem,
@@ -95,9 +96,20 @@ where
     .await
 }
 
+const RESOURCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn await_slot<T>(
     rx: oneshot::Receiver<anyhow::Result<T>>,
     missing_msg: &'static str,
 ) -> anyhow::Result<T> {
-    rx.await.map_err(|_| anyhow_site!("{missing_msg}"))?
+    match timeout(RESOURCE_RESPONSE_TIMEOUT, rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => Err(anyhow_site!(
+            "{missing_msg}: response channel closed: {err:?}"
+        )),
+        Err(_) => Err(anyhow_site!(
+            "{missing_msg}: timed out after {} seconds",
+            RESOURCE_RESPONSE_TIMEOUT.as_secs()
+        )),
+    }
 }

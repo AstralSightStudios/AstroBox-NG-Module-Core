@@ -26,8 +26,7 @@ pub async fn send_message(
         DeviceKind::Xiaomi => {
             let info = xiaomi_app_info(&addr, &package_name).await?;
             with_xiaomi_thirdparty_app_system(addr, move |sys| {
-                sys.send_phone_message(&info, payload);
-                Ok(())
+                sys.send_phone_message(&info, payload)
             })
             .await
         }
@@ -47,11 +46,7 @@ pub async fn launch(addr: String, package_name: String, page: String) -> anyhow:
     match device_kind(&addr).await? {
         DeviceKind::Xiaomi => {
             let info = xiaomi_app_info(&addr, &package_name).await?;
-            with_xiaomi_thirdparty_app_system(addr, move |sys| {
-                sys.launch_app(&info, &page);
-                Ok(())
-            })
-            .await
+            with_xiaomi_thirdparty_app_system(addr, move |sys| sys.launch_app(&info, &page)).await
         }
         DeviceKind::Vivo => {
             bail!(
@@ -65,11 +60,7 @@ pub async fn uninstall(addr: String, package_name: String) -> anyhow::Result<()>
     match device_kind(&addr).await? {
         DeviceKind::Xiaomi => {
             let info = xiaomi_app_info(&addr, &package_name).await?;
-            with_xiaomi_thirdparty_app_system(addr, move |sys| {
-                sys.uninstall_app(&info);
-                Ok(())
-            })
-            .await
+            with_xiaomi_thirdparty_app_system(addr, move |sys| sys.uninstall_app(&info)).await
         }
         DeviceKind::Vivo => {
             let rx =

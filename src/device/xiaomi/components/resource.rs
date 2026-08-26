@@ -55,7 +55,9 @@ impl ResourceSystem {
     ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::WatchFaceItem>>> {
         let (rx, should_enqueue) = self.watchface_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(build_watchface_get_installed());
+            if let Err(err) = self.enqueue_request(build_watchface_get_installed()) {
+                self.watchface_wait.fail(err);
+            }
         }
         rx
     }
@@ -65,13 +67,15 @@ impl ResourceSystem {
     ) -> oneshot::Receiver<anyhow::Result<Vec<protocol::AppItem>>> {
         let (rx, should_enqueue) = self.quick_app_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(build_thirdparty_app_get_installed());
+            if let Err(err) = self.enqueue_request(build_thirdparty_app_get_installed()) {
+                self.quick_app_wait.fail(err);
+            }
         }
         rx
     }
 
-    fn enqueue_request(&mut self, request: protocol::WearPacket) {
-        self.enqueue_pb_request(request, "ResourceSystem::enqueue_request");
+    fn enqueue_request(&mut self, request: protocol::WearPacket) -> anyhow::Result<()> {
+        self.try_enqueue_pb_request(request, "ResourceSystem::enqueue_request")
     }
 }
 
