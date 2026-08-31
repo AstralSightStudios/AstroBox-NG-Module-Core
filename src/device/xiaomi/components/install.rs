@@ -134,8 +134,7 @@ impl InstallSystem {
                         |dev| dev.config.res.clone(),
                     )
                     .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
-                    let id = resutils::get_watchface_id(&file_data, &res_config)
-                        .context("invalid watchface id")?;
+                    let id = resolve_watchface_install_id(&file_data, &res_config, watchface_id)?;
                     build_watchface_install_request(&id, file_data.len())
                 }
                 MassDataType::Firmare => build_firmware_install_request(
@@ -456,6 +455,17 @@ impl InstallComponent {
     }
 }
 
+fn resolve_watchface_install_id(
+    data: &[u8],
+    config: &ResConfig,
+    explicit_id: Option<&str>,
+) -> Result<String> {
+    match explicit_id {
+        Some(id) => Ok(id.to_owned()),
+        None => resutils::get_watchface_id(data, config).context("invalid watchface id"),
+    }
+}
+
 pub fn build_watchface_install_request(id: &str, package_size: usize) -> protocol::WearPacket {
     let prepare_info = protocol::PrepareInfo {
         id: id.to_string(),
@@ -540,5 +550,24 @@ pub fn build_notification_icon_request(package_name: &str) -> protocol::WearPack
         r#type: protocol::wear_packet::Type::Notification as i32,
         id: protocol::notification::NotificationId::PrepareAppIcon as u32,
         payload: Some(protocol::wear_packet::Payload::Notification(pkt_payload)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_watchface_install_id_is_used_verbatim() {
+        let config = ResConfig {
+            watchface_id_offset: 10,
+            watchface_id_field_len: 24,
+        };
+        let id = "任意/id 🔥";
+
+        assert_eq!(
+            resolve_watchface_install_id(&[], &config, Some(id)).unwrap(),
+            id
+        );
     }
 }

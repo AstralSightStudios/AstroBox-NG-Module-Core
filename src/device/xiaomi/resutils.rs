@@ -34,13 +34,6 @@ pub fn get_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
 }
 
 pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Result<(), String> {
-    if !new_id.as_bytes().iter().all(u8::is_ascii_alphanumeric) {
-        return Err("Watchface ID must contain only letters and digits".to_string());
-    }
-    if !VALID_WATCHFACE_ID_LENGTHS.contains(&new_id.len()) {
-        return Err("Watchface ID must be 9 or 12 characters".to_string());
-    }
-
     let offset = config.watchface_id_offset;
     let field_len = config.watchface_id_field_len;
     let field_end = offset
@@ -60,7 +53,7 @@ pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Re
 
     if start + new_id.len() > field_len {
         return Err(format!(
-            "Watchface ID field is too short for {} characters",
+            "Watchface ID field is too short for {} bytes",
             new_id.len()
         ));
     }
@@ -281,23 +274,28 @@ mod tests {
     }
 
     #[test]
-    fn set_watchface_id_rejects_unsupported_length() {
+    fn set_watchface_id_accepts_arbitrary_utf8_string() {
         let config = test_config();
         let mut data = data_with_field(b"123456789");
+        let new_id = "自定义/watchface-v2";
 
-        let err = set_watchface_id(&mut data, &config, "123").unwrap_err();
+        set_watchface_id(&mut data, &config, new_id).unwrap();
 
-        assert_eq!(err, "Watchface ID must be 9 or 12 characters");
+        let id_start = config.watchface_id_offset;
+        let id_end = id_start + new_id.len();
+        assert_eq!(&data[id_start..id_end], new_id.as_bytes());
+        assert!(data[id_end..28].iter().all(|&byte| byte == 0));
     }
 
     #[test]
-    fn set_watchface_id_rejects_non_alphanumeric() {
+    fn set_watchface_id_rejects_only_when_field_is_too_short() {
         let config = test_config();
         let mut data = data_with_field(b"123456789");
+        let new_id = "x".repeat(config.watchface_id_field_len + 1);
 
-        let err = set_watchface_id(&mut data, &config, "abc-123-xyz").unwrap_err();
+        let err = set_watchface_id(&mut data, &config, &new_id).unwrap_err();
 
-        assert_eq!(err, "Watchface ID must contain only letters and digits");
+        assert_eq!(err, "Watchface ID field is too short for 25 bytes");
     }
 
     #[test]
