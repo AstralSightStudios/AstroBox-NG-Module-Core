@@ -37,6 +37,7 @@ use crate::device::xiaomi::components::{
     install::{InstallComponent, InstallSystem},
     mass::{MassComponent, MassSystem},
     media::{MediaComponent, MediaSystem},
+    notification::NotificationSystem,
     report::ReportSystem,
     resource::{ResourceComponent, ResourceSystem},
     sync::{SyncComponent, SyncSystem},
@@ -54,6 +55,7 @@ use tokio::runtime::Handle;
 
 pub mod data;
 pub mod install;
+pub mod notification;
 pub mod resource;
 pub mod sync;
 pub mod thirdparty_app;
@@ -193,6 +195,7 @@ where
                     InstallSystem::new(device_id.clone(), install_config),
                     MassComponent::new(),
                     MassSystem::new(device_id.clone()),
+                    NotificationSystem,
                     MediaComponent::default(),
                     MediaSystem::new(device_id.clone()),
                     InfoComponent::new(),

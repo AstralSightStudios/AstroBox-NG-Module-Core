@@ -3,6 +3,7 @@ pub mod info;
 pub mod install;
 pub mod mass;
 pub mod media;
+pub mod notification;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network;
 pub mod report;
