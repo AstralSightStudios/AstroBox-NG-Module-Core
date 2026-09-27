@@ -19,7 +19,7 @@ use crate::{
     events::{CoreEvent, InterconnectMessage},
 };
 
-pub const MANAGER_PACKAGE: &str = "ng.lst.conora";
+pub const MANAGER_PACKAGE: &str = "ng.lst.corona";
 const MAX_TEXT_CHARS: usize = 18_000;
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_ATTEMPTS: usize = 4;

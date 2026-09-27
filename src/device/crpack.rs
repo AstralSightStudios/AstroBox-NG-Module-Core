@@ -14,8 +14,6 @@ pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_CHUNKS_PER_FILE: usize = 2_048;
 const MAX_ARCHIVE_ENTRIES: usize = 16_384;
-const MAX_MAPPINGS: usize = 64;
-const MAX_CONFIG_BYTES: usize = 32 * 1024;
 const THEME_ROOT: &str = "/data/quickapp/files/ng.lst.corona/themes/";
 const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 const RESOURCE_PACK_FORMAT: &str = "canopus-resource-pack";
@@ -160,7 +158,7 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
     }
 
     let manifest_bytes = manifest_bytes.context("CRPack must contain a root canora.json")?;
-    let theme_id = validate_manifest(&manifest_bytes)?;
+    let theme_id = parse_manifest_theme_id(&manifest_bytes)?;
     ensure!(!files.is_empty(), "empty CRPack");
     for file in &files {
         let full_path = format!("{THEME_ROOT}{theme_id}/{}", file.path);
@@ -249,7 +247,8 @@ fn has_supported_marker(data: &[u8]) -> bool {
         && value.get("formatVersion").and_then(Value::as_u64) == Some(RESOURCE_PACK_VERSION)
 }
 
-fn validate_manifest(data: &[u8]) -> anyhow::Result<String> {
+// The Manager owns mapping-rule validation; the sender only parses fields needed to route the transfer.
+fn parse_manifest_theme_id(data: &[u8]) -> anyhow::Result<String> {
     ensure!(
         !data.is_empty() && data.len() <= MAX_MANIFEST_BYTES,
         "canora.json must be between 1 byte and 64 KiB"
@@ -274,16 +273,6 @@ fn validate_manifest(data: &[u8]) -> anyhow::Result<String> {
 
     let theme_id = required_string(object, "themeId")?;
     ensure!(valid_theme_id(theme_id), "invalid CRPack themeId");
-    let name = required_string(object, "name")?;
-    ensure!(
-        !name.is_empty() && name.len() <= 128,
-        "name must be 1-128 UTF-8 bytes"
-    );
-    validate_optional_text(object, "version", 64)?;
-    validate_optional_text(object, "author", 128)?;
-    validate_optional_text(object, "description", 1024)?;
-    validate_targets(object)?;
-    validate_mappings(object, theme_id)?;
     Ok(theme_id.to_owned())
 }
 
@@ -292,108 +281,6 @@ fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> anyhow::Res
         .get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("canora.json {key} must be a string"))
-}
-
-fn validate_optional_text(
-    object: &Map<String, Value>,
-    key: &str,
-    max_bytes: usize,
-) -> anyhow::Result<()> {
-    if let Some(value) = object.get(key) {
-        let text = value
-            .as_str()
-            .with_context(|| format!("canora.json {key} must be a string"))?;
-        ensure!(
-            text.len() <= max_bytes,
-            "canora.json {key} exceeds {max_bytes} bytes"
-        );
-    }
-    Ok(())
-}
-
-fn validate_targets(object: &Map<String, Value>) -> anyhow::Result<()> {
-    let Some(value) = object.get("targets") else {
-        return Ok(());
-    };
-    let targets = value
-        .as_array()
-        .context("canora.json targets must be an array")?;
-    ensure!(targets.len() <= 16, "canora.json targets exceeds 16 items");
-    for target in targets {
-        let target = target
-            .as_str()
-            .context("canora.json target entries must be strings")?;
-        ensure!(
-            !target.is_empty() && target.len() <= 128,
-            "invalid canora.json target entry"
-        );
-    }
-    Ok(())
-}
-
-fn validate_mappings(object: &Map<String, Value>, theme_id: &str) -> anyhow::Result<()> {
-    let mappings = object
-        .get("mappings")
-        .and_then(Value::as_array)
-        .context("canora.json mappings must be an array")?;
-    ensure!(
-        mappings.len() <= MAX_MAPPINGS,
-        "canora.json mappings exceeds 64 items"
-    );
-
-    let destination_root = format!("{THEME_ROOT}{theme_id}/");
-    let mut seen_sources = HashSet::new();
-    let mut config_bytes = 0usize;
-    for (index, mapping) in mappings.iter().enumerate() {
-        let mapping = mapping
-            .as_object()
-            .with_context(|| format!("canora.json mappings[{index}] must be an object"))?;
-        let source = required_string(mapping, "source")?;
-        let destination = required_string(mapping, "destination")?;
-        ensure!(
-            valid_absolute_path(source) && valid_absolute_path(destination),
-            "canora.json mappings[{index}] contains an invalid path"
-        );
-        ensure!(
-            destination.starts_with(&destination_root),
-            "canora.json mappings[{index}].destination is outside the theme directory"
-        );
-        ensure!(
-            source.ends_with('/') == destination.ends_with('/'),
-            "canora.json mappings[{index}] source and destination path types differ"
-        );
-        ensure!(
-            seen_sources.insert(source),
-            "canora.json mappings[{index}] source is duplicated"
-        );
-        config_bytes = config_bytes
-            .checked_add(source.len() + 1 + destination.len() + 1)
-            .context("generated mappings.tsv size overflow")?;
-    }
-    ensure!(
-        config_bytes <= MAX_CONFIG_BYTES,
-        "generated mappings.tsv exceeds 32 KiB"
-    );
-    Ok(())
-}
-
-fn valid_absolute_path(path: &str) -> bool {
-    if path.is_empty()
-        || !path.starts_with('/')
-        || path.len() >= 256
-        || path.contains(['\\', ':'])
-        || path.chars().any(char::is_control)
-    {
-        return false;
-    }
-    let segments: Vec<_> = path[1..].split('/').collect();
-    segments.iter().enumerate().all(|(index, segment)| {
-        if segment.is_empty() {
-            index + 1 == segments.len()
-        } else {
-            *segment != "." && *segment != ".."
-        }
-    })
 }
 
 fn valid_theme_id(id: &str) -> bool {
@@ -408,7 +295,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const VALID_MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[{"source":"/resource/","destination":"/data/quickapp/files/ng.lst.corona/themes/dark/"}]}"#;
+    const VALID_MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[{"source":"/resource/app/settings/","destination":"app/settings/"}]}"#;
+    const EMPTY_MAPPING_MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
 
     fn zip_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = ZipArchiveWriter::new(Cursor::new(Vec::new()));
@@ -427,7 +315,7 @@ mod tests {
     fn recognizes_and_loads_crpack_without_extension_assumptions() {
         let bytes = zip_with_entries(&[
             ("canora.json", VALID_MANIFEST),
-            ("icons/confirm.bin", b"asset"),
+            ("app/settings/launcher.bin", b"asset"),
         ]);
         assert!(is_crpack_archive(&bytes));
 
@@ -435,7 +323,7 @@ mod tests {
         assert_eq!(pack.theme_id, "dark");
         assert_eq!(pack.files.len(), 2);
         assert_eq!(pack.files[0].path, "canora.json");
-        assert_eq!(pack.files[1].path, "icons/confirm.bin");
+        assert_eq!(pack.files[1].path, "app/settings/launcher.bin");
         assert_eq!(pack.files[1].data, b"asset");
         assert_eq!(pack.total_bytes, VALID_MANIFEST.len() + 5);
     }
@@ -485,7 +373,7 @@ mod tests {
         let options =
             zip::write::FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("canora.json", options).unwrap();
-        writer.write_all(VALID_MANIFEST).unwrap();
+        writer.write_all(EMPTY_MAPPING_MANIFEST).unwrap();
         for index in 0..MAX_FILES {
             writer
                 .start_file(format!("assets/{index}.bin"), options)
@@ -498,10 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_manifest_mappings() {
-        let invalid_manifest = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[{"source":"/resource/","destination":"/data/quickapp/files/ng.lst.corona/themes/light/"}]}"#;
-        let bytes = zip_with_entries(&[("canora.json", invalid_manifest)]);
+    fn leaves_mapping_semantics_to_the_device_manager() {
+        let invalid_mapping_manifest = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[{"source":"not-absolute","destination":"../outside/"}]}"#;
+        let bytes = zip_with_entries(&[
+            ("canora.json", invalid_mapping_manifest),
+            ("app/settings/launcher.bin", b"asset"),
+        ]);
         assert!(is_crpack_archive(&bytes));
-        assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
+        assert!(parse_crpack_archive(Cursor::new(bytes)).is_ok());
     }
 }
