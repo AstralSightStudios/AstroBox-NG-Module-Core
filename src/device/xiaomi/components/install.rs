@@ -84,14 +84,14 @@ impl InstallSystem {
 
         let mut file_data = file_data;
 
-        // 如果提供了新的watchface_id且是表盘类型，先修改文件中的ID
+        // 如果提供了新的watchface_id且是表盘类型，先修改文件中的ID（支持 .bin 与 .mwz 压缩包）
         if let (MassDataType::Watchface, Some(new_id)) = (r#type, watchface_id) {
             let res_config =
                 with_device_component_mut::<XiaomiDevice, ResConfig, _>(owner.clone(), |dev| {
                     dev.config.res.clone()
                 })
                 .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
-            resutils::set_watchface_id(&mut file_data, &res_config, new_id)
+            resutils::set_watchface_id_vec(&mut file_data, &res_config, new_id)
                 .map_err(|err| anyhow_site!("failed to set watchface id: {}", err))?;
         }
 
