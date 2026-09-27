@@ -57,6 +57,8 @@ pub mod data;
 pub mod install;
 pub mod notification;
 pub mod resource;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod res_pack;
 pub mod sync;
 pub mod thirdparty_app;
 pub mod vivo;
@@ -188,6 +190,8 @@ where
                     ),
                 );
                 let mut entity_ref = rt.world_mut().entity_mut(entity);
+                #[cfg(not(target_arch = "wasm32"))]
+                entity_ref.insert(res_pack::ResourcePackComponent::default());
                 entity_ref.insert((
                     AuthComponent::new(authkey_for_component),
                     AuthSystem::new(device_id.clone()),
