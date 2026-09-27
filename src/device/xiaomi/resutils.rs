@@ -1,7 +1,10 @@
 use serde_repr::Serialize_repr;
 use std::io::{Cursor, Read, Write};
 
-use crate::device::xiaomi::{config::ResConfig, packet::mass::MassDataType};
+use crate::device::{
+    crpack::is_crpack_archive,
+    xiaomi::{config::ResConfig, packet::mass::MassDataType},
+};
 
 const VALID_WATCHFACE_ID_LENGTHS: [usize; 2] = [9, 12];
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
@@ -666,6 +669,25 @@ mod tests {
     }
 
     #[test]
+    fn get_file_type_recognizes_crpack_by_manifest_contents() {
+        let manifest = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
+        let data = zip_with_entries(&[
+            ("canora.json", manifest),
+            ("assets/toolkit.bin", b"toolkit"),
+        ]);
+
+        assert_eq!(get_file_type(&data), FileType::ResourcePack);
+    }
+
+    #[test]
+    fn get_file_type_does_not_recognize_wrong_crpack_version() {
+        let manifest = br#"{"format":"canopus-resource-pack","formatVersion":2}"#;
+        let data = zip_with_entries(&[("canora.json", manifest)]);
+
+        assert_eq!(get_file_type(&data), FileType::Zip);
+    }
+
+    #[test]
     fn get_file_type_recognizes_miwear_ota_as_firmware() {
         let data = zip_with_entry("vela_ap.bin", MIN_FIRMWARE_SIZE);
 
@@ -933,10 +955,15 @@ pub enum FileType {
     WatchFace = MassDataType::Watchface as u8,
     Firmware = MassDataType::Firmare as u8,
     ThirdPartyApp = MassDataType::ThirdPartyApp as u8,
+    ResourcePack = 92,
 }
 pub fn get_file_type(data: &[u8]) -> FileType {
     if data.is_empty() {
         return FileType::Null;
+    }
+    // CRPack is identified by its root manifest marker, not by its extension.
+    if is_crpack_archive(data) {
+        return FileType::ResourcePack;
     }
     // 0. 检查是不是小米可穿戴固件（OTA JAR 也 PK 开头，必须优先判断）
     if is_xiaomi_firmware(data, Some(data.len())) {

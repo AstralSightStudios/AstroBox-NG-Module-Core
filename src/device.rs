@@ -53,12 +53,13 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::runtime::Handle;
 
+mod crpack;
 pub mod data;
 pub mod install;
 pub mod notification;
-pub mod resource;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod res_pack;
+pub mod resource;
 pub mod sync;
 pub mod thirdparty_app;
 pub mod vivo;

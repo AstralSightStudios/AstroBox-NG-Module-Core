@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -15,14 +14,13 @@ use tokio::{
 };
 
 use crate::{
+    device::crpack::{MAX_CHUNKS_PER_FILE, load_crpack},
     ecs::Component,
     events::{CoreEvent, InterconnectMessage},
 };
 
 pub const MANAGER_PACKAGE: &str = "ng.lst.conora";
 const MAX_TEXT_CHARS: usize = 18_000;
-const MAX_FILES: usize = 4096;
-const MAX_BYTES: usize = 64 * 1024 * 1024;
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_ATTEMPTS: usize = 4;
 
@@ -43,251 +41,19 @@ struct Pack {
     digest: String,
 }
 
-fn is_valid_theme_id(id: &str) -> bool {
-    (1..=12).contains(&id.len())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-}
-
-fn valid_relative_path(path: &str) -> bool {
-    !path.contains(['\\', '\0', ':'])
-        && path
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-}
-
-fn extract_theme_id_from_mappings(data: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(data).ok()?;
-    for line in text.lines() {
-        for word in line.split(['\t', ' ', ',', ';']) {
-            if let Some(rest) = word.strip_prefix("themes/") {
-                if let Some((id, _)) = rest.split_once('/') {
-                    if is_valid_theme_id(id) {
-                        return Some(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 fn load_pack(path: &Path) -> anyhow::Result<Pack> {
-    if path.is_dir() {
-        load_pack_dir(path)
-    } else {
-        load_pack_zip(path)
-    }
-}
+    let crpack = load_crpack(path)?;
+    let theme = crpack.theme_id;
+    let files: Vec<PackFile> = crpack
+        .files
+        .into_iter()
+        .map(|file| PackFile {
+            path: file.path,
+            data: file.data,
+        })
+        .collect();
+    let total = crpack.total_bytes;
 
-fn load_pack_zip(path: &Path) -> anyhow::Result<Pack> {
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file).context("res_pack must be a valid ZIP archive")?;
-    ensure!(zip.len() <= MAX_FILES * 2, "too many entries in ZIP archive");
-
-    let mut raw_files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total_bytes = 0usize;
-    for index in 0..zip.len() {
-        let mut entry = zip.by_index(index)?;
-        if entry.is_dir() {
-            continue;
-        }
-        let raw_name = entry.name().replace('\\', "/");
-        if raw_name.starts_with("__MACOSX/")
-            || raw_name.ends_with("/.DS_Store")
-            || raw_name == ".DS_Store"
-            || raw_name.ends_with("/desktop.ini")
-            || raw_name == "desktop.ini"
-            || raw_name.ends_with("/Thumbs.db")
-            || raw_name == "Thumbs.db"
-        {
-            continue;
-        }
-        ensure!(
-            valid_relative_path(&raw_name),
-            "invalid resource path in ZIP: {raw_name}"
-        );
-        let size = entry.size() as usize;
-        ensure!(
-            size <= MAX_BYTES - total_bytes,
-            "res_pack exceeds 64 MiB limit"
-        );
-        total_bytes += size;
-        ensure!(
-            raw_files.len() < MAX_FILES,
-            "res_pack exceeds 4096 files limit"
-        );
-        let mut data = Vec::with_capacity(size);
-        entry.read_to_end(&mut data)?;
-        raw_files.push((raw_name, data));
-    }
-    ensure!(!raw_files.is_empty(), "empty ZIP archive");
-
-    let (theme, prefix) = if let Some((_, mappings_data)) = raw_files.iter().find(|(p, _)| p == "mappings.tsv") {
-        let parsed_theme = extract_theme_id_from_mappings(mappings_data);
-        let theme = if let Some(t) = parsed_theme {
-            t
-        } else {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .context("invalid file stem")?;
-            stem.to_ascii_lowercase()
-        };
-        (theme, String::new())
-    } else {
-        let mapping_entry = raw_files
-            .iter()
-            .find(|(p, _)| p.ends_with("/mappings.tsv"))
-            .context("res_pack is missing mappings.tsv")?;
-        let (first_seg, _) = mapping_entry
-            .0
-            .split_once('/')
-            .context("invalid mappings.tsv path")?;
-        let prefix = format!("{first_seg}/");
-        ensure!(
-            raw_files.iter().all(|(p, _)| p.starts_with(&prefix)),
-            "all files in ZIP must be inside the '{prefix}' directory"
-        );
-        (first_seg.to_string(), prefix)
-    };
-
-    ensure!(
-        is_valid_theme_id(&theme),
-        "invalid themeId '{theme}': must be 1-12 lowercase ASCII letters, digits, '_' or '-'"
-    );
-
-    let mut pack_files = Vec::with_capacity(raw_files.len());
-    let mut total = 0usize;
-    for (raw_path, data) in raw_files {
-        let rel_path = raw_path
-            .strip_prefix(&prefix)
-            .unwrap_or(&raw_path)
-            .to_string();
-        ensure!(
-            format!("themes/{theme}/{rel_path}").len() < 256,
-            "resource path too long: {rel_path}"
-        );
-        total += data.len();
-        pack_files.push(PackFile {
-            path: rel_path,
-            data,
-        });
-    }
-
-    ensure!(
-        pack_files.iter().any(|f| f.path == "mappings.tsv"),
-        "res_pack is missing mappings.tsv"
-    );
-
-    pack_files.sort_by(|a, b| {
-        if a.path == "mappings.tsv" {
-            std::cmp::Ordering::Less
-        } else if b.path == "mappings.tsv" {
-            std::cmp::Ordering::Greater
-        } else {
-            a.path.cmp(&b.path)
-        }
-    });
-
-    let mut hash = Sha256::new();
-    hash.update(theme.as_bytes());
-    for file in &pack_files {
-        hash.update((file.path.len() as u64).to_le_bytes());
-        hash.update(file.path.as_bytes());
-        hash.update((file.data.len() as u64).to_le_bytes());
-        hash.update(&file.data);
-    }
-    let digest = hex::encode(hash.finalize());
-
-    Ok(Pack {
-        theme,
-        files: pack_files,
-        total,
-        digest,
-    })
-}
-
-fn load_pack_dir(root: &Path) -> anyhow::Result<Pack> {
-    ensure!(
-        root.is_dir() && !std::fs::symlink_metadata(root)?.file_type().is_symlink(),
-        "res_pack must not be a symlink"
-    );
-    let theme = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("invalid themeId")?
-        .to_string();
-    ensure!(
-        is_valid_theme_id(&theme),
-        "invalid themeId: {theme}"
-    );
-    let mut files = Vec::new();
-    let mut total = 0usize;
-    fn walk(
-        root: &Path,
-        relative: &str,
-        theme: &str,
-        files: &mut Vec<PackFile>,
-        total: &mut usize,
-    ) -> anyhow::Result<()> {
-        let mut entries = std::fs::read_dir(root.join(relative))?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("non-UTF8 resource path"))?;
-            let path = if relative.is_empty() {
-                name
-            } else {
-                format!("{relative}/{name}")
-            };
-            ensure!(valid_relative_path(&path), "invalid-path: {path}");
-            ensure!(
-                format!("themes/{theme}/{path}").len() < 256,
-                "resource path too long: {path}"
-            );
-            let kind = entry.file_type()?;
-            ensure!(!kind.is_symlink(), "symlinks are not allowed in res_pack");
-            if kind.is_dir() {
-                walk(root, &path, theme, files, total)?;
-            } else {
-                ensure!(
-                    kind.is_file() && files.len() < MAX_FILES,
-                    "invalid file or too many files"
-                );
-                let size = entry.metadata()?.len() as usize;
-                ensure!(
-                    size <= MAX_BYTES - *total,
-                    "res_pack exceeds 64 MiB"
-                );
-                let data = std::fs::read(entry.path())?;
-                ensure!(
-                    data.len() == size,
-                    "resource changed while reading"
-                );
-                *total += data.len();
-                files.push(PackFile { path, data });
-            }
-        }
-        Ok(())
-    }
-    walk(root, "", &theme, &mut files, &mut total)?;
-    ensure!(
-        files.iter().any(|file| file.path == "mappings.tsv"),
-        "res_pack is missing mappings.tsv"
-    );
-    files.sort_by(|a, b| {
-        if a.path == "mappings.tsv" {
-            std::cmp::Ordering::Less
-        } else if b.path == "mappings.tsv" {
-            std::cmp::Ordering::Greater
-        } else {
-            a.path.cmp(&b.path)
-        }
-    });
     let mut hash = Sha256::new();
     hash.update(theme.as_bytes());
     for file in &files {
@@ -297,6 +63,7 @@ fn load_pack_dir(root: &Path) -> anyhow::Result<Pack> {
         hash.update(&file.data);
     }
     let digest = hex::encode(hash.finalize());
+
     Ok(Pack {
         theme,
         files,
@@ -346,9 +113,8 @@ pub async fn install(
     }
     let apps = super::resource::request_quick_app_list_json(addr.clone()).await?;
     ensure!(
-        apps.as_array().is_some_and(|apps| apps
-            .iter()
-            .any(|app| app["packageName"] == MANAGER_PACKAGE)),
+        apps.as_array()
+            .is_some_and(|apps| apps.iter().any(|app| app["packageName"] == MANAGER_PACKAGE)),
         "required resource is not installed: {MANAGER_PACKAGE}"
     );
     let mut transport = Transport {
@@ -381,6 +147,7 @@ pub async fn install(
         chunk_size > 0 && chunk_size <= max_chunk,
         "resume chunk size exceeds negotiated message limit"
     );
+    validate_chunk_limits(&pack.files, chunk_size)?;
     let max_window = hello["maxWindow"].as_u64().unwrap_or(4).clamp(1, 4) as usize;
     let mode = if resume.is_some() {
         "resume"
@@ -411,7 +178,6 @@ pub async fn install(
     let mut completed = 0;
     for (index, file) in pack.files.iter().enumerate() {
         let count = file.data.len().div_ceil(chunk_size);
-        ensure!(count <= 65_536, "too many chunks in {}", file.path);
         let state = transport.exchange('P', json!({"themeId":pack.theme,"fileIndex":index,"sizeBytes":file.data.len(),"chunkSizeBytes":chunk_size,"chunkCount":count}), |kind, value| kind == b'P' && value["fileIndex"] == index && matches!(value["status"].as_str(), Some("ready" | "resume" | "complete"))).await?;
         let window = state["window"]
             .as_u64()
@@ -460,6 +226,19 @@ pub async fn install(
         status: "finished".into(),
         resume: None,
     });
+    Ok(())
+}
+
+fn validate_chunk_limits(files: &[PackFile], chunk_size: usize) -> anyhow::Result<()> {
+    ensure!(chunk_size > 0, "chunk size must be non-zero");
+    for file in files {
+        let chunk_count = file.data.len().div_ceil(chunk_size);
+        ensure!(
+            chunk_count <= MAX_CHUNKS_PER_FILE,
+            "{} exceeds the Manager's 2,048-chunk limit",
+            file.path
+        );
+    }
     Ok(())
 }
 
@@ -720,57 +499,51 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    const MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
+
     #[test]
     fn standard_base91_vectors_and_message_bound() {
         assert_eq!(base91(b""), "");
+        assert_eq!(base91(b"test"), "fPNKd");
         assert_eq!(base91(b"Hello World!"), ">OwJh>Io0Tv!8PE");
         assert!(base91(&vec![255; 12_000]).len() + 9 <= MAX_TEXT_CHARS);
-        assert!(valid_relative_path("app/settings/launcher.bin"));
-        for path in ["/root", "a//b", "../x", "a/./b", "a\\b"] {
-            assert!(!valid_relative_path(path));
-        }
     }
 
     #[test]
-    fn load_pack_from_zip_with_root_mappings() {
+    fn preflights_the_managers_chunk_limit_before_transfer() {
+        let allowed = PackFile {
+            path: "allowed.bin".into(),
+            data: vec![0; MAX_CHUNKS_PER_FILE],
+        };
+        let rejected = PackFile {
+            path: "too-large.bin".into(),
+            data: vec![0; MAX_CHUNKS_PER_FILE + 1],
+        };
+        assert!(validate_chunk_limits(&[allowed], 1).is_ok());
+        assert!(validate_chunk_limits(&[rejected], 1).is_err());
+    }
+
+    #[test]
+    fn load_pack_from_crpack_zip_without_requiring_an_extension() {
         let zip_path = std::env::temp_dir().join(format!("test_dark_{}.zip", std::process::id()));
         let file = std::fs::File::create(&zip_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
 
         let options = zip::write::FileOptions::default();
-        zip.start_file("mappings.tsv", options).unwrap();
-        zip.write_all(b"res\tthemes/dark/app/test.bin\n").unwrap();
+        zip.start_file("canora.json", options).unwrap();
+        zip.write_all(MANIFEST).unwrap();
         zip.start_file("app/test.bin", options).unwrap();
         zip.write_all(b"binary_payload").unwrap();
         zip.finish().unwrap();
 
-        let pack = load_pack(&zip_path).unwrap();
+        let result = load_pack(&zip_path);
         let _ = std::fs::remove_file(&zip_path);
+        let pack = result.unwrap();
         assert_eq!(pack.theme, "dark");
         assert_eq!(pack.files.len(), 2);
-        assert_eq!(pack.files[0].path, "mappings.tsv");
+        assert_eq!(pack.files[0].path, "canora.json");
         assert_eq!(pack.files[1].path, "app/test.bin");
         assert_eq!(pack.files[1].data, b"binary_payload");
-    }
-
-    #[test]
-    fn load_pack_from_zip_with_nested_folder() {
-        let zip_path = std::env::temp_dir().join(format!("test_retro_{}.zip", std::process::id()));
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-
-        let options = zip::write::FileOptions::default();
-        zip.start_file("retro/mappings.tsv", options).unwrap();
-        zip.write_all(b"mappings").unwrap();
-        zip.start_file("retro/icons/icon.bin", options).unwrap();
-        zip.write_all(b"icon_data").unwrap();
-        zip.finish().unwrap();
-
-        let pack = load_pack(&zip_path).unwrap();
-        let _ = std::fs::remove_file(&zip_path);
-        assert_eq!(pack.theme, "retro");
-        assert_eq!(pack.files.len(), 2);
-        assert_eq!(pack.files[0].path, "mappings.tsv");
-        assert_eq!(pack.files[1].path, "icons/icon.bin");
+        assert_eq!(pack.total, MANIFEST.len() + b"binary_payload".len());
     }
 }
