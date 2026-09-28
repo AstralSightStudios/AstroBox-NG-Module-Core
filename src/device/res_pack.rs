@@ -22,7 +22,10 @@ use crate::{
 pub const MANAGER_PACKAGE: &str = "ng.lst.corona";
 const MAX_TEXT_CHARS: usize = 18_000;
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const HANDSHAKE_RETRY: Duration = Duration::from_millis(750);
 const MAX_ATTEMPTS: usize = 4;
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Component, Default)]
 pub struct ResourcePackComponent {
@@ -125,22 +128,9 @@ pub async fn install(
         session: lock,
     };
     super::thirdparty_app::launch(addr, MANAGER_PACKAGE.into(), String::new()).await?;
-    let hello = transport
-        .exchange(
-            'H',
-            json!({"version":1,"maxTextChars":MAX_TEXT_CHARS}),
-            |kind, _| kind == b'H',
-        )
-        .await?;
-    ensure!(
-        hello["version"] == 1,
-        "unsupported res_pack protocol version"
-    );
-    transport.max_chars = (hello["maxTextChars"]
-        .as_u64()
-        .context("invalid maxTextChars")? as usize)
-        .min(MAX_TEXT_CHARS);
-    ensure!(transport.max_chars >= 256, "maxTextChars is too small");
+    let hello = transport.handshake().await?;
+    let (max_chars, max_window) = parse_handshake_limits(&hello)?;
+    transport.max_chars = max_chars;
     let max_chunk = 12_000.min((transport.max_chars - 11) * 13 / 16);
     let chunk_size = resume.as_ref().map_or(max_chunk, |token| token.chunk_size);
     ensure!(
@@ -148,7 +138,6 @@ pub async fn install(
         "resume chunk size exceeds negotiated message limit"
     );
     validate_chunk_limits(&pack.files, chunk_size)?;
-    let max_window = hello["maxWindow"].as_u64().unwrap_or(4).clamp(1, 4) as usize;
     let mode = if resume.is_some() {
         "resume"
     } else {
@@ -242,8 +231,56 @@ fn validate_chunk_limits(files: &[PackFile], chunk_size: usize) -> anyhow::Resul
     Ok(())
 }
 
+fn new_request_id() -> String {
+    let nonce = crate::tools::generate_random_bytes(16);
+    let count = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}_{count:x}", hex::encode(nonce))
+}
+
+fn is_announce(text: &str) -> bool {
+    parse_control(text).is_some_and(|(kind, value)| {
+        kind == b'H' && value["version"] == 2 && value["type"] == "announce"
+    })
+}
+
+fn is_handshake_response(text: &str, request_id: &str) -> bool {
+    parse_control(text).is_some_and(|(kind, value)| {
+        kind == b'H'
+            && value["version"] == 2
+            && value["type"] == "response"
+            && value["replyTo"] == request_id
+    })
+}
+
+fn parse_handshake_limits(value: &Value) -> anyhow::Result<(usize, usize)> {
+    let max_chars = value["maxTextChars"]
+        .as_u64()
+        .context("invalid maxTextChars")?;
+    ensure!(
+        (256..=MAX_TEXT_CHARS as u64).contains(&max_chars),
+        "maxTextChars is outside the supported range"
+    );
+    let max_window = value["maxWindow"].as_u64().context("invalid maxWindow")?;
+    ensure!((1..=4).contains(&max_window), "maxWindow is outside 1..=4");
+    Ok((max_chars as usize, max_window as usize))
+}
+
 fn is_ready(kind: u8, value: &Value) -> bool {
     kind == b'T' && value["operation"] == "status" && value["status"] == "ready"
+}
+
+fn decode_manager_envelope(payload: &[u8]) -> anyhow::Result<String> {
+    let envelope: Value =
+        serde_json::from_slice(payload).context("invalid Manager message envelope")?;
+    let packet = envelope
+        .get("msg")
+        .and_then(Value::as_str)
+        .context("Manager message envelope is missing string msg")?;
+    ensure!(
+        packet.chars().count() <= MAX_TEXT_CHARS,
+        "Manager protocol packet exceeds maxTextChars"
+    );
+    Ok(packet.to_owned())
 }
 
 fn parse_control(text: &str) -> Option<(u8, Value)> {
@@ -285,6 +322,45 @@ struct Transport {
 }
 
 impl Transport {
+    async fn handshake(&mut self) -> anyhow::Result<Value> {
+        let request_id = new_request_id();
+        let text = format!(
+            "H{}",
+            json!({"version":2,"type":"request","requestId":request_id,"maxTextChars":MAX_TEXT_CHARS})
+        );
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        self.send_handshake_request(&text, deadline).await?;
+        let mut next_send = Instant::now() + HANDSHAKE_RETRY;
+        loop {
+            let receive_deadline = next_send.min(deadline);
+            if let Some(response) = self.receive(receive_deadline).await? {
+                if is_handshake_response(&response, &request_id) {
+                    let (_, value) = parse_control(&response).expect("validated control message");
+                    return Ok(value);
+                }
+                if is_announce(&response) {
+                    self.send_handshake_request(&text, deadline).await?;
+                    next_send = Instant::now() + HANDSHAKE_RETRY;
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("res_pack handshake timed out");
+            }
+            if Instant::now() >= next_send {
+                self.send_handshake_request(&text, deadline).await?;
+                next_send = Instant::now() + HANDSHAKE_RETRY;
+            }
+        }
+    }
+
+    async fn send_handshake_request(&self, text: &str, deadline: Instant) -> anyhow::Result<()> {
+        match timeout_at(deadline, self.send(text)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if format!("{error:#}").contains("device_not_connected") => Err(error),
+            Ok(Err(_)) | Err(_) => Ok(()),
+        }
+    }
+
     async fn send(&self, text: &str) -> anyhow::Result<()> {
         ensure!(
             text.chars().count() <= self.max_chars,
@@ -331,7 +407,7 @@ impl Transport {
                 payload.len() <= MAX_TEXT_CHARS * 4,
                 "oversized interconnect response"
             );
-            let text = String::from_utf8(payload).context("invalid interconnect text")?;
+            let text = decode_manager_envelope(&payload)?;
             if let Some((kind, value)) = parse_control(&text) {
                 if value
                     .get("themeId")
@@ -500,6 +576,74 @@ mod tests {
     use std::io::Write;
 
     const MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
+
+    #[test]
+    fn manager_message_envelope_unwraps_the_existing_text_packet() {
+        let packet = r#"H{"version":2,"type":"response","replyTo":"request_1"}"#;
+        let payload = serde_json::to_vec(&json!({ "msg": packet })).unwrap();
+        assert_eq!(decode_manager_envelope(&payload).unwrap(), packet);
+    }
+
+    #[test]
+    fn manager_message_envelope_requires_a_string_msg() {
+        assert!(decode_manager_envelope(br#"{}"#).is_err());
+        assert!(decode_manager_envelope(br#"{"msg":42}"#).is_err());
+    }
+
+    #[test]
+    fn handshake_accepts_only_matching_v2_response_not_announce() {
+        let id = "request_123-abc";
+        assert!(is_announce(
+            r#"H{"version":2,"type":"announce","maxTextChars":18000,"maxWindow":4}"#
+        ));
+        assert!(!is_handshake_response(
+            r#"H{"version":2,"type":"announce","requestId":"request_123-abc"}"#,
+            id
+        ));
+        assert!(!is_handshake_response(
+            r#"H{"version":2,"type":"response","replyTo":"older"}"#,
+            id
+        ));
+        assert!(!is_handshake_response(
+            r#"H{"version":1,"type":"response","replyTo":"request_123-abc"}"#,
+            id
+        ));
+        let response = r#"H{"version":2,"type":"response","replyTo":"request_123-abc","maxTextChars":18000,"maxWindow":4}"#;
+        assert!(is_handshake_response(response, id));
+        let (_, value) = parse_control(response).unwrap();
+        assert_eq!(parse_handshake_limits(&value).unwrap(), (18_000, 4));
+    }
+
+    #[test]
+    fn handshake_rejects_invalid_negotiated_limits() {
+        let invalid = [
+            json!({"maxTextChars":18000}),
+            json!({"maxTextChars":"18000","maxWindow":4}),
+            json!({"maxTextChars":255,"maxWindow":4}),
+            json!({"maxTextChars":18001,"maxWindow":4}),
+            json!({"maxTextChars":18000,"maxWindow":0}),
+            json!({"maxTextChars":18000,"maxWindow":5}),
+            json!({"maxTextChars":18000,"maxWindow":"4"}),
+        ];
+        for value in invalid {
+            assert!(parse_handshake_limits(&value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn request_ids_are_unique_and_wire_safe() {
+        let first = new_request_id();
+        let second = new_request_id();
+        let valid = |id: &str| {
+            (1..=64).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        };
+        assert!(valid(&first));
+        assert!(valid(&second));
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn standard_base91_vectors_and_message_bound() {
