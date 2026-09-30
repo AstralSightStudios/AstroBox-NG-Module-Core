@@ -44,6 +44,11 @@ impl AuthSystem {
 
         let nonce_clone = nonce.clone();
         with_device_component_mut::<AuthComponent, _, _>(self.owner_id.clone(), move |comp| {
+            comp.is_authed = false;
+            comp.enc_key.clear();
+            comp.dec_key.clear();
+            comp.enc_nonce.clear();
+            comp.dec_nonce.clear();
             comp.random_bytes = nonce_clone;
         })
         .map_err(|err| anyhow_site!("failed to update auth component nonce: {err:?}"))?;
@@ -73,6 +78,10 @@ impl AuthSystem {
 
 impl L2PbExt for AuthSystem {
     fn on_pb_packet(&mut self, payload: WearPacket) {
+        if !self.auth_wait.lock().as_ref().is_some_and(|waiter| !waiter.is_closed()) {
+            return;
+        }
+        let packet_id = payload.id;
         #[cfg(not(target_os = "espidf"))]
         log::trace!("on_pb_packet: {}", serde_json::to_string(&payload).unwrap());
         if let Some(pkt) = payload.payload {
@@ -108,38 +117,25 @@ impl L2PbExt for AuthSystem {
                                     }
                                 }
                             },
-                            pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_dc) => {
-                                let update_res = with_device_component_mut::<AuthComponent, _, _>(
+                            pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(confirm) => {
+                                let result = with_device_component_mut::<AuthComponent, _, _>(
                                     self.owner_id.clone(),
-                                    |comp| {
-                                        comp.is_authed = true;
-                                    },
-                                );
-
-                                match update_res {
-                                    Ok(_) => {
-                                        if let Some(aw_sender) = self.auth_wait.lock().take() {
-                                            if let Err(err) = aw_sender.send(Ok(())) {
-                                                log::debug!(
-                                                    "Auth completion receiver dropped before delivery: {:?}",
-                                                    err
-                                                );
-                                            }
-                                        } else {
-                                            log::debug!(
-                                                "AuthDeviceConfirm received but no pending waiter present"
-                                            );
-                                        }
-                                    }
-                                    Err(err) => {
-                                        let anyhow_err = anyhow_site!(
-                                            "failed to mark auth component as authed: {err:?}"
-                                        );
-                                        log::error!("{anyhow_err:?}");
-                                        if let Some(waiter) = self.auth_wait.lock().take() {
-                                            let _ = waiter.send(Err(anyhow_err));
-                                        }
-                                    }
+                                    move |comp| comp.confirm(confirm.confirm_result),
+                                )
+                                .map_err(|err| anyhow_site!("failed to finish auth: {err:?}"))
+                                .and_then(|result| result);
+                                if let Some(waiter) = self.auth_wait.lock().take() {
+                                    let _ = waiter.send(result);
+                                }
+                            }
+                            pb::xiaomi::protocol::account::Payload::ErrorCode(code)
+                                if packet_id == pb::xiaomi::protocol::account::AccountId::AuthVerify as u32
+                                    || packet_id == pb::xiaomi::protocol::account::AccountId::AuthConfirm as u32 =>
+                            {
+                                if let Some(waiter) = self.auth_wait.lock().take() {
+                                    let _ = waiter.send(Err(anyhow_site!(
+                                        "Device rejected authentication: account error {code}"
+                                    )));
                                 }
                             }
                             _ => {}
@@ -164,6 +160,20 @@ pub struct AuthComponent {
 }
 
 impl AuthComponent {
+    fn confirm(&mut self, accepted: bool) -> anyhow::Result<()> {
+        self.is_authed = false;
+        if !accepted {
+            bail_site!("Device rejected authentication confirmation");
+        }
+        if self.enc_key.len() != 16 || self.dec_key.len() != 16
+            || self.enc_nonce.len() != 4 || self.dec_nonce.len() != 4
+        {
+            bail_site!("Authentication confirmation arrived before device verification");
+        }
+        self.is_authed = true;
+        Ok(())
+    }
+
     pub fn new(authkey: String) -> Self {
         Self {
             authkey,
@@ -370,4 +380,42 @@ fn kdf_miwear(secret_key: &[u8; 16], phone_nonce: &[u8; 16], watch_nonce: &[u8; 
         offset = end;
     }
     okm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verified_auth() -> AuthComponent {
+        let mut auth = AuthComponent::new(String::new());
+        auth.enc_key = vec![1; 16];
+        auth.dec_key = vec![2; 16];
+        auth.enc_nonce = vec![3; 4];
+        auth.dec_nonce = vec![4; 4];
+        auth
+    }
+
+    #[test]
+    fn rejected_confirmation_does_not_mark_connected() {
+        let mut auth = verified_auth();
+        assert!(auth.confirm(false).is_err());
+        assert!(!auth.is_authed);
+    }
+
+    #[test]
+    fn confirmation_requires_verified_session_keys() {
+        let mut auth = AuthComponent::new(String::new());
+        assert!(auth.confirm(true).is_err());
+        assert!(!auth.is_authed);
+    }
+
+    #[test]
+    fn accepted_confirmation_only_authenticates_its_device() {
+        let mut first = verified_auth();
+        let mut second = verified_auth();
+        first.confirm(true).unwrap();
+        assert!(second.confirm(false).is_err());
+        assert!(first.is_authed);
+        assert!(!second.is_authed);
+    }
 }

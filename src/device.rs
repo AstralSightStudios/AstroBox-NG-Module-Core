@@ -242,7 +242,7 @@ where
                         .expect("AuthSystem missing");
                     auth_system.prepare_auth().map(Some)
                 })
-                .unwrap_or_else(|| Ok(None))
+                .unwrap_or_else(|| Err(crate::anyhow_site!("Device removed before authentication")))
             })
             .await?;
 
