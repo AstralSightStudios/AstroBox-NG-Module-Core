@@ -9,7 +9,6 @@ use anyhow::{Context, ensure};
 use serde_json::{Map, Value};
 use zip::{CompressionMethod, ZipArchive};
 
-pub(crate) const MAX_FILES: usize = 128;
 pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_CHUNKS_PER_FILE: usize = 2_048;
@@ -132,7 +131,6 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
             relative_path != "mappings.tsv",
             "CRPack v1 must not contain mappings.tsv"
         );
-        ensure!(files.len() < MAX_FILES, "CRPack exceeds 128 files");
 
         let declared_size = entry.size();
         let remaining_bytes = MAX_BYTES - total_bytes;
@@ -368,20 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_more_than_128_files_and_actual_size_overruns() {
+    fn accepts_more_than_128_files_and_rejects_actual_size_overruns() {
         let mut writer = ZipArchiveWriter::new(Cursor::new(Vec::new()));
         let options =
             zip::write::FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("canora.json", options).unwrap();
         writer.write_all(EMPTY_MAPPING_MANIFEST).unwrap();
-        for index in 0..MAX_FILES {
+        for index in 0..256 {
             writer
                 .start_file(format!("assets/{index}.bin"), options)
                 .unwrap();
             writer.write_all(b"x").unwrap();
         }
         let bytes = writer.finish().unwrap().into_inner();
-        assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
+        // The container imposes no file-count cap; only the Interconnect transfer is bounded.
+        assert!(parse_crpack_archive(Cursor::new(bytes)).is_ok());
         assert!(read_entry_bounded(&b"123456"[..], 5, 5).is_err());
     }
 
