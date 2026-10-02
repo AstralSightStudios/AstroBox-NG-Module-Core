@@ -18,6 +18,10 @@ const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 const RESOURCE_PACK_FORMAT: &str = "canopus-resource-pack";
 const RESOURCE_PACK_VERSION: u64 = 1;
 
+fn is_manifest_path(path: &str) -> bool {
+    matches!(path, "corona.json" | "canora.json")
+}
+
 pub(crate) struct CrPackFile {
     pub(crate) path: String,
     pub(crate) data: Vec<u8>,
@@ -47,7 +51,7 @@ pub(crate) fn is_crpack_archive(data: &[u8]) -> bool {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        if entry.name() != "corona.json" || entry.is_dir() {
+        if !is_manifest_path(entry.name()) || entry.is_dir() {
             continue;
         }
         if manifest_found
@@ -135,17 +139,17 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
         let declared_size = entry.size();
         let remaining_bytes = MAX_BYTES - total_bytes;
         let mut entry_limit = remaining_bytes;
-        if relative_path == "corona.json" {
+        if is_manifest_path(&relative_path) {
             entry_limit = entry_limit.min(MAX_MANIFEST_BYTES);
         }
         let data = read_entry_bounded(entry, declared_size, entry_limit)
             .with_context(|| format!("invalid or oversized ZIP entry: {relative_path}"))?;
         total_bytes += data.len();
 
-        if relative_path == "corona.json" {
+        if is_manifest_path(&relative_path) {
             ensure!(
                 manifest_bytes.is_none(),
-                "CRPack must contain exactly one corona.json"
+                "CRPack must contain exactly one root corona.json (legacy canora.json is also accepted)"
             );
             manifest_bytes = Some(data.clone());
         }
@@ -324,6 +328,35 @@ mod tests {
         assert_eq!(pack.files[1].path, "app/settings/launcher.bin");
         assert_eq!(pack.files[1].data, b"asset");
         assert_eq!(pack.total_bytes, VALID_MANIFEST.len() + 5);
+    }
+
+    #[test]
+    fn accepts_both_manifest_names_and_preserves_transfer_paths() {
+        for name in ["corona.json", "canora.json"] {
+            let bytes = zip_with_entries(&[(name, VALID_MANIFEST)]);
+            assert!(is_crpack_archive(&bytes));
+            let pack = parse_crpack_archive(Cursor::new(bytes)).unwrap();
+            assert_eq!(pack.theme_id, "dark");
+            assert_eq!(pack.files[0].path, name);
+            assert_eq!(pack.files[0].data, VALID_MANIFEST);
+
+            let nested = format!("dark/{name}");
+            let bytes = zip_with_entries(&[(&nested, VALID_MANIFEST)]);
+            assert!(!is_crpack_archive(&bytes));
+            assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_manifest_names() {
+        for names in [["corona.json", "canora.json"], ["canora.json", "corona.json"]] {
+            let bytes = zip_with_entries(&[
+                (names[0], VALID_MANIFEST),
+                (names[1], VALID_MANIFEST),
+            ]);
+            assert!(!is_crpack_archive(&bytes));
+            assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
+        }
     }
 
     #[test]
