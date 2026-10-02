@@ -285,8 +285,8 @@ fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> anyhow::Res
         .with_context(|| format!("corona.json {key} must be a string"))
 }
 
-fn valid_theme_id(id: &str) -> bool {
-    (1..=12).contains(&id.len())
+pub(crate) fn valid_theme_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
         && id.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
         })
@@ -348,12 +348,37 @@ mod tests {
     }
 
     #[test]
+    fn theme_ids_accept_64_ascii_characters_but_not_65_or_unsafe_names() {
+        let theme_id = "a".repeat(64);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "format":"canopus-resource-pack", "formatVersion":1,
+            "themeId":theme_id, "name":"Long ID", "mappings":[]
+        }))
+        .unwrap();
+        let bytes = zip_with_entries(&[("corona.json", &manifest), ("icons/test.bin", b"asset")]);
+        let pack = parse_crpack_archive(Cursor::new(bytes)).unwrap();
+        assert_eq!(pack.theme_id, theme_id);
+        for invalid in [
+            "a".repeat(65),
+            String::new(),
+            "A".into(),
+            "../dark".into(),
+            "暗色".into(),
+        ] {
+            assert!(!valid_theme_id(&invalid));
+            let mut value: Value = serde_json::from_slice(&manifest).unwrap();
+            value["themeId"] = Value::String(invalid);
+            assert!(parse_manifest_theme_id(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_conflicting_manifest_names() {
-        for names in [["corona.json", "canora.json"], ["canora.json", "corona.json"]] {
-            let bytes = zip_with_entries(&[
-                (names[0], VALID_MANIFEST),
-                (names[1], VALID_MANIFEST),
-            ]);
+        for names in [
+            ["corona.json", "canora.json"],
+            ["canora.json", "corona.json"],
+        ] {
+            let bytes = zip_with_entries(&[(names[0], VALID_MANIFEST), (names[1], VALID_MANIFEST)]);
             assert!(!is_crpack_archive(&bytes));
             assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
         }

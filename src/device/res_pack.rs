@@ -19,6 +19,10 @@ use crate::{
     events::{CoreEvent, InterconnectMessage},
 };
 
+mod list;
+pub use list::InstalledResourcePack;
+use list::ListCollector;
+
 pub const MANAGER_PACKAGE: &str = "ng.lst.corona";
 const MAX_TEXT_CHARS: usize = 18_000;
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
@@ -26,6 +30,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_RETRY: Duration = Duration::from_millis(750);
 const MAX_ATTEMPTS: usize = 4;
 static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const LIST_ATTEMPTS: usize = 2;
+const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGER_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Component, Default)]
 pub struct ResourcePackComponent {
@@ -90,6 +97,56 @@ pub struct ResourcePackProgress {
     pub resume: Option<ResumeToken>,
 }
 
+/// Query a complete installed snapshot without closing a user-opened Manager.
+/// The device session lock also prevents a query from interrupting an upload.
+pub async fn list_installed(addr: String) -> anyhow::Result<Vec<InstalledResourcePack>> {
+    let device_addr = addr.clone();
+    let session = crate::ecs::with_rt_mut(move |rt| {
+        rt.component_ref::<ResourcePackComponent>(&device_addr)
+            .map(|comp| comp.session.clone())
+            .context("res_pack is not supported by this device")
+    })
+    .await?;
+    let _guard = session
+        .clone()
+        .try_lock_owned()
+        .context("a resource pack session is already running")?;
+    let mut transport = Transport {
+        addr: addr.clone(),
+        theme: String::new(),
+        max_chars: MAX_TEXT_CHARS,
+        events: crate::events::subscribe(),
+        session,
+    };
+    // A responsive Manager already belongs to the user. Do not navigate or
+    // claim its lifetime, even if the subsequent list query fails.
+    if let Some(hello) = transport.handshake_for(MANAGER_PROBE_TIMEOUT).await? {
+        transport.max_chars = parse_handshake_limits(&hello)?.0;
+        return transport.list_installed().await;
+    }
+
+    // A timeout does not prove the app was closed. Only a cold-start token
+    // acknowledged by Manager gives this check permission to send Q.
+    let launch_token = new_request_id();
+    let mut owned = false;
+    let result = async {
+        transport.launch_for_update_check(&launch_token).await?;
+        let hello = transport.handshake().await?;
+        transport.max_chars = parse_handshake_limits(&hello)?.0;
+        owned = confirms_launch_ownership(&hello, &launch_token);
+        transport.list_installed().await
+    }
+    .await;
+    // Unknown/legacy launch contexts, failed handshakes and an already-running
+    // Manager are left open. Retain the session lock through owned cleanup.
+    if owned {
+        if let Err(error) = transport.quit(&launch_token).await {
+            log::debug!("[ResourcePack] Manager cleanup failed: {error:#}");
+        }
+    }
+    result
+}
+
 pub async fn install(
     addr: String,
     path: PathBuf,
@@ -127,7 +184,7 @@ pub async fn install(
         events: crate::events::subscribe(),
         session: lock,
     };
-    super::thirdparty_app::launch(addr, MANAGER_PACKAGE.into(), String::new()).await?;
+    transport.launch().await?;
     let hello = transport.handshake().await?;
     let (max_chars, max_window) = parse_handshake_limits(&hello)?;
     transport.max_chars = max_chars;
@@ -269,23 +326,43 @@ fn is_ready(kind: u8, value: &Value) -> bool {
     kind == b'T' && value["operation"] == "status" && value["status"] == "ready"
 }
 
-fn decode_manager_envelope(payload: &[u8]) -> anyhow::Result<String> {
+enum ManagerPacket {
+    Text(String),
+    List(Value),
+}
+
+fn decode_manager_packet(payload: &[u8], max_chars: usize) -> anyhow::Result<ManagerPacket> {
     let envelope: Value =
         serde_json::from_slice(payload).context("invalid Manager message envelope")?;
     let packet = envelope
         .get("msg")
         .and_then(Value::as_str)
         .context("Manager message envelope is missing string msg")?;
+    if packet == "L" {
+        ensure!(
+            serde_json::to_string(&envelope)?.chars().count() <= max_chars,
+            "Manager list response exceeds maxTextChars"
+        );
+        return Ok(ManagerPacket::List(envelope));
+    }
     ensure!(
-        packet.chars().count() <= MAX_TEXT_CHARS,
+        packet.chars().count() <= max_chars,
         "Manager protocol packet exceeds maxTextChars"
     );
-    Ok(packet.to_owned())
+    Ok(ManagerPacket::Text(packet.to_owned()))
+}
+
+#[cfg(test)]
+fn decode_manager_envelope(payload: &[u8]) -> anyhow::Result<String> {
+    match decode_manager_packet(payload, MAX_TEXT_CHARS)? {
+        ManagerPacket::Text(text) => Ok(text),
+        ManagerPacket::List(_) => bail!("structured list is not a text packet"),
+    }
 }
 
 fn parse_control(text: &str) -> Option<(u8, Value)> {
     let kind = *text.as_bytes().first()?;
-    if !matches!(kind, b'H' | b'T' | b'P' | b'E') {
+    if !matches!(kind, b'H' | b'T' | b'P' | b'E' | b'Q') {
         return None;
     }
     Some((kind, serde_json::from_str(&text[1..]).ok()?))
@@ -313,6 +390,68 @@ fn received_chunks(state: &Value, count: usize) -> anyhow::Result<Vec<bool>> {
     Ok(received)
 }
 
+fn confirms_launch_ownership(hello: &Value, launch_token: &str) -> bool {
+    hello["launchToken"].as_str() == Some(launch_token)
+}
+
+fn update_check_launch_uri(launch_token: &str) -> String {
+    format!("hap://app/{MANAGER_PACKAGE}/pages/index?astroboxCheckToken={launch_token}")
+}
+
+enum ManagerCommand {
+    Launch(String),
+    Send(Vec<u8>),
+}
+
+// Validate connection ownership and enqueue in one ECS turn. In particular an
+// old query must never send Q to a newly connected device at the same address.
+fn enqueue_manager_command(
+    rt: &mut crate::ecs::runtime::Runtime,
+    addr: &str,
+    expected_session: &Arc<Mutex<()>>,
+    deadline: Instant,
+    command: ManagerCommand,
+) -> anyhow::Result<()> {
+    use super::xiaomi::components::{
+        resource::ResourceComponent,
+        thirdparty_app::{AppInfo, ThirdpartyAppSystem},
+    };
+    rt.with_device_mut(addr, |world, entity| {
+        ensure!(
+            world
+                .get::<ResourcePackComponent>(entity)
+                .is_some_and(|comp| Arc::ptr_eq(&comp.session, expected_session)),
+            "device_not_connected: resource pack connection changed"
+        );
+        // ECS jobs survive cancellation of their awaiting future. Suppress a
+        // timed-out launch/send rather than performing a late external effect.
+        ensure!(
+            Instant::now() < deadline,
+            "Manager command deadline expired"
+        );
+        let resources = world
+            .get::<ResourceComponent>(entity)
+            .context("Xiaomi resource component not found")?;
+        let app = resources
+            .quick_apps
+            .iter()
+            .find(|app| app.package_name == MANAGER_PACKAGE)
+            .context("resource Manager is not installed")?;
+        let info = AppInfo {
+            package_name: app.package_name.clone(),
+            fingerprint: app.fingerprint.clone(),
+        };
+        let mut system = world
+            .get_mut::<ThirdpartyAppSystem>(entity)
+            .context("Xiaomi thirdparty app system not found")?;
+        match command {
+            ManagerCommand::Launch(uri) => system.launch_app(&info, &uri),
+            ManagerCommand::Send(payload) => system.send_phone_message(&info, payload),
+        }
+    })
+    .context("device_not_connected: device not found")?
+}
+
 struct Transport {
     addr: String,
     theme: String,
@@ -323,12 +462,18 @@ struct Transport {
 
 impl Transport {
     async fn handshake(&mut self) -> anyhow::Result<Value> {
+        self.handshake_for(HANDSHAKE_TIMEOUT)
+            .await?
+            .context("res_pack handshake timed out")
+    }
+
+    async fn handshake_for(&mut self, duration: Duration) -> anyhow::Result<Option<Value>> {
         let request_id = new_request_id();
         let text = format!(
             "H{}",
             json!({"version":2,"type":"request","requestId":request_id,"maxTextChars":MAX_TEXT_CHARS})
         );
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let deadline = Instant::now() + duration;
         self.send_handshake_request(&text, deadline).await?;
         let mut next_send = Instant::now() + HANDSHAKE_RETRY;
         loop {
@@ -336,7 +481,7 @@ impl Transport {
             if let Some(response) = self.receive(receive_deadline).await? {
                 if is_handshake_response(&response, &request_id) {
                     let (_, value) = parse_control(&response).expect("validated control message");
-                    return Ok(value);
+                    return Ok(Some(value));
                 }
                 if is_announce(&response) {
                     self.send_handshake_request(&text, deadline).await?;
@@ -344,7 +489,7 @@ impl Transport {
                 }
             }
             if Instant::now() >= deadline {
-                bail!("res_pack handshake timed out");
+                return Ok(None);
             }
             if Instant::now() >= next_send {
                 self.send_handshake_request(&text, deadline).await?;
@@ -354,18 +499,14 @@ impl Transport {
     }
 
     async fn send_handshake_request(&self, text: &str, deadline: Instant) -> anyhow::Result<()> {
-        match timeout_at(deadline, self.send(text)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if format!("{error:#}").contains("device_not_connected") => Err(error),
-            Ok(Err(_)) | Err(_) => Ok(()),
+        match self.send_until(text, deadline).await {
+            Ok(()) => Ok(()),
+            Err(error) if format!("{error:#}").contains("device_not_connected") => Err(error),
+            Err(_) => Ok(()),
         }
     }
 
-    async fn send(&self, text: &str) -> anyhow::Result<()> {
-        ensure!(
-            text.chars().count() <= self.max_chars,
-            "interconnect message exceeds maxTextChars"
-        );
+    async fn ensure_current_session(&self) -> anyhow::Result<()> {
         let addr = self.addr.clone();
         let session = self.session.clone();
         let current = crate::ecs::with_rt_mut(move |rt| {
@@ -377,21 +518,64 @@ impl Transport {
             current,
             "device_not_connected: resource pack connection changed"
         );
-        super::thirdparty_app::send_message(
-            self.addr.clone(),
-            MANAGER_PACKAGE.into(),
-            text.as_bytes().to_vec(),
+        Ok(())
+    }
+
+    async fn command(&self, command: ManagerCommand, deadline: Instant) -> anyhow::Result<()> {
+        let addr = self.addr.clone();
+        let session = self.session.clone();
+        timeout_at(
+            deadline,
+            crate::ecs::with_rt_mut(move |rt| {
+                enqueue_manager_command(rt, &addr, &session, deadline, command)
+            }),
+        )
+        .await
+        .context("Manager command timed out")?
+    }
+
+    async fn launch(&self) -> anyhow::Result<()> {
+        self.command(
+            ManagerCommand::Launch(String::new()),
+            Instant::now() + HANDSHAKE_TIMEOUT,
         )
         .await
     }
 
-    async fn receive(&mut self, deadline: Instant) -> anyhow::Result<Option<String>> {
+    async fn launch_for_update_check(&self, launch_token: &str) -> anyhow::Result<()> {
+        self.command(
+            ManagerCommand::Launch(update_check_launch_uri(launch_token)),
+            Instant::now() + HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn send_until(&self, text: &str, deadline: Instant) -> anyhow::Result<()> {
+        ensure!(
+            text.chars().count() <= self.max_chars,
+            "interconnect message exceeds maxTextChars"
+        );
+        self.command(ManagerCommand::Send(text.as_bytes().to_vec()), deadline)
+            .await
+    }
+
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        self.send_until(text, Instant::now() + ACK_TIMEOUT).await
+    }
+
+    async fn receive_packet(&mut self, deadline: Instant) -> anyhow::Result<Option<ManagerPacket>> {
         loop {
             let event = match timeout_at(deadline, self.events.recv()).await {
                 Err(_) => return Ok(None),
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(result) => result.context("interconnect event channel closed")?,
             };
+            if let CoreEvent::DeviceStateChanged(change) = &event {
+                if change.device_addr == self.addr {
+                    self.ensure_current_session().await?;
+                }
+                continue;
+            }
             let CoreEvent::InterconnectMessage(InterconnectMessage {
                 device_addr,
                 pkg_name,
@@ -407,8 +591,22 @@ impl Transport {
                 payload.len() <= MAX_TEXT_CHARS * 4,
                 "oversized interconnect response"
             );
-            let text = decode_manager_envelope(&payload)?;
+            self.ensure_current_session().await?;
+            return Ok(Some(decode_manager_packet(&payload, self.max_chars)?));
+        }
+    }
+
+    async fn receive(&mut self, deadline: Instant) -> anyhow::Result<Option<String>> {
+        while let Some(packet) = self.receive_packet(deadline).await? {
+            let ManagerPacket::Text(text) = packet else {
+                continue;
+            };
             if let Some((kind, value)) = parse_control(&text) {
+                // Q belongs only to quit(), which reads packets directly. A
+                // delayed cleanup rejection must not abort a later upload.
+                if kind == b'Q' {
+                    continue;
+                }
                 if value
                     .get("themeId")
                     .is_some_and(|theme| theme != &self.theme)
@@ -424,6 +622,60 @@ impl Transport {
             }
             return Ok(Some(text));
         }
+        Ok(None)
+    }
+
+    async fn list_installed(&mut self) -> anyhow::Result<Vec<InstalledResourcePack>> {
+        for _ in 0..LIST_ATTEMPTS {
+            self.ensure_current_session().await?;
+            // A retry reads a new Manager snapshot and must not mix old pages.
+            let request_id = new_request_id();
+            let mut collector = ListCollector::new(request_id.clone());
+            let deadline = Instant::now() + ACK_TIMEOUT;
+            self.send_until(&format!("L{}", json!({"requestId":request_id})), deadline)
+                .await?;
+            while let Some(packet) = self.receive_packet(deadline).await? {
+                if let ManagerPacket::List(value) = packet {
+                    if let Some(items) = collector.push(value)? {
+                        return Ok(items);
+                    }
+                }
+            }
+        }
+        bail!("resource pack list timed out")
+    }
+
+    async fn quit(&mut self, launch_token: &str) -> anyhow::Result<()> {
+        let deadline = Instant::now() + QUIT_TIMEOUT;
+        timeout_at(deadline, async {
+            let request_id = new_request_id();
+            self.send_until(
+                &format!(
+                    "Q{}",
+                    json!({"requestId":request_id,"launchToken":launch_token})
+                ),
+                deadline,
+            )
+            .await?;
+            while let Some(packet) = self.receive_packet(deadline).await? {
+                let ManagerPacket::Text(text) = packet else {
+                    continue;
+                };
+                if let Some((b'Q', value)) = parse_control(&text) {
+                    if value["replyTo"] == request_id {
+                        ensure!(
+                            value["status"] == "ready",
+                            "Manager refused Q: {}",
+                            value["errorCode"]
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            bail!("Manager Q acknowledgement timed out")
+        })
+        .await
+        .context("Manager Q timed out")?
     }
 
     async fn exchange(
@@ -591,6 +843,58 @@ mod tests {
     }
 
     #[test]
+    fn structured_list_keeps_fields_and_uses_whole_object_length() {
+        let value = json!({"msg":"L","replyTo":"list_42","pageIndex":0,
+            "done":true,"total":0,"items":[]});
+        let payload = serde_json::to_vec(&value).unwrap();
+        match decode_manager_packet(&payload, MAX_TEXT_CHARS).unwrap() {
+            ManagerPacket::List(list) => assert_eq!(list, value),
+            ManagerPacket::Text(_) => panic!("L must not become a bare text packet"),
+        }
+        assert!(decode_manager_packet(&payload, 1).is_err());
+        assert!(decode_manager_envelope(&payload).is_err());
+    }
+
+    #[test]
+    fn quit_is_a_text_control_packet_with_reply_correlation() {
+        let value = json!({"replyTo":"quit_42","status":"ready"});
+        let text = format!("Q{value}");
+        let payload = serde_json::to_vec(&json!({"msg":text})).unwrap();
+        assert_eq!(decode_manager_envelope(&payload).unwrap(), text);
+        let (kind, decoded) = parse_control(&text).unwrap();
+        assert_eq!(kind, b'Q');
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn cleanup_requires_the_exact_cold_launch_token() {
+        let token = "check_42";
+        assert!(confirms_launch_ownership(
+            &json!({"launchToken":token}),
+            token
+        ));
+        for hello in [
+            json!({}),
+            json!({"launchToken":null}),
+            json!({"launchToken":42}),
+            json!({"launchToken":"other_check"}),
+        ] {
+            assert!(!confirms_launch_ownership(&hello, token));
+        }
+    }
+
+    #[test]
+    fn update_check_launch_uses_explicit_context_not_the_normal_launch_uri() {
+        let token = new_request_id();
+        assert_eq!(
+            update_check_launch_uri(&token),
+            format!("hap://app/ng.lst.corona/pages/index?astroboxCheckToken={token}")
+        );
+        // Tokens need no escaping and cannot inject a second query parameter.
+        assert!(!token.contains(['?', '&', '/', '=']));
+    }
+
+    #[test]
     fn handshake_accepts_only_matching_v2_response_not_announce() {
         let id = "request_123-abc";
         assert!(is_announce(
@@ -643,6 +947,51 @@ mod tests {
         assert!(valid(&first));
         assert!(valid(&second));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn stale_sessions_cannot_enqueue_launch_or_quit_on_a_reconnected_device() {
+        let mut rt = crate::ecs::runtime::Runtime::new();
+        let original = ResourcePackComponent::default();
+        let session = original.session.clone();
+        rt.spawn_device("device".into(), (original,));
+        rt.spawn_device("device".into(), (ResourcePackComponent::default(),));
+        for command in [
+            ManagerCommand::Launch(String::new()),
+            ManagerCommand::Send(b"Q{}".to_vec()),
+        ] {
+            let error = enqueue_manager_command(
+                &mut rt,
+                "device",
+                &session,
+                Instant::now() + ACK_TIMEOUT,
+                command,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("connection changed"));
+        }
+    }
+
+    #[test]
+    fn cancelled_command_jobs_cannot_perform_late_side_effects() {
+        let mut rt = crate::ecs::runtime::Runtime::new();
+        let component = ResourcePackComponent::default();
+        let session = component.session.clone();
+        rt.spawn_device("device".into(), (component,));
+        for command in [
+            ManagerCommand::Launch(String::new()),
+            ManagerCommand::Send(b"Q{}".to_vec()),
+        ] {
+            let error = enqueue_manager_command(
+                &mut rt,
+                "device",
+                &session,
+                Instant::now() - Duration::from_secs(1),
+                command,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("deadline expired"));
+        }
     }
 
     #[test]
