@@ -24,6 +24,8 @@ use crate::device::xiaomi::{
 mod command_pool;
 pub use command_pool::CommandPool;
 
+const MAX_PACKET_RETRIES: u8 = 3;
+
 /// 待发送的数据（已分配 seq）
 pub struct QueuedData {
     pub seq: u8,
@@ -40,6 +42,8 @@ struct SendItem {
     need_retransmission: bool,
     /// 期待收到 ACK 的截止时间，用于检测是否需要重传。
     deadline: Instant,
+    /// 已重传次数
+    retries: u8,
 }
 
 /// 管理 SAR L1/L2 发送状态的核心控制器，实现窗口、超时与累积确认逻辑。
@@ -347,16 +351,70 @@ impl SarController {
     fn check_timeouts_internal(&mut self) {
         let now = Instant::now();
         let mut need = false;
+        let mut exceeded = false;
         for item in self.tx_queue.iter_mut() {
             if item.wait_ack && now >= item.deadline {
+                if item.retries >= MAX_PACKET_RETRIES {
+                    log::warn!(
+                        "[SarController] Packet seq={} on device {} exceeded max retries ({}); aborting transmission",
+                        item.packet.seq,
+                        self.device_id,
+                        MAX_PACKET_RETRIES
+                    );
+                    exceeded = true;
+                    break;
+                }
+                item.retries = item.retries.saturating_add(1);
                 item.wait_ack = false;
                 item.need_retransmission = true;
                 need = true;
             }
         }
+        if exceeded {
+            self.abort_all_pending(crate::anyhow_site!("SAR max retransmission limit exceeded"));
+            return;
+        }
         if need {
             self.try_run_next();
         }
+    }
+
+    pub fn abort_all_pending(&mut self, err: anyhow::Error) {
+        log::warn!(
+            "[SarController] Aborting all pending packets for {}: {err:#}",
+            self.device_id
+        );
+        self.tx_queue.clear();
+        self.command_pool = CommandPool::new();
+        self.ack_notify.notify_waiters();
+
+        let device_id = self.device_id.clone();
+        let handle = self.tk_handle.clone();
+        spawn_with_handle(
+            async move {
+                crate::device::xiaomi::fail_all_device_slots(&device_id, err).await;
+            },
+            handle,
+        );
+    }
+
+    async fn on_send_failure(device_id: &str, err: super::SendError) {
+        log::warn!(
+            "[SarController] Transport send failed for {}: {:?}",
+            device_id,
+            err
+        );
+        let dev_id = device_id.to_string();
+        crate::ecs::with_rt_mut(move |rt| {
+            let _ = rt.with_device_mut(&dev_id, |world, entity| {
+                if let Some(dev) = world.get_mut::<super::XiaomiDevice>(entity) {
+                    dev.sar.lock().abort_all_pending(crate::anyhow_site!(
+                        "Transport send failed: {err:?}"
+                    ));
+                }
+            });
+        })
+        .await;
     }
 
     pub fn on_l1_packet(&mut self, l1: &L1Packet) -> bool {
@@ -524,9 +582,12 @@ impl SarController {
             );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
+            let device_id = self.device_id.clone();
             spawn_with_handle(
                 async move {
-                    let _ = (send_fn)(vec![pkt.to_bytes()]).await;
+                    if let Err(err) = (send_fn)(vec![pkt.to_bytes()]).await {
+                        Self::on_send_failure(&device_id, err).await;
+                    }
                 },
                 handle,
             );
@@ -554,9 +615,12 @@ impl SarController {
             );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
+            let device_id = self.device_id.clone();
             spawn_with_handle(
                 async move {
-                    let _ = (send_fn)(cmd_batch).await;
+                    if let Err(err) = (send_fn)(cmd_batch).await {
+                        Self::on_send_failure(&device_id, err).await;
+                    }
                 },
                 handle,
             );
@@ -576,6 +640,7 @@ impl SarController {
                 wait_ack: true,
                 need_retransmission: false,
                 deadline,
+                retries: 0,
             });
         }
         if !data_batch.is_empty() {
@@ -597,12 +662,90 @@ impl SarController {
             );
             let send_fn = self.sender.clone();
             let handle = self.tk_handle.clone();
+            let device_id = self.device_id.clone();
             spawn_with_handle(
                 async move {
-                    let _ = (send_fn)(data_batch).await;
+                    if let Err(err) = (send_fn)(data_batch).await {
+                        Self::on_send_failure(&device_id, err).await;
+                    }
                 },
                 handle,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn max_retries_exceeded_aborts_pending_queue() {
+        let sent_count = Arc::new(AtomicUsize::new(0));
+        let sent_count_clone = sent_count.clone();
+        let sender: SendFn = Arc::new(move |_batches| {
+            sent_count_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+
+        let handle = tokio::runtime::Handle::current();
+        let profiler = TransportProfilerHandle::new();
+        let config = SarConfig::default();
+
+        let mut sar = SarController::new(
+            handle,
+            sender,
+            "test_device".to_string(),
+            profiler,
+            config,
+        );
+
+        // Put one data packet into tx_queue
+        sar.enqueue(vec![0x01, 0x02, 0x03]);
+        assert_eq!(sar.tx_queue.len(), 1);
+        assert_eq!(sar.tx_queue[0].retries, 0);
+
+        // Simulate timeouts for retry 1, 2, 3
+        for expected_retries in 1..=MAX_PACKET_RETRIES {
+            sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+            sar.check_timeouts_internal();
+            assert_eq!(sar.tx_queue[0].retries, expected_retries);
+            assert!(sar.tx_queue[0].wait_ack);
+            assert!(!sar.tx_queue[0].need_retransmission);
+        }
+
+        // The 4th timeout check exceeds MAX_PACKET_RETRIES -> aborts queue
+        sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+        sar.check_timeouts_internal();
+
+        // tx_queue must be cleared upon abort
+        assert_eq!(sar.tx_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abort_all_pending_notifies_ack_waiter() {
+        let sender: SendFn = Arc::new(|_| Box::pin(async { Ok(()) }));
+        let handle = tokio::runtime::Handle::current();
+        let profiler = TransportProfilerHandle::new();
+        let config = SarConfig::default();
+
+        let mut sar = SarController::new(
+            handle,
+            sender,
+            "test_device_2".to_string(),
+            profiler,
+            config,
+        );
+
+        let notifier = sar.ack_notifier();
+        let waiter = notifier.notified();
+
+        sar.abort_all_pending(crate::anyhow_site!("test abort"));
+
+        // Waiter must be notified immediately
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("ack_notifier was not notified upon abort");
     }
 }

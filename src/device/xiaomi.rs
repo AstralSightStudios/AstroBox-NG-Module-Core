@@ -198,3 +198,27 @@ impl XiaomiDevice {
         self.device.addr()
     }
 }
+
+pub async fn fail_all_device_slots(device_id: &str, err: anyhow::Error) {
+    let dev_id = device_id.to_string();
+    crate::ecs::with_rt_mut(move |rt| {
+        let _ = rt.with_device_mut(&dev_id, |world, entity| {
+            if let Some(mut sys) = world.get_mut::<components::info::InfoSystem>(entity) {
+                sys.fail_waiters(&err);
+            }
+            if let Some(mut sys) = world.get_mut::<components::resource::ResourceSystem>(entity) {
+                sys.fail_waiters(&err);
+            }
+            if let Some(mut sys) = world.get_mut::<components::watchface::WatchfaceSystem>(entity) {
+                sys.fail_waiters(&err);
+            }
+            if let Some(mut sys) = world.get_mut::<components::media::MediaSystem>(entity) {
+                sys.fail_waiters(&err);
+            }
+            if let Some(mut sys) = world.get_mut::<components::report::ReportSystem>(entity) {
+                sys.fail_waiters(&err);
+            }
+        });
+    })
+    .await;
+}

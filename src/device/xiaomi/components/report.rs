@@ -29,14 +29,21 @@ impl ReportSystem {
         }
     }
 
+    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
+        let msg = err.to_string();
+        self.device_log_wait.fail(anyhow::anyhow!("{msg}"));
+    }
+
     pub fn request_device_log_export(
         &mut self,
     ) -> oneshot::Receiver<anyhow::Result<protocol::report_data::Result>> {
         let (rx, should_enqueue) = self.device_log_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(build_report_data_packet(
+            if let Err(err) = self.enqueue_request(build_report_data_packet(
                 protocol::report_data::Type::DeviceLog,
-            ));
+            )) {
+                self.device_log_wait.fail(err);
+            }
         }
         rx
     }
@@ -45,8 +52,8 @@ impl ReportSystem {
         self.device_log_wait.clear();
     }
 
-    fn enqueue_request(&mut self, request: protocol::WearPacket) {
-        self.enqueue_pb_request(request, "ReportSystem::enqueue_request");
+    fn enqueue_request(&mut self, request: protocol::WearPacket) -> anyhow::Result<()> {
+        self.try_enqueue_pb_request(request, "ReportSystem::enqueue_request")
     }
 }
 

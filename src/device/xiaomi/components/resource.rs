@@ -32,6 +32,12 @@ impl ResourceSystem {
         }
     }
 
+    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
+        let msg = err.to_string();
+        self.watchface_wait.fail(anyhow::anyhow!("{msg}"));
+        self.quick_app_wait.fail(anyhow::anyhow!("{msg}"));
+    }
+
     pub async fn get_installed_watchfaces(
         &mut self,
     ) -> anyhow::Result<Vec<protocol::WatchFaceItem>> {

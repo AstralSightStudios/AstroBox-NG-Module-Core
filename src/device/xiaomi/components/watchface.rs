@@ -40,6 +40,16 @@ impl WatchfaceSystem {
         }
     }
 
+    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
+        let msg = err.to_string();
+        self.set_current_wait.fail(anyhow::anyhow!("{msg}"));
+        self.uninstall_wait.fail(anyhow::anyhow!("{msg}"));
+        self.edit_wait.fail(anyhow::anyhow!("{msg}"));
+        self.bg_image_wait.fail(anyhow::anyhow!("{msg}"));
+        self.font_wait.fail(anyhow::anyhow!("{msg}"));
+        self.support_data_wait.fail(anyhow::anyhow!("{msg}"));
+    }
+
     /// Fire-and-forget variant retained for callers that do not need the
     /// device acknowledgement.  Xiaomi's WatchFace protocol does expose a
     /// `Success` response; use `request_set_watchface` when completion matters.

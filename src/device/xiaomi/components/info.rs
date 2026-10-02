@@ -57,12 +57,21 @@ impl InfoSystem {
         .await
     }
 
+    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
+        let msg = err.to_string();
+        self.device_info_wait.fail(anyhow::anyhow!("{msg}"));
+        self.device_status_wait.fail(anyhow::anyhow!("{msg}"));
+        self.device_storage_wait.fail(anyhow::anyhow!("{msg}"));
+    }
+
     pub fn request_device_info(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceInfo>> {
         let (rx, should_enqueue) = self.device_info_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(Self::build_system_packet(
+            if let Err(err) = self.enqueue_request(Self::build_system_packet(
                 protocol::system::SystemId::GetDeviceInfo,
-            ));
+            )) {
+                self.device_info_wait.fail(err);
+            }
         }
         rx
     }
@@ -70,9 +79,11 @@ impl InfoSystem {
     pub fn request_device_status(&mut self) -> oneshot::Receiver<anyhow::Result<DeviceStatus>> {
         let (rx, should_enqueue) = self.device_status_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(Self::build_system_packet(
+            if let Err(err) = self.enqueue_request(Self::build_system_packet(
                 protocol::system::SystemId::GetDeviceStatus,
-            ));
+            )) {
+                self.device_status_wait.fail(err);
+            }
         }
         rx
     }
@@ -82,15 +93,17 @@ impl InfoSystem {
     ) -> oneshot::Receiver<anyhow::Result<protocol::StorageInfo>> {
         let (rx, should_enqueue) = self.device_storage_wait.prepare();
         if should_enqueue {
-            self.enqueue_request(Self::build_system_packet(
+            if let Err(err) = self.enqueue_request(Self::build_system_packet(
                 protocol::system::SystemId::GetStorageInfo,
-            ));
+            )) {
+                self.device_storage_wait.fail(err);
+            }
         }
         rx
     }
 
-    fn enqueue_request(&mut self, request: protocol::WearPacket) {
-        self.enqueue_pb_request(request, "InfoSystem::enqueue_request");
+    fn enqueue_request(&mut self, request: protocol::WearPacket) -> anyhow::Result<()> {
+        self.try_enqueue_pb_request(request, "InfoSystem::enqueue_request")
     }
 
     fn build_system_packet(id: protocol::system::SystemId) -> protocol::WearPacket {

@@ -99,6 +99,30 @@ impl MediaSystem {
         }
     }
 
+    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
+        let msg = err.to_string();
+        self.song_summary_wait.fail(anyhow::anyhow!("{msg}"));
+        self.media_file_summary_wait.fail(anyhow::anyhow!("{msg}"));
+        if let Some(tx) = self.media_file_list_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+        if let Some(tx) = self.song_page_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+        if let Some(tx) = self.songlist_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+        if let Some(tx) = self.song_remove_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+        if let Some(tx) = self.song_add_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+        if let Some(tx) = self.song_report_wait.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+        }
+    }
+
     pub fn request_song_summary(&mut self) -> oneshot::Receiver<Result<protocol::SongSummary>> {
         let (rx, should_enqueue) = self.song_summary_wait.prepare();
         if should_enqueue {
