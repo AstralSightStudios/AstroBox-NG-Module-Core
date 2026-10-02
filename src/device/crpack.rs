@@ -47,7 +47,7 @@ pub(crate) fn is_crpack_archive(data: &[u8]) -> bool {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        if entry.name() != "canora.json" || entry.is_dir() {
+        if entry.name() != "corona.json" || entry.is_dir() {
             continue;
         }
         if manifest_found
@@ -135,17 +135,17 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
         let declared_size = entry.size();
         let remaining_bytes = MAX_BYTES - total_bytes;
         let mut entry_limit = remaining_bytes;
-        if relative_path == "canora.json" {
+        if relative_path == "corona.json" {
             entry_limit = entry_limit.min(MAX_MANIFEST_BYTES);
         }
         let data = read_entry_bounded(entry, declared_size, entry_limit)
             .with_context(|| format!("invalid or oversized ZIP entry: {relative_path}"))?;
         total_bytes += data.len();
 
-        if relative_path == "canora.json" {
+        if relative_path == "corona.json" {
             ensure!(
                 manifest_bytes.is_none(),
-                "CRPack must contain exactly one canora.json"
+                "CRPack must contain exactly one corona.json"
             );
             manifest_bytes = Some(data.clone());
         }
@@ -155,7 +155,7 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
         });
     }
 
-    let manifest_bytes = manifest_bytes.context("CRPack must contain a root canora.json")?;
+    let manifest_bytes = manifest_bytes.context("CRPack must contain a root corona.json")?;
     let theme_id = parse_manifest_theme_id(&manifest_bytes)?;
     ensure!(!files.is_empty(), "empty CRPack");
     for file in &files {
@@ -249,17 +249,17 @@ fn has_supported_marker(data: &[u8]) -> bool {
 fn parse_manifest_theme_id(data: &[u8]) -> anyhow::Result<String> {
     ensure!(
         !data.is_empty() && data.len() <= MAX_MANIFEST_BYTES,
-        "canora.json must be between 1 byte and 64 KiB"
+        "corona.json must be between 1 byte and 64 KiB"
     );
     ensure!(
         !data.starts_with(&[0xef, 0xbb, 0xbf]),
-        "canora.json must be UTF-8 without a BOM"
+        "corona.json must be UTF-8 without a BOM"
     );
     let value: Value =
-        serde_json::from_slice(data).context("canora.json is not valid UTF-8 JSON")?;
+        serde_json::from_slice(data).context("corona.json is not valid UTF-8 JSON")?;
     let object = value
         .as_object()
-        .context("canora.json root must be an object")?;
+        .context("corona.json root must be an object")?;
     ensure!(
         required_string(object, "format")? == RESOURCE_PACK_FORMAT,
         "unsupported CRPack format"
@@ -278,7 +278,7 @@ fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> anyhow::Res
     object
         .get(key)
         .and_then(Value::as_str)
-        .with_context(|| format!("canora.json {key} must be a string"))
+        .with_context(|| format!("corona.json {key} must be a string"))
 }
 
 fn valid_theme_id(id: &str) -> bool {
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn recognizes_and_loads_crpack_without_extension_assumptions() {
         let bytes = zip_with_entries(&[
-            ("canora.json", VALID_MANIFEST),
+            ("corona.json", VALID_MANIFEST),
             ("app/settings/launcher.bin", b"asset"),
         ]);
         assert!(is_crpack_archive(&bytes));
@@ -320,7 +320,7 @@ mod tests {
         let pack = parse_crpack_archive(Cursor::new(bytes)).unwrap();
         assert_eq!(pack.theme_id, "dark");
         assert_eq!(pack.files.len(), 2);
-        assert_eq!(pack.files[0].path, "canora.json");
+        assert_eq!(pack.files[0].path, "corona.json");
         assert_eq!(pack.files[1].path, "app/settings/launcher.bin");
         assert_eq!(pack.files[1].data, b"asset");
         assert_eq!(pack.total_bytes, VALID_MANIFEST.len() + 5);
@@ -328,14 +328,14 @@ mod tests {
 
     #[test]
     fn rejects_non_root_manifest_wrong_marker_and_unsupported_version() {
-        let wrapped = zip_with_entries(&[("dark/canora.json", VALID_MANIFEST)]);
+        let wrapped = zip_with_entries(&[("dark/corona.json", VALID_MANIFEST)]);
         assert!(!is_crpack_archive(&wrapped));
         assert!(parse_crpack_archive(Cursor::new(wrapped)).is_err());
 
         let wrong_format = br#"{"format":"other","formatVersion":1}"#;
         let wrong_version = br#"{"format":"canopus-resource-pack","formatVersion":2}"#;
         for manifest in [wrong_format.as_slice(), wrong_version.as_slice()] {
-            let bytes = zip_with_entries(&[("canora.json", manifest)]);
+            let bytes = zip_with_entries(&[("corona.json", manifest)]);
             assert!(!is_crpack_archive(&bytes));
             assert!(parse_crpack_archive(Cursor::new(bytes)).is_err());
         }
@@ -343,25 +343,25 @@ mod tests {
 
     #[test]
     fn rejects_legacy_mappings_duplicates_and_unsafe_paths() {
-        let legacy = zip_with_entries(&[("mappings.tsv", b"old"), ("canora.json", VALID_MANIFEST)]);
+        let legacy = zip_with_entries(&[("mappings.tsv", b"old"), ("corona.json", VALID_MANIFEST)]);
         assert!(parse_crpack_archive(Cursor::new(legacy)).is_err());
 
         let duplicate = zip_with_entries(&[
-            ("canora.json", VALID_MANIFEST),
-            ("canora.json", VALID_MANIFEST),
+            ("corona.json", VALID_MANIFEST),
+            ("corona.json", VALID_MANIFEST),
         ]);
         assert!(parse_crpack_archive(Cursor::new(duplicate)).is_err());
 
         let traversal =
-            zip_with_entries(&[("canora.json", VALID_MANIFEST), ("../evil.bin", b"bad")]);
+            zip_with_entries(&[("corona.json", VALID_MANIFEST), ("../evil.bin", b"bad")]);
         assert!(parse_crpack_archive(Cursor::new(traversal)).is_err());
 
         let backslash =
-            zip_with_entries(&[("canora.json", VALID_MANIFEST), ("icons\\evil.bin", b"bad")]);
+            zip_with_entries(&[("corona.json", VALID_MANIFEST), ("icons\\evil.bin", b"bad")]);
         assert!(parse_crpack_archive(Cursor::new(backslash)).is_err());
 
         let drive_path =
-            zip_with_entries(&[("canora.json", VALID_MANIFEST), ("C:/evil.bin", b"bad")]);
+            zip_with_entries(&[("corona.json", VALID_MANIFEST), ("C:/evil.bin", b"bad")]);
         assert!(parse_crpack_archive(Cursor::new(drive_path)).is_err());
     }
 
@@ -370,7 +370,7 @@ mod tests {
         let mut writer = ZipArchiveWriter::new(Cursor::new(Vec::new()));
         let options =
             zip::write::FileOptions::default().compression_method(CompressionMethod::Stored);
-        writer.start_file("canora.json", options).unwrap();
+        writer.start_file("corona.json", options).unwrap();
         writer.write_all(EMPTY_MAPPING_MANIFEST).unwrap();
         for index in 0..256 {
             writer
@@ -388,7 +388,7 @@ mod tests {
     fn leaves_mapping_semantics_to_the_device_manager() {
         let invalid_mapping_manifest = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[{"source":"not-absolute","destination":"../outside/"}]}"#;
         let bytes = zip_with_entries(&[
-            ("canora.json", invalid_mapping_manifest),
+            ("corona.json", invalid_mapping_manifest),
             ("app/settings/launcher.bin", b"asset"),
         ]);
         assert!(is_crpack_archive(&bytes));

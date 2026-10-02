@@ -674,7 +674,7 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
 
         let options = zip::write::FileOptions::default();
-        zip.start_file("canora.json", options).unwrap();
+        zip.start_file("corona.json", options).unwrap();
         zip.write_all(MANIFEST).unwrap();
         zip.start_file("app/test.bin", options).unwrap();
         zip.write_all(b"binary_payload").unwrap();
@@ -685,7 +685,7 @@ mod tests {
         let pack = result.unwrap();
         assert_eq!(pack.theme, "dark");
         assert_eq!(pack.files.len(), 2);
-        assert_eq!(pack.files[0].path, "canora.json");
+        assert_eq!(pack.files[0].path, "corona.json");
         assert_eq!(pack.files[1].path, "app/test.bin");
         assert_eq!(pack.files[1].data, b"binary_payload");
         assert_eq!(pack.total, MANIFEST.len() + b"binary_payload".len());

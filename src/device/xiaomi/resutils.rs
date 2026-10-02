@@ -672,7 +672,7 @@ mod tests {
     fn get_file_type_recognizes_crpack_by_manifest_contents() {
         let manifest = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
         let data = zip_with_entries(&[
-            ("canora.json", manifest),
+            ("corona.json", manifest),
             ("assets/toolkit.bin", b"toolkit"),
         ]);
 
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn get_file_type_does_not_recognize_wrong_crpack_version() {
         let manifest = br#"{"format":"canopus-resource-pack","formatVersion":2}"#;
-        let data = zip_with_entries(&[("canora.json", manifest)]);
+        let data = zip_with_entries(&[("corona.json", manifest)]);
 
         assert_eq!(get_file_type(&data), FileType::Zip);
     }
