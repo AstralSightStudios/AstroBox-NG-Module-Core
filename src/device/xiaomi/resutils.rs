@@ -941,6 +941,120 @@ mod tests {
         assert!(manifest_found, "manifest.xml should be preserved");
         assert!(bin_found, "renamed bin should be preserved");
     }
+
+    #[test]
+    fn get_file_type_recognizes_abp_by_manifest_contents() {
+        let manifest_json = br#"{
+            "name": "calculator",
+            "version": "1.0.0",
+            "entry": "index.wasm",
+            "wasi_version": 1,
+            "api_level": 2,
+            "permissions": []
+        }"#;
+        let abp_data = zip_with_entries(&[("manifest.json", manifest_json)]);
+        assert!(is_abp_archive(&abp_data));
+        assert_eq!(get_file_type(&abp_data), FileType::Abp);
+    }
+
+    #[test]
+    fn get_file_type_rejects_quickapp_manifest_as_abp() {
+        let quickapp_manifest = br#"{
+            "package": "com.example.quickapp",
+            "name": "QuickApp",
+            "versionName": "1.0.0",
+            "versionCode": 100
+        }"#;
+        let rpk_data = zip_with_entries(&[("manifest.json", quickapp_manifest)]);
+        assert!(!is_abp_archive(&rpk_data));
+        assert_ne!(get_file_type(&rpk_data), FileType::Abp);
+    }
+
+    #[test]
+    fn get_file_type_recognizes_mwz_by_contents() {
+        let bin_bytes = data_with_field(b"123456789");
+        let description_xml = br#"<?xml version="1.0" encoding="utf-8"?>
+<watch>
+    <name>TestFace</name>
+    <_id>123456789</_id>
+</watch>"#;
+        let mwz_data = zip_with_entries(&[
+            ("description.xml", description_xml),
+            ("123456789.bin", &bin_bytes),
+        ]);
+        assert!(is_mwz_archive(&mwz_data));
+        assert_eq!(get_file_type(&mwz_data), FileType::WatchFace);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AbpManifestMarker {
+    name: String,
+    api_level: u32,
+    #[allow(dead_code)]
+    #[serde(default)]
+    entry: Option<String>,
+}
+
+/// 识别 ZIP 压缩包是否为 AstroBox 插件包（ABP）。
+/// 从内部包含的 manifest.json 结构特征判断（具有 api_level、合法 name 等），
+/// 不依赖外部文件名后缀，适配 Android SAF 等无后缀 content:// URI 场景。
+pub fn is_abp_archive(data: &[u8]) -> bool {
+    if !is_zip(data) {
+        return false;
+    }
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(data)) else {
+        return false;
+    };
+    let max_entries = archive.len().min(500);
+    for i in 0..max_entries {
+        let Ok(mut file) = archive.by_index(i) else {
+            continue;
+        };
+        if file.name().ends_with('/') {
+            continue;
+        }
+        let is_manifest = std::path::Path::new(file.name())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("manifest.json"))
+            .unwrap_or(false);
+        if !is_manifest {
+            continue;
+        }
+        if file.size() > 1024 * 1024 {
+            continue;
+        }
+        let mut content = Vec::new();
+        if file.read_to_end(&mut content).is_err() {
+            continue;
+        }
+        if let Ok(manifest) = serde_json::from_slice::<AbpManifestMarker>(&content) {
+            let trimmed = manifest.name.trim();
+            if !trimmed.is_empty()
+                && trimmed != "."
+                && trimmed != ".."
+                && !trimmed.ends_with('.')
+                && !trimmed.contains('/')
+                && !trimmed.contains('\\')
+                && !trimmed.contains(':')
+                && manifest.api_level >= 1
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 识别 ZIP 压缩包是否为 MWZ 表盘包。
+/// 从内部 description.xml / manifest.xml / bin 中的表盘 ID 判断，
+/// 不依赖外部文件名后缀。
+pub fn is_mwz_archive(data: &[u8]) -> bool {
+    if !is_zip(data) {
+        return false;
+    }
+    get_mwz_watchface_id(data, &ResConfig::default()).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Serialize_repr, PartialEq)]
@@ -969,14 +1083,16 @@ pub fn get_file_type(data: &[u8]) -> FileType {
     if is_xiaomi_firmware(data, Some(data.len())) {
         return FileType::Firmware;
     }
+    // 检查是不是 ABP 插件包（根据内部 manifest.json 特征）
+    if is_abp_archive(data) {
+        return FileType::Abp;
+    }
+    // 检查是不是 MWZ 表盘包（根据内部 description.xml / manifest.xml / bin 特征）
+    if is_mwz_archive(data) {
+        return FileType::WatchFace;
+    }
     // 1. 检查是不是 ZIP 格式
     if data.len() >= 4 && &data[..4] == [0x50, 0x4B, 0x03, 0x04] {
-        /* // 检查扩展名 abp
-        if let Some(ext) = filename.extension() {
-            if ext == "abp" {
-                return Ok("abp".to_string());
-            }
-        } */
         // 检查尾部是否包含 quickapp 字样
         let tail = &data[..];
 
