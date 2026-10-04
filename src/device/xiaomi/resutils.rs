@@ -80,8 +80,12 @@ fn get_bin_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     }
     let field = &data[offset..offset + field_len];
 
-    // 表盘 ID 可能是 9 位或 12 位的字母数字组合，前面可能存在非 ID 的填充字节。
-    // 扫描字段中的字母数字连续段，返回第一个长度合法的段作为 ID。
+    let range = find_bin_watchface_id_range(field)?;
+    String::from_utf8(field[range].to_vec()).ok()
+}
+
+fn find_bin_watchface_id_range(field: &[u8]) -> Option<std::ops::Range<usize>> {
+    // Skip padding and locate the complete 9- or 12-byte alphanumeric ID.
     let mut i = 0;
     while i < field.len() {
         if !(field[i] as char).is_ascii_alphanumeric() {
@@ -93,7 +97,7 @@ fn get_bin_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
             i += 1;
         }
         if VALID_WATCHFACE_ID_LENGTHS.contains(&(i - run_start)) {
-            return Some(field[run_start..i].iter().map(|&b| b as char).collect());
+            return Some(run_start..i);
         }
     }
 
@@ -188,11 +192,21 @@ fn set_bin_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Re
     }
 
     let field = &data[offset..field_end];
-    // 原始资源文件中的 ID 始终为数字，借此定位 ID 在字段中的起始位置。
-    let start = field
-        .iter()
-        .position(|&b| (b as char).is_ascii_digit())
-        .ok_or("No digits found in watchface ID field")?;
+    let start = match find_bin_watchface_id_range(field) {
+        Some(range) => range.start,
+        None => {
+            // Preserve support for nonstandard numeric IDs, including any
+            // leading letters in the same run rather than treating them as padding.
+            let mut start = field
+                .iter()
+                .position(u8::is_ascii_digit)
+                .ok_or("No watchface ID found in watchface ID field")?;
+            while start > 0 && field[start - 1].is_ascii_alphanumeric() {
+                start -= 1;
+            }
+            start
+        }
+    };
 
     if start + new_id.len() > field_len {
         return Err(format!(
@@ -506,6 +520,70 @@ mod tests {
 
         assert_eq!(&data[4..7], b"ab\0");
         assert_eq!(&data[7..19], b"111222333444");
+    }
+
+    #[test]
+    fn set_watchface_id_replaces_corona_id_from_its_first_letter() {
+        let config = ResConfig::default();
+        let mut data = vec![0; config.watchface_id_offset + config.watchface_id_field_len + 4];
+        let start = config.watchface_id_offset + 6;
+        data[start..start + 12].copy_from_slice(b"corona000000");
+        let field_end = config.watchface_id_offset + config.watchface_id_field_len;
+        data[field_end..].fill(0xaa);
+
+        set_watchface_id_vec(&mut data, &config, "canopus_corona").unwrap();
+
+        assert!(data[config.watchface_id_offset..start].iter().all(|&b| b == 0));
+        assert_eq!(&data[start..start + 14], b"canopus_corona");
+        assert!(data[start + 14..field_end].iter().all(|&b| b == 0));
+        assert_eq!(&data[field_end..], &[0xaa; 4]);
+    }
+
+    #[test]
+    fn set_watchface_id_replaces_letter_only_id_and_can_be_repeated() {
+        let config = test_config();
+        let mut data = data_with_field(b"ab\0ABCDEFGHIJKL");
+
+        set_watchface_id(&mut data, &config, "aB3dE6gH9jK2").unwrap();
+        assert_eq!(&data[4..7], b"ab\0");
+        assert_eq!(
+            get_watchface_id(&data, &config).as_deref(),
+            Some("aB3dE6gH9jK2")
+        );
+
+        set_watchface_id(&mut data, &config, "123456789").unwrap();
+        assert_eq!(
+            get_watchface_id(&data, &config).as_deref(),
+            Some("123456789")
+        );
+        assert!(data[16..28].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn set_watchface_id_keeps_nonstandard_numeric_id_support() {
+        let config = test_config();
+        let mut data = data_with_field(b"\0\0abc12345");
+
+        set_watchface_id(&mut data, &config, "987654321").unwrap();
+
+        assert_eq!(&data[4..6], &[0; 2]);
+        assert_eq!(
+            get_watchface_id(&data, &config).as_deref(),
+            Some("987654321")
+        );
+    }
+
+    #[test]
+    fn set_watchface_id_rejects_insufficient_remaining_space_without_mutation() {
+        let config = test_config();
+        let mut data = data_with_field(b"\0\0\0\0\0\0corona000000");
+        let original = data.clone();
+        let new_id = "x".repeat(19);
+
+        let err = set_watchface_id(&mut data, &config, &new_id).unwrap_err();
+
+        assert_eq!(err, "Watchface ID field is too short for 19 bytes");
+        assert_eq!(data, original);
     }
 
     #[test]
