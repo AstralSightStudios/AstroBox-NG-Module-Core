@@ -418,7 +418,15 @@ where
     // 3) 等设备回能力参数
     let prepare_resp = rx.await.context("Mass prepare response not received")?;
     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
-        bail_site!("Mass data prepare was not READY");
+        // 带上设备给的状态名（LowStorage / ExceedQuantityLimit …），前端据此给出
+        // 具体原因；不带的话一律落到笼统的“设备拒绝”。
+        match protocol::PrepareStatus::try_from(prepare_resp.prepare_status) {
+            Ok(status) => bail_site!("Mass data prepare was not READY (status: {:?})", status),
+            Err(_) => bail_site!(
+                "Mass data prepare was not READY (status: {})",
+                prepare_resp.prepare_status
+            ),
+        }
     }
     if let Some(profiler) = profiler.as_ref() {
         profiler.record(
