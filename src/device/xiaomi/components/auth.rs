@@ -56,10 +56,17 @@ impl AuthSystem {
         let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
         *self.auth_wait.lock() = Some(tx);
 
+        let app_device_id = with_device_component_mut::<AuthComponent, _, _>(
+            self.owner_id.clone(), |comp| comp.app_device_id.clone(),
+        ).map_err(|err| anyhow_site!("failed to read app device ID: {err:?}"))?;
         with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), move |dev| {
-            dev.sar
-                .lock()
-                .enqueue(L2Packet::pb_write(build_auth_step_1(&nonce)).to_bytes());
+            let mut packet = build_auth_step_1(&nonce);
+            if let Some(pb::xiaomi::protocol::wear_packet::Payload::Account(account)) = &mut packet.payload {
+                if let Some(pb::xiaomi::protocol::account::Payload::AuthAppVerify(verify)) = &mut account.payload {
+                    verify.app_device_id = app_device_id;
+                }
+            }
+            dev.sar.lock().enqueue(L2Packet::pb_write(packet).to_bytes());
         })
         .map_err(|err| {
             self.auth_wait.lock().take();
@@ -151,6 +158,7 @@ impl L2PbExt for AuthSystem {
 #[derive(Component, serde::Serialize)]
 pub struct AuthComponent {
     pub authkey: String,
+    pub app_device_id: Option<String>,
     pub is_authed: bool,
     pub random_bytes: Vec<u8>,
     pub enc_key: Vec<u8>,
@@ -177,6 +185,7 @@ impl AuthComponent {
     pub fn new(authkey: String) -> Self {
         Self {
             authkey,
+            app_device_id: None,
             is_authed: false,
             random_bytes: vec![],
             enc_key: vec![],

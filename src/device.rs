@@ -33,6 +33,7 @@ use crate::device::xiaomi::components::network::NetworkComponent;
 use crate::device::xiaomi::components::network::NetworkSystem;
 use crate::device::xiaomi::components::{
     auth::{AuthComponent, AuthSystem},
+    bind::{BindSystem, XiaomiConnectOptions},
     info::{InfoComponent, InfoSystem},
     install::{InstallComponent, InstallSystem},
     mass::{MassComponent, MassSystem},
@@ -136,6 +137,33 @@ where
     F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), SendError>> + Send + 'static,
 {
+    create_device_with_options(
+        tk_handle, device_kind, name, addr, authkey, sar_version, connect_type,
+        tx_win_overrun_allowance, transport_chunk_size_spp, transport_chunk_size_ble,
+        force_android, XiaomiConnectOptions::default(), sender,
+    ).await
+}
+
+pub async fn create_device_with_options<F, Fut>(
+    tk_handle: Handle,
+    device_kind: DeviceKind,
+    name: String,
+    addr: String,
+    authkey: String,
+    sar_version: u32,
+    connect_type: ConnectType,
+    tx_win_overrun_allowance: Option<u8>,
+    transport_chunk_size_spp: Option<usize>,
+    transport_chunk_size_ble: Option<usize>,
+    force_android: bool,
+    options: XiaomiConnectOptions,
+    sender: F,
+) -> anyhow::Result<DeviceConnectionInfo>
+where
+    F: Fn(Vec<Vec<u8>>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), SendError>> + Send + 'static,
+{
+    let binding = options.local_bind.is_some();
     match device_kind {
         DeviceKind::Vivo => {
             bail!(
@@ -193,8 +221,13 @@ where
                 let mut entity_ref = rt.world_mut().entity_mut(entity);
                 #[cfg(not(target_arch = "wasm32"))]
                 entity_ref.insert(res_pack::ResourcePackComponent::default());
+                let mut auth = AuthComponent::new(authkey_for_component);
+                auth.app_device_id = options.app_device_id;
+                if let Some(config) = options.local_bind {
+                    entity_ref.insert(BindSystem::new(device_id.clone(), config));
+                }
                 entity_ref.insert((
-                    AuthComponent::new(authkey_for_component),
+                    auth,
                     AuthSystem::new(device_id.clone()),
                     InstallComponent::new(),
                     InstallSystem::new(device_id.clone(), install_config),
@@ -237,10 +270,13 @@ where
 
             let auth_rx = crate::ecs::with_rt_mut(move |rt| {
                 rt.with_device_mut(&device_id_for_auth, |world, entity| {
-                    let mut auth_system = world
-                        .get_mut::<AuthSystem>(entity)
-                        .expect("AuthSystem missing");
-                    auth_system.prepare_auth().map(Some)
+                    if binding {
+                        world.get_mut::<BindSystem>(entity)
+                            .expect("BindSystem missing").prepare_bind().map(Some)
+                    } else {
+                        world.get_mut::<AuthSystem>(entity)
+                            .expect("AuthSystem missing").prepare_auth().map(Some)
+                    }
                 })
                 .unwrap_or_else(|| Err(crate::anyhow_site!("Device removed before authentication")))
             })

@@ -8,6 +8,9 @@ edition = "2024"
 sha2 = "0.10.9"
 sha1 = "0.10"
 hmac = "0.12.1"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh"] }
+getrandom = { version = "0.2", features = ["js"] }
 rc4 = "0.1"
 cipher = "0.4"
 aes = "0.8.4"

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bind;
 pub mod info;
 pub mod install;
 pub mod mass;
