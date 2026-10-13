@@ -76,6 +76,21 @@ fn packet(
     }
 }
 
+/// The band reads `date` as local time `yyyyMMdd'T'HHmmss`: the Watch S5
+/// (4.101.020) takes the 8 digits before and the 6 after the `T`, and
+/// dereferences `strchr(date, 'T') + 1` unchecked, so a date without a `T`
+/// crashes it.
+fn notification_date(timestamp_ms: u64) -> String {
+    use chrono::TimeZone;
+
+    chrono::Local
+        .timestamp_millis_opt(timestamp_ms as i64)
+        .earliest()
+        .unwrap_or_else(chrono::Local::now)
+        .format("%Y%m%dT%H%M%S")
+        .to_string()
+}
+
 fn build_notification(source: &str, content: NotificationContent) -> Result<protocol::WearPacket> {
     let id = notification_id(source, content.id)?;
     let (focus, focus_v2) = match content.live_activity {
@@ -91,7 +106,7 @@ fn build_notification(source: &str, content: NotificationContent) -> Result<prot
             title: content.title,
             sub_title: content.sub_title,
             text: content.text,
-            date: content.timestamp_ms.to_string(),
+            date: notification_date(content.timestamp_ms),
             uid: id.uid,
             app_group: id.app_group,
             key: id.key,
@@ -157,7 +172,8 @@ mod tests {
             sent
         );
         let value = data(&sent);
-        assert_eq!(value.date, "1700000000000");
+        assert_eq!(value.date.len(), 15);
+        assert_eq!(value.date.as_bytes()[8], b'T');
         assert_eq!(value.support_reply, Some(false));
         assert!(value.focus.is_none() && value.focus_v2.is_none());
         let removed = build_removal("plugin-a", 7).unwrap();
