@@ -250,6 +250,7 @@ where
                     WatchfaceSystem::new(device_id.clone()),
                     SyncComponent::new(),
                     SyncSystem::new(device_id.clone()),
+                    crate::device::canopus::CanopusSystem::new(),
                 ));
                 #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
                 {

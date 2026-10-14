@@ -84,6 +84,360 @@ pub fn updates(installed: &[CanopusModule], available: &[(String, u32)]) -> Vec<
         .collect()
 }
 
+
+
+// -----------------------------------------------------------------------------
+// WearPacket Layer 2 Communication & CPC2 Protocol (ADR-CAN-008)
+// -----------------------------------------------------------------------------
+
+use crate::device::xiaomi::packet::v2::layer2::{L2Channel, L2Cipher, L2Error, L2OpCode, L2Packet};
+use crate::device::xiaomi::system::XiaomiSystemExt;
+use bevy_ecs::component::Component;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+
+pub const CANOPUS_L2_CHANNEL: u8 = 0x43;
+pub const CANOPUS_TRANSPORT_V2_MAGIC: u32 = 0x43504332; // "CPC2"
+pub const CANOPUS_TRANSPORT_V2_HEADER_SIZE: usize = 36;
+pub const CANOPUS_ABI_MAJOR: u16 = 1;
+pub const CANOPUS_ABI_MINOR: u16 = 0;
+pub const CANOPUS_PROTO_MAX_PAYLOAD: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CanopusCommand {
+    Echo = 1,
+    Install = 2,
+    Enable = 3,
+    Disable = 4,
+    Remove = 5,
+    Rollback = 7,
+    QueryModule = 8,
+    QueryDevice = 9,
+    EnterSafeMode = 10,
+    Activate = 11,
+    Scan = 12,
+    NativeStage = 13,
+    RestoreAfterBoot = 14,
+}
+
+impl TryFrom<u32> for CanopusCommand {
+    type Error = Cpc2CodecError;
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        Ok(match v {
+            1 => CanopusCommand::Echo,
+            2 => CanopusCommand::Install,
+            3 => CanopusCommand::Enable,
+            4 => CanopusCommand::Disable,
+            5 => CanopusCommand::Remove,
+            7 => CanopusCommand::Rollback,
+            8 => CanopusCommand::QueryModule,
+            9 => CanopusCommand::QueryDevice,
+            10 => CanopusCommand::EnterSafeMode,
+            11 => CanopusCommand::Activate,
+            12 => CanopusCommand::Scan,
+            13 => CanopusCommand::NativeStage,
+            14 => CanopusCommand::RestoreAfterBoot,
+            _ => return Err(Cpc2CodecError::UnknownCommand(v)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CanopusResult {
+    Accepted = 1,
+    Queued = 2,
+    Running = 3,
+    Completed = 4,
+    Failed = 5,
+    Rejected = 6,
+    Disallowed = 7,
+    RebootRequired = 8,
+}
+
+impl TryFrom<u32> for CanopusResult {
+    type Error = Cpc2CodecError;
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        Ok(match v {
+            1 => CanopusResult::Accepted,
+            2 => CanopusResult::Queued,
+            3 => CanopusResult::Running,
+            4 => CanopusResult::Completed,
+            5 => CanopusResult::Failed,
+            6 => CanopusResult::Rejected,
+            7 => CanopusResult::Disallowed,
+            8 => CanopusResult::RebootRequired,
+            _ => return Err(Cpc2CodecError::InvalidResult(v)),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Cpc2CodecError {
+    TooShort(usize),
+    InvalidMagic(u32),
+    HeaderTooSmall(usize),
+    UnsupportedAbiMajor(u16),
+    UnsupportedAbiMinor(u16),
+    PayloadTooLarge(usize),
+    LengthMismatch(usize, usize),
+    UnknownCommand(u32),
+    InvalidResult(u32),
+    InvalidKind(u16),
+}
+
+impl std::fmt::Display for Cpc2CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort(len) => write!(f, "Frame too short: {len} bytes"),
+            Self::InvalidMagic(m) => write!(f, "Invalid magic: 0x{m:08x}"),
+            Self::HeaderTooSmall(sz) => write!(f, "Header size too small: {sz}"),
+            Self::UnsupportedAbiMajor(maj) => write!(f, "Unsupported ABI major: {maj}"),
+            Self::UnsupportedAbiMinor(min) => write!(f, "Unsupported ABI minor: {min}"),
+            Self::PayloadTooLarge(sz) => write!(f, "Payload too large: {sz} bytes"),
+            Self::LengthMismatch(expected, actual) => {
+                write!(f, "Length mismatch: expected {expected}, actual {actual}")
+            }
+            Self::UnknownCommand(cmd) => write!(f, "Unknown command opcode: {cmd}"),
+            Self::InvalidResult(res) => write!(f, "Invalid result code: {res}"),
+            Self::InvalidKind(k) => write!(f, "Invalid message kind: {k}"),
+        }
+    }
+}
+
+impl std::error::Error for Cpc2CodecError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cpc2Request {
+    pub command: CanopusCommand,
+    pub request_id: u32,
+    pub payload: Vec<u8>,
+}
+
+impl Cpc2Request {
+    pub fn new(command: CanopusCommand, request_id: u32, payload: Vec<u8>) -> Self {
+        Self {
+            command,
+            request_id,
+            payload,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, Cpc2CodecError> {
+        if self.payload.len() > CANOPUS_PROTO_MAX_PAYLOAD {
+            return Err(Cpc2CodecError::PayloadTooLarge(self.payload.len()));
+        }
+        let total = CANOPUS_TRANSPORT_V2_HEADER_SIZE + self.payload.len();
+        let mut buf = vec![0u8; total];
+        buf[0..4].copy_from_slice(&CANOPUS_TRANSPORT_V2_MAGIC.to_le_bytes());
+        buf[4..6].copy_from_slice(&(CANOPUS_TRANSPORT_V2_HEADER_SIZE as u16).to_le_bytes());
+        buf[6..8].copy_from_slice(&1u16.to_le_bytes()); // REQUEST = 1
+        buf[8..10].copy_from_slice(&CANOPUS_ABI_MAJOR.to_le_bytes());
+        buf[10..12].copy_from_slice(&CANOPUS_ABI_MINOR.to_le_bytes());
+        buf[12..16].copy_from_slice(&(total as u32).to_le_bytes());
+        buf[16..20].copy_from_slice(&(self.command as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&self.request_id.to_le_bytes());
+        buf[24..28].copy_from_slice(&0u32.to_le_bytes()); // flags
+        buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // result = 0
+        buf[32..36].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        if !self.payload.is_empty() {
+            buf[CANOPUS_TRANSPORT_V2_HEADER_SIZE..].copy_from_slice(&self.payload);
+        }
+        Ok(buf)
+    }
+
+    pub fn to_l2_packet(&self, cipher: Option<&dyn L2Cipher>) -> Result<L2Packet, L2Error> {
+        let wire = self.encode().map_err(|_| L2Error::TooShort)?;
+        match cipher {
+            Some(c) => L2Packet::canopus_write_enc(wire, c),
+            None => Ok(L2Packet::canopus_write(wire)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cpc2Response {
+    pub opcode: u32,
+    pub request_id: u32,
+    pub result: CanopusResult,
+    pub payload: Vec<u8>,
+}
+
+impl Cpc2Response {
+    pub fn decode(buf: &[u8]) -> Result<Self, Cpc2CodecError> {
+        if buf.len() < CANOPUS_TRANSPORT_V2_HEADER_SIZE {
+            return Err(Cpc2CodecError::TooShort(buf.len()));
+        }
+        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if magic != CANOPUS_TRANSPORT_V2_MAGIC {
+            return Err(Cpc2CodecError::InvalidMagic(magic));
+        }
+        let header_size = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
+        let kind = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if kind != 2 {
+            // RESPONSE = 2
+            return Err(Cpc2CodecError::InvalidKind(kind));
+        }
+        let major = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        if major != CANOPUS_ABI_MAJOR {
+            return Err(Cpc2CodecError::UnsupportedAbiMajor(major));
+        }
+        let minor = u16::from_le_bytes(buf[10..12].try_into().unwrap());
+        if minor > CANOPUS_ABI_MINOR {
+            return Err(Cpc2CodecError::UnsupportedAbiMinor(minor));
+        }
+        let total_size = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        if total_size != buf.len() || total_size < header_size {
+            return Err(Cpc2CodecError::LengthMismatch(total_size, buf.len()));
+        }
+        let opcode = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let request_id = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+        let result_code = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        let result = CanopusResult::try_from(result_code)?;
+        let payload_size = u32::from_le_bytes(buf[32..36].try_into().unwrap()) as usize;
+        if payload_size > CANOPUS_PROTO_MAX_PAYLOAD || header_size + payload_size != total_size {
+            return Err(Cpc2CodecError::LengthMismatch(
+                header_size + payload_size,
+                total_size,
+            ));
+        }
+        let payload = buf[header_size..header_size + payload_size].to_vec();
+        Ok(Self {
+            opcode,
+            request_id,
+            result,
+            payload,
+        })
+    }
+}
+
+/// ECS component that listens on `L2Channel::Canopus` and dispatches CPC2 responses
+/// to pending futures.
+#[derive(Component, Default)]
+pub struct CanopusSystem {
+    next_request_id: AtomicU32,
+    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+}
+
+impl CanopusSystem {
+    pub fn new() -> Self {
+        crate::device::xiaomi::system::register_xiaomi_system_ext_on_l2packet::<Self>();
+        Self {
+            next_request_id: AtomicU32::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn next_id(&self) -> u32 {
+        let mut id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        }
+        id
+    }
+
+    pub fn register_waiter(&self, request_id: u32) -> oneshot::Receiver<Cpc2Response> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(request_id, tx);
+        rx
+    }
+}
+
+pub async fn send_cpc2_request(
+    addr: &str,
+    req: Cpc2Request,
+    timeout: std::time::Duration,
+) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    use crate::device::xiaomi::XiaomiDevice;
+
+    let request_id = req.request_id;
+    let rx = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), move |sys| {
+        sys.register_waiter(request_id)
+    })
+    .map_err(|e| format!("Device component access failed: {:?}", e))?;
+
+    let cipher = crate::device::xiaomi::packet::cipher::get_l2_cipher(addr);
+    let l2_pkt = req
+        .to_l2_packet(cipher.as_deref().map(|c| c as &dyn L2Cipher))
+        .map_err(|e| format!("L2 packet build failed: {:?}", e))?;
+
+    with_device_component_mut::<XiaomiDevice, _, _>(addr.to_string(), move |dev| {
+        dev.sar.lock().enqueue(l2_pkt.to_bytes());
+    })
+    .map_err(|e| format!("Failed to enqueue packet: {:?}", e))?;
+
+    tokio::time::timeout(timeout, rx)
+        .await
+        .map_err(|_| "Canopus request timed out".to_string())?
+        .map_err(|_| "Response channel closed".to_string())
+}
+
+pub async fn query_device(addr: &str) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+        .unwrap_or(1);
+    let req = Cpc2Request::new(CanopusCommand::QueryDevice, req_id, vec![]);
+    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+}
+
+pub async fn trigger_scan(addr: &str) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+        .unwrap_or(1);
+    let req = Cpc2Request::new(CanopusCommand::Scan, req_id, vec![]);
+    send_cpc2_request(addr, req, std::time::Duration::from_secs(10)).await
+}
+
+pub async fn set_module_enabled(addr: &str, module_id: &str, enable: bool) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+        .unwrap_or(1);
+    let cmd = if enable { CanopusCommand::Enable } else { CanopusCommand::Disable };
+    let req = Cpc2Request::new(cmd, req_id, module_id.as_bytes().to_vec());
+    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+}
+
+pub async fn remove_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+        .unwrap_or(1);
+    let req = Cpc2Request::new(CanopusCommand::Remove, req_id, module_id.as_bytes().to_vec());
+    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+}
+
+impl XiaomiSystemExt for CanopusSystem {
+    fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
+        if channel != L2Channel::Canopus {
+            return;
+        }
+
+        match Cpc2Response::decode(payload) {
+            Ok(resp) => {
+                log::debug!(
+                    "[CanopusSystem] received CPC2 response: opcode={}, request_id={}, result={:?}",
+                    resp.opcode,
+                    resp.request_id,
+                    resp.result
+                );
+                if let Some(tx) = self.pending.lock().unwrap().remove(&resp.request_id) {
+                    let _ = tx.send(resp);
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "[CanopusSystem] failed to decode CPC2 response ({} bytes): {}",
+                    payload.len(),
+                    err
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,4 +488,33 @@ mod tests {
         assert_eq!(found[0].id, "a");
         assert_eq!(found[0].installed_version_code, 3);
     }
+
+    #[test]
+    fn test_cpc2_request_encode_response_decode() {
+        let req = Cpc2Request::new(CanopusCommand::QueryDevice, 0x4301, vec![1, 2, 3, 4]);
+        let enc = req.encode().unwrap();
+        assert_eq!(enc.len(), CANOPUS_TRANSPORT_V2_HEADER_SIZE + 4);
+        assert_eq!(&enc[0..4], &CANOPUS_TRANSPORT_V2_MAGIC.to_le_bytes());
+
+        // Construct response wire frame
+        let mut resp_wire = vec![0u8; CANOPUS_TRANSPORT_V2_HEADER_SIZE + 2];
+        resp_wire[0..4].copy_from_slice(&CANOPUS_TRANSPORT_V2_MAGIC.to_le_bytes());
+        resp_wire[4..6].copy_from_slice(&(CANOPUS_TRANSPORT_V2_HEADER_SIZE as u16).to_le_bytes());
+        resp_wire[6..8].copy_from_slice(&2u16.to_le_bytes()); // RESPONSE = 2
+        resp_wire[8..10].copy_from_slice(&CANOPUS_ABI_MAJOR.to_le_bytes());
+        resp_wire[10..12].copy_from_slice(&CANOPUS_ABI_MINOR.to_le_bytes());
+        resp_wire[12..16].copy_from_slice(&((CANOPUS_TRANSPORT_V2_HEADER_SIZE + 2) as u32).to_le_bytes());
+        resp_wire[16..20].copy_from_slice(&(CanopusCommand::QueryDevice as u32).to_le_bytes());
+        resp_wire[20..24].copy_from_slice(&0x4301u32.to_le_bytes());
+        resp_wire[28..32].copy_from_slice(&(CanopusResult::Completed as u32).to_le_bytes());
+        resp_wire[32..36].copy_from_slice(&2u32.to_le_bytes());
+        resp_wire[36..38].copy_from_slice(&[0xaa, 0xbb]);
+
+        let decoded = Cpc2Response::decode(&resp_wire).unwrap();
+        assert_eq!(decoded.opcode, CanopusCommand::QueryDevice as u32);
+        assert_eq!(decoded.request_id, 0x4301);
+        assert_eq!(decoded.result, CanopusResult::Completed);
+        assert_eq!(decoded.payload, vec![0xaa, 0xbb]);
+    }
+
 }

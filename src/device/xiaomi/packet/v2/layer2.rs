@@ -18,6 +18,7 @@ pub enum L2Channel {
     Lyra = 8,        // TRANSPORT_CHANNEL_LYRA
     Research = 9,    // TRANSPORT_CHANNEL_RESEARCH
     MultiModal = 10, // TRANSPORT_CHANNEL_MULTI_MODAL
+    Canopus = 0x43,  // TRANSPORT_CHANNEL_CANOPUS (ADR-CAN-008, 'C')
 }
 
 impl TryFrom<u8> for L2Channel {
@@ -35,6 +36,7 @@ impl TryFrom<u8> for L2Channel {
             8 => Lyra,
             9 => Research,
             10 => MultiModal,
+            0x43 => Canopus,
             _ => return Err(L2Error::InvalidChannel(v)),
         })
     }
@@ -154,6 +156,17 @@ impl L2Packet {
         Ok(Self::new(L2Channel::Pb, L2OpCode::WriteEnc, ct))
     }
 
+    pub fn canopus_write(payload: Vec<u8>) -> Self {
+        Self::new(L2Channel::Canopus, L2OpCode::Write, payload)
+    }
+
+    pub fn canopus_write_enc(payload: Vec<u8>, cipher: &dyn L2Cipher) -> Result<Self, L2Error> {
+        let ct = cipher
+            .encrypt(&payload)
+            .map_err(|_| L2Error::DecryptFailed)?;
+        Ok(Self::new(L2Channel::Canopus, L2OpCode::WriteEnc, ct))
+    }
+
     pub fn into_l1(self, seq: u8, frx: bool) -> L1Packet {
         L1Packet::new(L1DataType::Data, frx, seq, self.to_bytes())
     }
@@ -169,4 +182,25 @@ impl L2Packet {
 pub trait L2Cipher {
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, ()>;
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ()>;
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_canopus_channel_roundtrip() {
+        assert_eq!(L2Channel::try_from(0x43).unwrap(), L2Channel::Canopus);
+        let pkt = L2Packet::canopus_write(vec![0x43, 0x50, 0x43, 0x32]);
+        let bytes = pkt.to_bytes();
+        assert_eq!(bytes[0], 0x43);
+        assert_eq!(bytes[1], L2OpCode::Write as u8);
+        assert_eq!(&bytes[2..], &[0x43, 0x50, 0x43, 0x32]);
+
+        let parsed = L2Packet::from_bytes(&bytes, None).unwrap();
+        assert_eq!(parsed.channel, L2Channel::Canopus);
+        assert_eq!(parsed.opcode, L2OpCode::Write);
+        assert_eq!(parsed.payload, vec![0x43, 0x50, 0x43, 0x32]);
+    }
 }
