@@ -409,6 +409,120 @@ pub async fn remove_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Respo
     send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanopusDeviceInfo {
+    pub framework_revision: u32,
+    pub safe_mode: bool,
+    pub module_count: u32,
+    pub safe_mode_reason: u32,
+    pub error_code: u32,
+    pub flags: u32,
+    pub scan_summary: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanopusDeviceModule {
+    pub slot: u32,
+    pub module_id: String,
+    pub version: u32,
+    pub state: u32,
+    pub lifecycle_class: u32,
+    pub flags: u32,
+    pub activation_error: u32,
+}
+
+pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
+    if payload.len() < 36 {
+        return Err(format!("Payload too short for device info: {} bytes", payload.len()));
+    }
+    let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    if magic != 0x43514431 {
+        return Err(format!("Invalid CQD1 magic: 0x{magic:08x}"));
+    }
+    let framework_revision = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let safe_mode = u32::from_le_bytes(payload[12..16].try_into().unwrap()) != 0;
+    let module_count = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let safe_mode_reason = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+    let error_code = u32::from_le_bytes(payload[24..28].try_into().unwrap());
+    let flags = u32::from_le_bytes(payload[28..32].try_into().unwrap());
+    let scan_summary = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+
+    Ok(CanopusDeviceInfo {
+        framework_revision,
+        safe_mode,
+        module_count,
+        safe_mode_reason,
+        error_code,
+        flags,
+        scan_summary,
+    })
+}
+
+pub fn parse_module_info(payload: &[u8]) -> Result<CanopusDeviceModule, String> {
+    if payload.len() < 64 {
+        return Err(format!("Payload too short for module info: {} bytes", payload.len()));
+    }
+    let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    if magic != 0x43514D31 {
+        return Err(format!("Invalid CQM1 magic: 0x{magic:08x}"));
+    }
+    let slot = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let state = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    let lifecycle_class = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let version = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+    let flags = u32::from_le_bytes(payload[24..28].try_into().unwrap());
+    let id_bytes = &payload[28..60];
+    let id_len = id_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+    let module_id = String::from_utf8_lossy(&id_bytes[..id_len]).trim().to_string();
+    let activation_error = u32::from_le_bytes(payload[60..64].try_into().unwrap());
+
+    Ok(CanopusDeviceModule {
+        slot,
+        module_id,
+        version,
+        state,
+        lifecycle_class,
+        flags,
+        activation_error,
+    })
+}
+
+pub async fn get_device_info(addr: &str) -> Result<CanopusDeviceInfo, String> {
+    let resp = query_device(addr).await?;
+    if resp.result != CanopusResult::Completed {
+        return Err(format!("Device query returned {:?}", resp.result));
+    }
+    parse_device_info(&resp.payload)
+}
+
+pub async fn query_module(addr: &str, slot: u32) -> Result<Option<CanopusDeviceModule>, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+        .unwrap_or(1);
+    let req = Cpc2Request::new(CanopusCommand::QueryModule, req_id, slot.to_le_bytes().to_vec());
+    let resp = send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await?;
+    if resp.result != CanopusResult::Completed || resp.payload.len() < 64 {
+        return Ok(None);
+    }
+    Ok(parse_module_info(&resp.payload).ok())
+}
+
+pub async fn list_device_modules(addr: &str) -> Result<Vec<CanopusDeviceModule>, String> {
+    let info = get_device_info(addr).await?;
+    let mut modules = Vec::new();
+    for slot in 0..32 {
+        if modules.len() as u32 >= info.module_count {
+            break;
+        }
+        if let Ok(Some(m)) = query_module(addr, slot).await {
+            modules.push(m);
+        }
+    }
+    Ok(modules)
+}
+
 impl XiaomiSystemExt for CanopusSystem {
     fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
         if channel != L2Channel::Canopus {
@@ -515,6 +629,45 @@ mod tests {
         assert_eq!(decoded.request_id, 0x4301);
         assert_eq!(decoded.result, CanopusResult::Completed);
         assert_eq!(decoded.payload, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_parse_device_and_module_info() {
+        // Construct mock CQD1 payload (36 bytes)
+        let mut dev_payload = vec![0u8; 36];
+        dev_payload[0..4].copy_from_slice(&0x43514431u32.to_le_bytes()); // "CQD1"
+        dev_payload[4..8].copy_from_slice(&36u32.to_le_bytes());
+        dev_payload[8..12].copy_from_slice(&2u32.to_le_bytes()); // revision
+        dev_payload[12..16].copy_from_slice(&0u32.to_le_bytes()); // safe_mode = false
+        dev_payload[16..20].copy_from_slice(&3u32.to_le_bytes()); // module_count = 3
+        dev_payload[20..24].copy_from_slice(&0u32.to_le_bytes()); // safe_mode_reason
+        dev_payload[24..28].copy_from_slice(&0u32.to_le_bytes()); // error_code
+        dev_payload[28..32].copy_from_slice(&0u32.to_le_bytes()); // flags
+        dev_payload[32..36].copy_from_slice(&0x10u32.to_le_bytes()); // scan_summary
+
+        let dev_info = parse_device_info(&dev_payload).unwrap();
+        assert_eq!(dev_info.framework_revision, 2);
+        assert!(!dev_info.safe_mode);
+        assert_eq!(dev_info.module_count, 3);
+        assert_eq!(dev_info.scan_summary, 0x10);
+
+        // Construct mock CQM1 payload (64 bytes)
+        let mut mod_payload = vec![0u8; 64];
+        mod_payload[0..4].copy_from_slice(&0x43514D31u32.to_le_bytes()); // "CQM1"
+        mod_payload[4..8].copy_from_slice(&64u32.to_le_bytes());
+        mod_payload[8..12].copy_from_slice(&1u32.to_le_bytes()); // slot = 1
+        mod_payload[12..16].copy_from_slice(&3u32.to_le_bytes()); // state = 3 (ENABLED)
+        mod_payload[16..20].copy_from_slice(&1u32.to_le_bytes()); // lifecycle = 1
+        mod_payload[20..24].copy_from_slice(&100u32.to_le_bytes()); // version = 100
+        mod_payload[24..28].copy_from_slice(&0u32.to_le_bytes()); // flags
+        mod_payload[28..40].copy_from_slice(b"lyra_player\0");
+        mod_payload[60..64].copy_from_slice(&0u32.to_le_bytes()); // activation_error
+
+        let mod_info = parse_module_info(&mod_payload).unwrap();
+        assert_eq!(mod_info.slot, 1);
+        assert_eq!(mod_info.module_id, "lyra_player");
+        assert_eq!(mod_info.version, 100);
+        assert_eq!(mod_info.state, 3);
     }
 
 }
