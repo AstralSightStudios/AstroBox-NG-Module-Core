@@ -55,6 +55,7 @@ use std::future::Future;
 use tokio::runtime::Handle;
 
 mod crpack;
+pub mod canopus;
 pub mod data;
 pub mod install;
 pub mod notification;
