@@ -1148,10 +1148,15 @@ pub enum FileType {
     Firmware = MassDataType::Firmare as u8,
     ThirdPartyApp = MassDataType::ThirdPartyApp as u8,
     ResourcePack = 92,
+    Canopus = 93,
 }
 pub fn get_file_type(data: &[u8]) -> FileType {
     if data.is_empty() {
         return FileType::Null;
+    }
+    // Native .canopus tar packages are not quick-app ZIP containers.
+    if crate::device::canopus::package::is_canopus_archive(data) {
+        return FileType::Canopus;
     }
     // CRPack is identified by its root manifest marker, not by its extension.
     if is_crpack_archive(data) {

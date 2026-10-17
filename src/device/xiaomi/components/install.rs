@@ -80,6 +80,9 @@ impl InstallSystem {
         progress_cb: Arc<dyn Fn(SendMassCallbackData) + Send + Sync>,
         watchface_id: Option<&str>,
     ) -> Result<InstallFuture> {
+        if crate::device::canopus::package::is_canopus_archive(&file_data) {
+            bail_site!("native .canopus packages require Canopus CPC2 staging, never MASS installation");
+        }
         let owner = self.owner_id.clone();
 
         let mut file_data = file_data;

@@ -45,6 +45,7 @@ prost = "0.14.1"
 nanorand = "0.8"
 hex = "0.4.3"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+tar = { version = "0.4.44", default-features = false }
 
 [features]
 default = ["xiaomi-network-stack"]
