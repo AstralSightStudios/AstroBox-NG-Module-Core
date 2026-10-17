@@ -156,6 +156,8 @@ impl XiaomiDevice {
         }
 
         let base = Device::new(name, addr, DeviceKind::Xiaomi);
+        // BLE 按单次写入上限分档定窗口/超时（对齐 iOS 官方），SPP 沿用安卓官方参数
+        let link = sar::SarLinkParams::for_transport(connect_type, config.transport.chunk_size_ble);
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
         let sar = sar::SarController::new(
             tk_handle.clone(),
@@ -163,6 +165,7 @@ impl XiaomiDevice {
             base.addr().to_string(),
             transport_profiler.clone(),
             config.sar.clone(),
+            link,
         );
 
         let dev = Self {
@@ -217,6 +220,12 @@ pub async fn fail_all_device_slots(device_id: &str, err: anyhow::Error) {
             }
             if let Some(mut sys) = world.get_mut::<components::report::ReportSystem>(entity) {
                 sys.fail_waiters(&err);
+            }
+            if let Some(comp) = world.get_mut::<components::install::InstallComponent>(entity) {
+                comp.fail_waiters(&err);
+            }
+            if let Some(comp) = world.get_mut::<components::mass::MassComponent>(entity) {
+                comp.fail_waiters();
             }
         });
     })

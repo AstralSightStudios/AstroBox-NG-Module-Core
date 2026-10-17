@@ -68,6 +68,8 @@ struct ReverseMassWaiter {
 struct PendingMassPart {
     part_num: u16,
     seq: u8,
+    /// 入队时的 SAR 会话代号；会话被中止/重启后旧 seq 作废，同号的新帧不能当成它的 ACK
+    epoch: u32,
     payload_len: usize,
     acked: bool,
 }
@@ -321,6 +323,11 @@ impl MassComponent {
             prepare_wait: Mutex::new(None),
         }
     }
+
+    /// 链路中止时丢掉 Prepare 等待者，发送方立刻失败而不是一直挂着。
+    pub fn fail_waiters(&self) {
+        self.prepare_wait.lock().take();
+    }
 }
 
 fn looks_like_reverse_mass_packet(payload: &[u8]) -> bool {
@@ -416,7 +423,14 @@ where
     log::info!("Waiting for prepare response...");
 
     // 3) 等设备回能力参数
-    let prepare_resp = rx.await.context("Mass prepare response not received")?;
+    let prepare_timeout = get_mass_config(&owner_id)
+        .await
+        .map(|config| config.prepare_timeout_secs)
+        .unwrap_or(MassConfig::default().prepare_timeout_secs);
+    let prepare_resp = timeout(Duration::from_secs(prepare_timeout), rx)
+        .await
+        .map_err(|_| crate::anyhow_site!("timed out waiting for MASS prepare response"))?
+        .context("Mass prepare response not received")?;
     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
         // 带上设备给的状态名（LowStorage / ExceedQuantityLimit …），前端据此给出
         // 具体原因；不带的话一律落到笼统的“设备拒绝”。
@@ -560,19 +574,9 @@ where
         .map(|(soft, raw, timeout)| (Some(soft), Some(raw), Some(timeout)))
         .unwrap_or((None, None, None));
 
-    let mass_config = crate::ecs::with_rt_mut({
-        let owner = owner_id.clone();
-        move |rt| {
-            rt.with_device_mut(&owner, |world, entity| {
-                world
-                    .get::<XiaomiDevice>(entity)
-                    .map(|dev| dev.config.mass.clone())
-            })
-            .flatten()
-        }
-    })
-    .await
-    .with_context(|| format!("Device {} not found when retrieving MASS config", owner_id))?;
+    let mass_config = get_mass_config(&owner_id)
+        .await
+        .with_context(|| format!("Device {} not found when retrieving MASS config", owner_id))?;
 
     // 7) 基于 hint 计算我们的批大小/软上限/卡顿判定门限
     let batch_limit = compute_batch_limit(&mass_config, tx_window_hint);
@@ -696,8 +700,8 @@ where
     .await?;
 
     // 最后把队头一个个等 ACK，直到清空
-    while let Some(front_seq) = pending_parts.front().map(|p| p.seq) {
-        wait_for_seq_ack(&owner_id, front_seq, &mass_config).await?;
+    while let Some((front_seq, front_epoch)) = pending_parts.front().map(|p| (p.seq, p.epoch)) {
+        wait_for_seq_ack(&owner_id, front_seq, front_epoch, &mass_config).await?;
         consume_acked_parts(
             &owner_id,
             &mut pending_parts,
@@ -728,7 +732,7 @@ async fn flush_mass_batch(
     let meta = mem::take(batch_meta);
     let meta_len = meta.len();
 
-    let seqs = enqueue_mass_batch(owner_id, payloads).await?;
+    let (seqs, epoch) = enqueue_mass_batch(owner_id, payloads).await?;
     if seqs.len() != meta_len {
         bail_site!(
             "enqueue_batch returned {} seqs but {} payloads were submitted",
@@ -741,6 +745,7 @@ async fn flush_mass_batch(
         pending_parts.push_back(PendingMassPart {
             part_num,
             seq,
+            epoch,
             payload_len,
             acked: false,
         });
@@ -807,7 +812,7 @@ where
     }
 
     if should_wait {
-        if let Some(front_seq) = pending_parts.front().map(|p| p.seq) {
+        if let Some((front_seq, front_epoch)) = pending_parts.front().map(|p| (p.seq, p.epoch)) {
             let wait_reason = if pending_parts.len() >= backlog_soft_limit {
                 "backlog"
             } else {
@@ -815,7 +820,7 @@ where
             };
             let wait_started_at = Instant::now();
             // 等队头 ACK 一个，再继续推进
-            wait_for_seq_ack(owner_id, front_seq, config).await?;
+            wait_for_seq_ack(owner_id, front_seq, front_epoch, config).await?;
             if let Some(profiler) = profiler {
                 profiler.record(
                     "mass",
@@ -855,6 +860,19 @@ where
     Ok(())
 }
 
+async fn get_mass_config(owner_id: &str) -> Option<MassConfig> {
+    let owner = owner_id.to_string();
+    crate::ecs::with_rt_mut(move |rt| {
+        rt.with_device_mut(&owner, |world, entity| {
+            world
+                .get::<XiaomiDevice>(entity)
+                .map(|dev| dev.config.mass.clone())
+        })
+        .flatten()
+    })
+    .await
+}
+
 async fn get_transport_profiler(owner_id: &str) -> Option<TransportProfilerHandle> {
     let owner = owner_id.to_string();
     crate::ecs::with_rt_mut(move |rt| {
@@ -868,18 +886,20 @@ async fn get_transport_profiler(owner_id: &str) -> Option<TransportProfilerHandl
     .await
 }
 
-/// 真正把批量包入队（交给 SAR），拿回每个包对应的 seq
-async fn enqueue_mass_batch(owner_id: &str, payloads: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+/// 真正把批量包入队（交给 SAR），拿回每个包对应的 seq 以及入队时的会话代号
+async fn enqueue_mass_batch(owner_id: &str, payloads: Vec<Vec<u8>>) -> Result<(Vec<u8>, u32)> {
     if payloads.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     crate::ecs::with_rt_mut({
         let owner = owner_id.to_string();
-        move |rt| -> Result<Vec<u8>> {
+        move |rt| -> Result<(Vec<u8>, u32)> {
             rt.with_device_mut(&owner, |world, entity| {
                 if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
-                    Ok(dev.sar.lock().enqueue_batch(payloads))
+                    let mut sar = dev.sar.lock();
+                    let seqs = sar.enqueue_batch(payloads);
+                    Ok((seqs, sar.session_epoch()))
                 } else {
                     bail_site!("Device {} not found when enqueueing MASS batch", owner)
                 }
@@ -929,8 +949,31 @@ fn compute_ack_stall_deadline(
     Duration::from_millis(combined.clamp(config.ack_stall_min_ms, config.ack_stall_max_ms))
 }
 
+/// 查询某个 seq 的确认状态；`None` 表示它所属的 SAR 会话已被中止，永远不会再有 ACK
+async fn query_seq_ack(owner_id: &str, seq: u8, epoch: u32, consume: bool) -> Option<bool> {
+    let owner = owner_id.to_string();
+    crate::ecs::with_rt_mut(move |rt| {
+        rt.with_device_mut(&owner, |world, entity| {
+            let Some(dev) = world.get_mut::<XiaomiDevice>(entity) else {
+                return Some(false);
+            };
+            let mut sar = dev.sar.lock();
+            if sar.session_epoch() != epoch {
+                return None;
+            }
+            let acked = sar.is_acked(seq);
+            if acked && consume {
+                sar.mark_ack_consumed(seq);
+            }
+            Some(acked)
+        })
+        .unwrap_or(Some(false))
+    })
+    .await
+}
+
 /// 阻塞等待某个 seq 收到 ACK（带总超时保护）
-async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Result<()> {
+async fn wait_for_seq_ack(owner_id: &str, seq: u8, epoch: u32, config: &MassConfig) -> Result<()> {
     let owner = owner_id.to_string();
     let ack_notifier = crate::ecs::with_rt_mut({
         let owner = owner.clone();
@@ -949,21 +992,15 @@ async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Resul
     let ack_future = async {
         loop {
             let notified = ack_notifier.notified();
-            let owner_clone = owner.clone();
-            let acked = crate::ecs::with_rt_mut(move |rt| {
-                rt.with_device_mut(&owner_clone, |world, entity| {
-                    if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
-                        return dev.sar.lock().is_acked(seq);
-                    }
-                    false
-                })
-                .unwrap_or(false)
-            })
-            .await;
-            if acked {
-                break;
+            match query_seq_ack(&owner, seq, epoch, false).await {
+                Some(true) => return Ok(()),
+                Some(false) => notified.await,
+                None => {
+                    return Err(crate::anyhow_site!(
+                        "SAR session was reset while waiting for MASS ACK (seq {seq})"
+                    ));
+                }
             }
-            notified.await;
         }
     };
 
@@ -972,8 +1009,7 @@ async fn wait_for_seq_ack(owner_id: &str, seq: u8, config: &MassConfig) -> Resul
         ack_future,
     )
     .await
-    .context("Timeout waiting for mass packet ACK")?;
-    Ok(())
+    .context("Timeout waiting for mass packet ACK")?
 }
 
 /// 把已经 ACK 的队头逐个弹出，顺便更新进度回调。
@@ -1000,31 +1036,13 @@ where
 
             if !front.acked {
                 // 如果队头还没标记 acked，就去底层查一下；ack 了就把该 seq 标可消费
-                let seq = front.seq;
-                let owner = owner_id.to_string();
-                let acked = crate::ecs::with_rt_mut({
-                    let owner = owner.clone();
-                    move |rt| {
-                        rt.with_device_mut(&owner, |world, entity| {
-                            let acked = if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
-                                dev.sar.lock().is_acked(seq)
-                            } else {
-                                false
-                            };
-                            if acked {
-                                if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
-                                    dev.sar.lock().mark_ack_consumed(seq);
-                                }
-                            }
-                            acked
-                        })
-                        .unwrap_or(false)
-                    }
-                })
-                .await;
-
-                if !acked {
-                    break;
+                match query_seq_ack(owner_id, front.seq, front.epoch, true).await {
+                    Some(true) => {}
+                    Some(false) => break,
+                    None => bail_site!(
+                        "SAR session was reset during MASS transfer (part {})",
+                        front.part_num
+                    ),
                 }
 
                 front.acked = true;

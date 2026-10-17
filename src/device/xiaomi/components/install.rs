@@ -35,8 +35,8 @@ pub struct InstallSystem {
 
 struct InstallWaiters {
     data_type: MassDataType,
-    prepare_tx: Option<oneshot::Sender<i32>>,
-    result_tx: Option<oneshot::Sender<InstallResultEvent>>,
+    prepare_tx: Option<oneshot::Sender<Result<i32>>>,
+    result_tx: Option<oneshot::Sender<Result<InstallResultEvent>>>,
 }
 
 enum InstallResultEvent {
@@ -98,7 +98,7 @@ impl InstallSystem {
                 .map_err(|err| anyhow_site!("failed to set watchface id: {}", err))?;
         }
 
-        let (prepare_tx, prepare_rx) = oneshot::channel::<i32>();
+        let (prepare_tx, prepare_rx) = oneshot::channel::<Result<i32>>();
         let (result_tx_opt, result_rx_opt) = match r#type {
             MassDataType::NotificationIcon => (None, None),
             MassDataType::Music => {
@@ -204,7 +204,7 @@ impl InstallSystem {
                 let prepare_status = timeout(prepare_timeout, prepare_rx)
                     .await
                     .map_err(|_| anyhow_site!("timed out waiting for install prepare response"))?
-                    .map_err(|_| anyhow_site!("prepare response channel closed unexpectedly"))?;
+                    .map_err(|_| anyhow_site!("prepare response channel closed unexpectedly"))??;
 
                 let prepare_enum = protocol::PrepareStatus::try_from(prepare_status)
                     .map_err(|_| anyhow_site!("unknown prepare status: {prepare_status}"))?;
@@ -221,7 +221,14 @@ impl InstallSystem {
 
                 if let Some(result_rx) = result_rx_opt {
                     let event = match timeout(result_timeout, result_rx).await {
-                        Ok(Ok(event)) => event,
+                        Ok(Ok(Ok(event))) => event,
+                        Ok(Ok(Err(err))) if matches!(r#type, MassDataType::Firmare) => {
+                            log::info!(
+                                "[Install] firmware payload sent; link dropped before the install result ({err:#}), the device may be rebooting"
+                            );
+                            return Ok(());
+                        }
+                        Ok(Ok(Err(err))) => return Err(err),
                         Ok(Err(_)) if matches!(r#type, MassDataType::Firmare) => {
                             log::info!(
                                 "[Install] firmware payload sent; install result message missing because the device may be rebooting"
@@ -263,12 +270,12 @@ impl L2PbExt for InstallSystem {
                             match wf.payload {
                                 Some(protocol::watch_face::Payload::PrepareStatus(status)) => {
                                     if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(status);
+                                        let _ = tx.send(Ok(status));
                                     }
                                 }
                                 Some(protocol::watch_face::Payload::InstallResult(result)) => {
                                     if let Some(tx) = waiters.result_tx.take() {
-                                        let _ = tx.send(InstallResultEvent::Watchface(result));
+                                        let _ = tx.send(Ok(InstallResultEvent::Watchface(result)));
                                     }
                                 }
                                 _ => {}
@@ -280,12 +287,12 @@ impl L2PbExt for InstallSystem {
                             match ta.payload {
                                 Some(protocol::thirdparty_app::Payload::InstallResponse(resp)) => {
                                     if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(resp.prepare_status);
+                                        let _ = tx.send(Ok(resp.prepare_status));
                                     }
                                 }
                                 Some(protocol::thirdparty_app::Payload::InstallResult(result)) => {
                                     if let Some(tx) = waiters.result_tx.take() {
-                                        let _ = tx.send(InstallResultEvent::ThirdpartyApp(result));
+                                        let _ = tx.send(Ok(InstallResultEvent::ThirdpartyApp(result)));
                                     }
                                 }
                                 _ => {}
@@ -298,9 +305,9 @@ impl L2PbExt for InstallSystem {
                                 sys.payload
                             {
                                 if let Some(tx) = waiters.prepare_tx.take() {
-                                    let _ = tx.send(resp.prepare_status);
+                                    let _ = tx.send(Ok(resp.prepare_status));
                                 } else if let Some(tx) = waiters.result_tx.take() {
-                                    let _ = tx.send(InstallResultEvent::Firmware(resp));
+                                    let _ = tx.send(Ok(InstallResultEvent::Firmware(resp)));
                                 }
                             }
                         }
@@ -311,7 +318,7 @@ impl L2PbExt for InstallSystem {
                                 nc.payload
                             {
                                 if let Some(tx) = waiters.prepare_tx.take() {
-                                    let _ = tx.send(resp.prepare_status);
+                                    let _ = tx.send(Ok(resp.prepare_status));
                                 }
                             }
                         }
@@ -454,6 +461,19 @@ impl InstallComponent {
     pub fn new() -> Self {
         Self {
             waiters: Mutex::new(None),
+        }
+    }
+
+    /// 链路中止时让正在等 Prepare/安装结果的请求立刻带着真实原因失败，而不是干等到超时。
+    pub fn fail_waiters(&self, err: &anyhow::Error) {
+        if let Some(waiters) = self.waiters.lock().as_mut() {
+            let msg = format!("{err:#}");
+            if let Some(tx) = waiters.prepare_tx.take() {
+                let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+            }
+            if let Some(tx) = waiters.result_tx.take() {
+                let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+            }
         }
     }
 }

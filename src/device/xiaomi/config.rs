@@ -28,6 +28,7 @@ impl Default for SarConfig {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MassConfig {
+    pub prepare_timeout_secs: u64,
     pub ack_wait_timeout_secs: u64,
     pub ack_poll_interval_ms: u64,
     pub ack_stall_default_ms: u64,
@@ -42,6 +43,7 @@ pub struct MassConfig {
 impl Default for MassConfig {
     fn default() -> Self {
         Self {
+            prepare_timeout_secs: 30,
             ack_wait_timeout_secs: 30,
             ack_poll_interval_ms: 50,
             ack_stall_default_ms: 400,
