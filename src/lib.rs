@@ -8,6 +8,8 @@ pub mod events;
 pub mod error;
 pub mod logger;
 pub mod models;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rpc;
 pub mod tools;
 
 // 默认初始化函数，使用默认配置初始化ECS系统
