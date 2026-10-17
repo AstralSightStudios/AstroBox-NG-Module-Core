@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 chrono = "0.4"
+tar = { version = "0.4.44", default-features = false }
 # --- crypto / hash ---
 sha2 = "0.10.9"
 sha1 = "0.10"

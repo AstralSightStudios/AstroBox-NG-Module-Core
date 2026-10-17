@@ -1,15 +1,10 @@
-//! Canopus modules on a band (refactor-plan P5).
+//! Canopus modules on a band (refactor-plan P5 / ADR-CAN-008).
 //!
-//! A Canopus module travels as a signed quick-app container named
-//! `com.canopus.pkg.<id>`: the phone installs it with the stock quick-app flow
-//! (listing, versions, updates and removal come for free) and the band's
-//! Canopus Supervisor imports the payload for its own firmware. The module id
-//! follows ADR-CAN-003: `^[a-z][a-z0-9_]{0,15}$`; the quick-app `versionCode`
-//! is the module's monotonic version code.
+//! Canopus modules are managed directly via native .canopus packages and
+//! WearPacket Layer 2 (0x43 / 'C') CPC2 RPC. Quick-app wrappers (.rpk) are
+//! completely eradicated.
 
-use pb::xiaomi::protocol::AppItem;
-
-pub const PACKAGE_PREFIX: &str = "com.canopus.pkg.";
+pub mod package;
 
 /// ADR-CAN-003 module id syntax.
 pub fn is_valid_module_id(id: &str) -> bool {
@@ -17,74 +12,9 @@ pub fn is_valid_module_id(id: &str) -> bool {
     !b.is_empty()
         && b.len() <= 16
         && b[0].is_ascii_lowercase()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
 }
-
-/// Quick-app package name for a module id, or `None` for an invalid id.
-pub fn package_name(module_id: &str) -> Option<String> {
-    is_valid_module_id(module_id).then(|| format!("{PACKAGE_PREFIX}{module_id}"))
-}
-
-/// Module id of a Canopus package name, or `None` when it is not one.
-pub fn module_id(package_name: &str) -> Option<&str> {
-    package_name
-        .strip_prefix(PACKAGE_PREFIX)
-        .filter(|id| is_valid_module_id(id))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanopusModule {
-    pub id: String,
-    pub package_name: String,
-    pub name: String,
-    pub version_code: u32,
-    pub fingerprint: Vec<u8>,
-}
-
-/// Canopus modules among the band's installed quick apps.
-pub fn modules_from_apps<'a>(apps: impl IntoIterator<Item = &'a AppItem>) -> Vec<CanopusModule> {
-    let mut modules: Vec<CanopusModule> = apps
-        .into_iter()
-        .filter_map(|app| {
-            let id = module_id(&app.package_name)?;
-            Some(CanopusModule {
-                id: id.to_string(),
-                package_name: app.package_name.clone(),
-                name: app.app_name.clone(),
-                version_code: app.version_code,
-                fingerprint: app.fingerprint.clone(),
-            })
-        })
-        .collect();
-    modules.sort_by(|a, b| a.id.cmp(&b.id));
-    modules
-}
-
-/// An available store version that is newer than what the band carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanopusUpdate {
-    pub id: String,
-    pub installed_version_code: u32,
-    pub available_version_code: u32,
-}
-
-/// Compares `versionCode`s (the device refuses same or lower versions, so only
-/// strictly newer ones are updates).
-pub fn updates(installed: &[CanopusModule], available: &[(String, u32)]) -> Vec<CanopusUpdate> {
-    available
-        .iter()
-        .filter_map(|(id, code)| {
-            let have = installed.iter().find(|m| &m.id == id)?;
-            (*code > have.version_code).then(|| CanopusUpdate {
-                id: id.clone(),
-                installed_version_code: have.version_code,
-                available_version_code: *code,
-            })
-        })
-        .collect()
-}
-
-
 
 // -----------------------------------------------------------------------------
 // WearPacket Layer 2 Communication & CPC2 Protocol (ADR-CAN-008)
@@ -102,7 +32,7 @@ pub const CANOPUS_L2_CHANNEL: u8 = 0x43;
 pub const CANOPUS_TRANSPORT_V2_MAGIC: u32 = 0x43504332; // "CPC2"
 pub const CANOPUS_TRANSPORT_V2_HEADER_SIZE: usize = 36;
 pub const CANOPUS_ABI_MAJOR: u16 = 1;
-pub const CANOPUS_ABI_MINOR: u16 = 0;
+pub const CANOPUS_ABI_MINOR: u16 = 2;
 pub const CANOPUS_PROTO_MAX_PAYLOAD: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +51,10 @@ pub enum CanopusCommand {
     Scan = 12,
     NativeStage = 13,
     RestoreAfterBoot = 14,
+    StageBegin = 15,
+    StageWrite = 16,
+    StageFinish = 17,
+    StageAbort = 18,
 }
 
 impl TryFrom<u32> for CanopusCommand {
@@ -140,6 +74,10 @@ impl TryFrom<u32> for CanopusCommand {
             12 => CanopusCommand::Scan,
             13 => CanopusCommand::NativeStage,
             14 => CanopusCommand::RestoreAfterBoot,
+            15 => CanopusCommand::StageBegin,
+            16 => CanopusCommand::StageWrite,
+            17 => CanopusCommand::StageFinish,
+            18 => CanopusCommand::StageAbort,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
     }
@@ -148,12 +86,12 @@ impl TryFrom<u32> for CanopusCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum CanopusResult {
-    Accepted = 1,
-    Queued = 2,
-    Running = 3,
-    Completed = 4,
-    Failed = 5,
-    Rejected = 6,
+    Rejected = 1,
+    Accepted = 2,
+    Queued = 3,
+    Running = 4,
+    Completed = 5,
+    Failed = 6,
     Disallowed = 7,
     RebootRequired = 8,
 }
@@ -162,12 +100,12 @@ impl TryFrom<u32> for CanopusResult {
     type Error = Cpc2CodecError;
     fn try_from(v: u32) -> Result<Self, Self::Error> {
         Ok(match v {
-            1 => CanopusResult::Accepted,
-            2 => CanopusResult::Queued,
-            3 => CanopusResult::Running,
-            4 => CanopusResult::Completed,
-            5 => CanopusResult::Failed,
-            6 => CanopusResult::Rejected,
+            1 => CanopusResult::Rejected,
+            2 => CanopusResult::Accepted,
+            3 => CanopusResult::Queued,
+            4 => CanopusResult::Running,
+            5 => CanopusResult::Completed,
+            6 => CanopusResult::Failed,
             7 => CanopusResult::Disallowed,
             8 => CanopusResult::RebootRequired,
             _ => return Err(Cpc2CodecError::InvalidResult(v)),
@@ -276,6 +214,9 @@ impl Cpc2Response {
             return Err(Cpc2CodecError::InvalidMagic(magic));
         }
         let header_size = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
+        if header_size < CANOPUS_TRANSPORT_V2_HEADER_SIZE {
+            return Err(Cpc2CodecError::HeaderTooSmall(header_size));
+        }
         let kind = u16::from_le_bytes(buf[6..8].try_into().unwrap());
         if kind != 2 {
             // RESPONSE = 2
@@ -320,6 +261,7 @@ impl Cpc2Response {
 pub struct CanopusSystem {
     next_request_id: AtomicU32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+    install_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CanopusSystem {
@@ -328,6 +270,7 @@ impl CanopusSystem {
         Self {
             next_request_id: AtomicU32::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            install_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -346,23 +289,45 @@ impl CanopusSystem {
     }
 }
 
+struct PendingRequest {
+    request_id: u32,
+    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.request_id);
+    }
+}
+
 pub async fn send_cpc2_request(
     addr: &str,
     req: Cpc2Request,
     timeout: std::time::Duration,
 ) -> Result<Cpc2Response, String> {
-    use crate::ecs::access::with_device_component_mut;
     use crate::device::xiaomi::XiaomiDevice;
+    use crate::ecs::access::with_device_component_mut;
 
     let request_id = req.request_id;
-    let rx = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), move |sys| {
-        sys.register_waiter(request_id)
-    })
-    .map_err(|e| format!("Device component access failed: {:?}", e))?;
+    let (rx, _pending) =
+        with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), move |sys| {
+            (
+                sys.register_waiter(request_id),
+                PendingRequest {
+                    request_id,
+                    pending: Arc::clone(&sys.pending),
+                },
+            )
+        })
+        .map_err(|e| format!("Device component access failed: {:?}", e))?;
 
-    let cipher = crate::device::xiaomi::packet::cipher::get_l2_cipher(addr);
+    let sar_version = with_device_component_mut::<XiaomiDevice, _, _>(addr.to_string(), |dev| dev.sar_version)
+        .map_err(|e| format!("Device component access failed: {e:?}"))?;
+    let cipher = crate::device::xiaomi::packet::cipher::ensure_l2_cipher(addr, sar_version)
+        .await
+        .ok_or("Canopus RPC requires an authenticated encrypted L2 session")?;
     let l2_pkt = req
-        .to_l2_packet(cipher.as_deref().map(|c| c as &dyn L2Cipher))
+        .to_l2_packet(Some(cipher.as_ref()))
         .map_err(|e| format!("L2 packet build failed: {:?}", e))?;
 
     with_device_component_mut::<XiaomiDevice, _, _>(addr.to_string(), move |dev| {
@@ -370,43 +335,85 @@ pub async fn send_cpc2_request(
     })
     .map_err(|e| format!("Failed to enqueue packet: {:?}", e))?;
 
-    tokio::time::timeout(timeout, rx)
+    let response = tokio::time::timeout(timeout, rx)
         .await
         .map_err(|_| "Canopus request timed out".to_string())?
-        .map_err(|_| "Response channel closed".to_string())
+        .map_err(|_| "Response channel closed".to_string())?;
+    if response.opcode != req.command as u32 {
+        return Err("Canopus response opcode does not match the request".into());
+    }
+    Ok(response)
+}
+
+pub async fn request(
+    addr: &str,
+    command: CanopusCommand,
+    payload: Vec<u8>,
+    timeout: std::time::Duration,
+) -> Result<Cpc2Response, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let id =
+        with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
+            .map_err(|e| format!("Canopus component access failed: {e:?}"))?;
+    send_cpc2_request(addr, Cpc2Request::new(command, id, payload), timeout).await
 }
 
 pub async fn query_device(addr: &str) -> Result<Cpc2Response, String> {
-    use crate::ecs::access::with_device_component_mut;
-    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
-        .unwrap_or(1);
-    let req = Cpc2Request::new(CanopusCommand::QueryDevice, req_id, vec![]);
-    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+    request(
+        addr,
+        CanopusCommand::QueryDevice,
+        vec![],
+        std::time::Duration::from_secs(5),
+    )
+    .await
 }
 
 pub async fn trigger_scan(addr: &str) -> Result<Cpc2Response, String> {
-    use crate::ecs::access::with_device_component_mut;
-    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
-        .unwrap_or(1);
-    let req = Cpc2Request::new(CanopusCommand::Scan, req_id, vec![]);
-    send_cpc2_request(addr, req, std::time::Duration::from_secs(10)).await
+    request(
+        addr,
+        CanopusCommand::Scan,
+        vec![],
+        std::time::Duration::from_secs(10),
+    )
+    .await
 }
 
-pub async fn set_module_enabled(addr: &str, module_id: &str, enable: bool) -> Result<Cpc2Response, String> {
-    use crate::ecs::access::with_device_component_mut;
-    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
-        .unwrap_or(1);
-    let cmd = if enable { CanopusCommand::Enable } else { CanopusCommand::Disable };
-    let req = Cpc2Request::new(cmd, req_id, module_id.as_bytes().to_vec());
-    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+fn module_id_payload(module_id: &str) -> Result<Vec<u8>, String> {
+    if !is_valid_module_id(module_id) {
+        return Err("Invalid Canopus module id".into());
+    }
+    let mut payload = module_id.as_bytes().to_vec();
+    payload.push(0);
+    Ok(payload)
+}
+
+pub async fn set_module_enabled(
+    addr: &str,
+    module_id: &str,
+    enable: bool,
+) -> Result<Cpc2Response, String> {
+    let cmd = if enable {
+        CanopusCommand::Enable
+    } else {
+        CanopusCommand::Disable
+    };
+    request(
+        addr,
+        cmd,
+        module_id_payload(module_id)?,
+        std::time::Duration::from_secs(5),
+    )
+    .await
 }
 
 pub async fn remove_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Response, String> {
-    use crate::ecs::access::with_device_component_mut;
-    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
-        .unwrap_or(1);
-    let req = Cpc2Request::new(CanopusCommand::Remove, req_id, module_id.as_bytes().to_vec());
-    send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await
+    request(
+        addr,
+        CanopusCommand::Remove,
+        module_id_payload(module_id)?,
+        std::time::Duration::from_secs(5),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -419,6 +426,8 @@ pub struct CanopusDeviceInfo {
     pub error_code: u32,
     pub flags: u32,
     pub scan_summary: u32,
+    /// Absent on older supervisors; never guess a target from the device name.
+    pub target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -435,12 +444,24 @@ pub struct CanopusDeviceModule {
 
 pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
     if payload.len() < 36 {
-        return Err(format!("Payload too short for device info: {} bytes", payload.len()));
+        return Err(format!(
+            "Payload too short for device info: {} bytes",
+            payload.len()
+        ));
     }
     let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     if magic != 0x43514431 {
         return Err(format!("Invalid CQD1 magic: 0x{magic:08x}"));
     }
+    let size = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    if size < 36 || size != payload.len() || (size > 36 && size < 84) {
+        return Err("Invalid Canopus device info size".into());
+    }
+    let target_id = if size >= 84 {
+        Some(package::fixed_string(&payload[36..84])?.to_string())
+    } else {
+        None
+    };
     let framework_revision = u32::from_le_bytes(payload[8..12].try_into().unwrap());
     let safe_mode = u32::from_le_bytes(payload[12..16].try_into().unwrap()) != 0;
     let module_count = u32::from_le_bytes(payload[16..20].try_into().unwrap());
@@ -457,25 +478,34 @@ pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
         error_code,
         flags,
         scan_summary,
+        target_id,
     })
 }
 
 pub fn parse_module_info(payload: &[u8]) -> Result<CanopusDeviceModule, String> {
     if payload.len() < 64 {
-        return Err(format!("Payload too short for module info: {} bytes", payload.len()));
+        return Err(format!(
+            "Payload too short for module info: {} bytes",
+            payload.len()
+        ));
     }
     let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     if magic != 0x43514D31 {
         return Err(format!("Invalid CQM1 magic: 0x{magic:08x}"));
+    }
+    let size = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    if size < 64 || size != payload.len() {
+        return Err("Invalid Canopus module info size".into());
     }
     let slot = u32::from_le_bytes(payload[8..12].try_into().unwrap());
     let state = u32::from_le_bytes(payload[12..16].try_into().unwrap());
     let lifecycle_class = u32::from_le_bytes(payload[16..20].try_into().unwrap());
     let version = u32::from_le_bytes(payload[20..24].try_into().unwrap());
     let flags = u32::from_le_bytes(payload[24..28].try_into().unwrap());
-    let id_bytes = &payload[28..60];
-    let id_len = id_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-    let module_id = String::from_utf8_lossy(&id_bytes[..id_len]).trim().to_string();
+    let module_id = package::fixed_string(&payload[28..60])?.to_string();
+    if !is_valid_module_id(&module_id) {
+        return Err("Invalid Canopus module identity in query response".into());
+    }
     let activation_error = u32::from_le_bytes(payload[60..64].try_into().unwrap());
 
     Ok(CanopusDeviceModule {
@@ -498,29 +528,145 @@ pub async fn get_device_info(addr: &str) -> Result<CanopusDeviceInfo, String> {
 }
 
 pub async fn query_module(addr: &str, slot: u32) -> Result<Option<CanopusDeviceModule>, String> {
-    use crate::ecs::access::with_device_component_mut;
-    let req_id = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| sys.next_id())
-        .unwrap_or(1);
-    let req = Cpc2Request::new(CanopusCommand::QueryModule, req_id, slot.to_le_bytes().to_vec());
-    let resp = send_cpc2_request(addr, req, std::time::Duration::from_secs(5)).await?;
-    if resp.result != CanopusResult::Completed || resp.payload.len() < 64 {
+    let resp = request(
+        addr,
+        CanopusCommand::QueryModule,
+        slot.to_le_bytes().to_vec(),
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    // The supervisor returns DISALLOWED for an unused slot, not an empty record.
+    if resp.result == CanopusResult::Disallowed && resp.payload.is_empty() {
         return Ok(None);
     }
-    Ok(parse_module_info(&resp.payload).ok())
+    require_completed(&resp)?;
+    let module = parse_module_info(&resp.payload)?;
+    if module.slot != slot || module.state == 0 {
+        return Err("Canopus query returned a different or empty module slot".into());
+    }
+    Ok(Some(module))
 }
 
 pub async fn list_device_modules(addr: &str) -> Result<Vec<CanopusDeviceModule>, String> {
     let info = get_device_info(addr).await?;
     let mut modules = Vec::new();
-    for slot in 0..32 {
+    for slot in 0..16 {
         if modules.len() as u32 >= info.module_count {
             break;
         }
-        if let Ok(Some(m)) = query_module(addr, slot).await {
-            modules.push(m);
+        if let Some(module) = query_module(addr, slot).await? {
+            modules.push(module);
         }
     }
+    if modules.len() as u32 != info.module_count {
+        return Err("Canopus module list changed or is incomplete; refresh it".into());
+    }
     Ok(modules)
+}
+
+fn require_completed(response: &Cpc2Response) -> Result<(), String> {
+    if response.result != CanopusResult::Completed {
+        return Err(format!(
+            "Canopus command {} returned {:?}",
+            response.opcode, response.result
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanopusInstallOutcome {
+    pub module_id: String,
+    pub target_id: String,
+    pub reboot_required: bool,
+}
+
+/// One staging transaction at a time per ECS device. Each chunk is acknowledged
+/// before the next; no Mass/quick-app transfer and no optimistic success.
+pub async fn install_native_package(
+    addr: &str,
+    data: &[u8],
+    on_progress: Arc<dyn Fn(f32) + Send + Sync>,
+) -> Result<CanopusInstallOutcome, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let lock = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| {
+        Arc::clone(&sys.install_lock)
+    })
+    .map_err(|e| format!("Canopus component access failed: {e:?}"))?;
+    let _guard = lock.lock().await;
+    on_progress(0.0);
+    let info = get_device_info(addr).await?;
+    let target_id = info
+        .target_id
+        .ok_or("Canopus native install unsupported: supervisor has no exact target_id")?;
+    let package = package::prepare_install(data, &target_id)?;
+    let staged = stage_package_with(
+        &package,
+        |command, payload| request(addr, command, payload, std::time::Duration::from_secs(10)),
+        on_progress.as_ref(),
+    )
+    .await;
+    if let Err(error) = staged {
+        // Best effort cleanup also covers a Begin/Write whose ACK was lost.
+        if let Err(abort_error) = request(
+            addr,
+            CanopusCommand::StageAbort,
+            vec![],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .and_then(|r| require_completed(&r))
+        {
+            log::warn!("Canopus staging cleanup failed: {abort_error}");
+        }
+        return Err(error);
+    }
+    let response = request(
+        addr,
+        CanopusCommand::Install,
+        module_id_payload(&package.module_id)?,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    if !matches!(
+        response.result,
+        CanopusResult::Completed | CanopusResult::RebootRequired
+    ) {
+        return Err(format!("Canopus install returned {:?}", response.result));
+    }
+    on_progress(1.0);
+    Ok(CanopusInstallOutcome {
+        module_id: package.module_id,
+        target_id,
+        reboot_required: response.result == CanopusResult::RebootRequired,
+    })
+}
+
+async fn stage_package_with<F, Fut>(
+    package: &package::InstallPackage,
+    mut send: F,
+    on_progress: &(dyn Fn(f32) + Send + Sync),
+) -> Result<(), String>
+where
+    F: FnMut(CanopusCommand, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Cpc2Response, String>>,
+{
+    require_completed(&send(CanopusCommand::StageBegin, package.receipt.clone()).await?)?;
+    for (index, chunk) in package
+        .artifact
+        .chunks(CANOPUS_PROTO_MAX_PAYLOAD - 4)
+        .enumerate()
+    {
+        let offset = index * (CANOPUS_PROTO_MAX_PAYLOAD - 4);
+        let mut payload = (offset as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(chunk);
+        require_completed(&send(CanopusCommand::StageWrite, payload).await?)?;
+        on_progress(0.95 * (offset + chunk.len()) as f32 / package.artifact.len() as f32);
+    }
+    require_completed(&send(CanopusCommand::StageFinish, vec![]).await?)?;
+    on_progress(0.97);
+    Ok(())
 }
 
 impl XiaomiSystemExt for CanopusSystem {
@@ -556,51 +702,12 @@ impl XiaomiSystemExt for CanopusSystem {
 mod tests {
     use super::*;
 
-    fn app(package: &str, version: u32) -> AppItem {
-        AppItem {
-            package_name: package.into(),
-            app_name: package.into(),
-            version_code: version,
-            fingerprint: vec![1, 2, 3],
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn ids_follow_adr_syntax() {
         assert!(is_valid_module_id("bluetooth_audio"));
         assert!(!is_valid_module_id("Bluetooth"));
         assert!(!is_valid_module_id("org.example.hello"));
         assert!(!is_valid_module_id("a_very_long_module_id"));
-        assert_eq!(package_name("lyra_player").as_deref(), Some("com.canopus.pkg.lyra_player"));
-        assert_eq!(package_name("../x"), None);
-        assert_eq!(module_id("com.canopus.pkg.refetch"), Some("refetch"));
-        assert_eq!(module_id("com.canopus.pkg.Bad"), None);
-        assert_eq!(module_id("com.other.refetch"), None);
-    }
-
-    #[test]
-    fn lists_only_canopus_packages_sorted() {
-        let apps = vec![
-            app("com.xiaomi.thing", 9),
-            app("com.canopus.pkg.refetch", 2),
-            app("com.canopus.pkg.lyra_player", 7),
-        ];
-        let modules = modules_from_apps(&apps);
-        assert_eq!(modules.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["lyra_player", "refetch"]);
-        assert_eq!(modules[0].version_code, 7);
-    }
-
-    #[test]
-    fn only_strictly_newer_versions_are_updates() {
-        let installed = modules_from_apps(&[app("com.canopus.pkg.a", 3), app("com.canopus.pkg.b", 5)]);
-        let found = updates(
-            &installed,
-            &[("a".into(), 4), ("b".into(), 5), ("c".into(), 9)],
-        );
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, "a");
-        assert_eq!(found[0].installed_version_code, 3);
     }
 
     #[test]
@@ -617,10 +724,11 @@ mod tests {
         resp_wire[6..8].copy_from_slice(&2u16.to_le_bytes()); // RESPONSE = 2
         resp_wire[8..10].copy_from_slice(&CANOPUS_ABI_MAJOR.to_le_bytes());
         resp_wire[10..12].copy_from_slice(&CANOPUS_ABI_MINOR.to_le_bytes());
-        resp_wire[12..16].copy_from_slice(&((CANOPUS_TRANSPORT_V2_HEADER_SIZE + 2) as u32).to_le_bytes());
+        resp_wire[12..16]
+            .copy_from_slice(&((CANOPUS_TRANSPORT_V2_HEADER_SIZE + 2) as u32).to_le_bytes());
         resp_wire[16..20].copy_from_slice(&(CanopusCommand::QueryDevice as u32).to_le_bytes());
         resp_wire[20..24].copy_from_slice(&0x4301u32.to_le_bytes());
-        resp_wire[28..32].copy_from_slice(&(CanopusResult::Completed as u32).to_le_bytes());
+        resp_wire[28..32].copy_from_slice(&5u32.to_le_bytes()); // C ABI COMPLETED, not a self-roundtrip
         resp_wire[32..36].copy_from_slice(&2u32.to_le_bytes());
         resp_wire[36..38].copy_from_slice(&[0xaa, 0xbb]);
 
@@ -650,6 +758,18 @@ mod tests {
         assert!(!dev_info.safe_mode);
         assert_eq!(dev_info.module_count, 3);
         assert_eq!(dev_info.scan_summary, 0x10);
+        assert_eq!(dev_info.target_id, None);
+        dev_payload.resize(84, 0);
+        dev_payload[4..8].copy_from_slice(&84u32.to_le_bytes());
+        let target = b"xiaomi-band-11-1.1.139";
+        dev_payload[36..36 + target.len()].copy_from_slice(target);
+        assert_eq!(
+            parse_device_info(&dev_payload)
+                .unwrap()
+                .target_id
+                .as_deref(),
+            Some("xiaomi-band-11-1.1.139")
+        );
 
         // Construct mock CQM1 payload (64 bytes)
         let mut mod_payload = vec![0u8; 64];
@@ -670,4 +790,61 @@ mod tests {
         assert_eq!(mod_info.state, 3);
     }
 
+    #[tokio::test]
+    async fn native_stage_chunks_are_sequential_and_require_completed() {
+        let package = package::InstallPackage {
+            module_id: "hello".into(),
+            receipt: vec![0; 176],
+            artifact: vec![42; 1020],
+        };
+        let calls = Mutex::new(Vec::new());
+        stage_package_with(
+            &package,
+            |command, payload| {
+                calls.lock().unwrap().push((command, payload));
+                std::future::ready(Ok(Cpc2Response {
+                    opcode: command as u32,
+                    request_id: 1,
+                    result: CanopusResult::Completed,
+                    payload: vec![],
+                }))
+            },
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(
+            calls.iter().map(|(cmd, _)| *cmd as u32).collect::<Vec<_>>(),
+            vec![15, 16, 16, 16, 17]
+        );
+        assert_eq!(calls[0].1.len(), 176);
+        for (index, (_, payload)) in calls[1..4].iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(payload[..4].try_into().unwrap()),
+                (index * 508) as u32
+            );
+            assert!(payload.len() <= 512);
+        }
+        let mut attempts = 0;
+        let result = stage_package_with(
+            &package,
+            |command, _| {
+                attempts += 1;
+                std::future::ready(Ok(Cpc2Response {
+                    opcode: command as u32,
+                    request_id: 1,
+                    result: CanopusResult::Queued,
+                    payload: vec![],
+                }))
+            },
+            &|_| {},
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(CanopusResult::try_from(1).unwrap(), CanopusResult::Rejected);
+        assert_eq!(CanopusResult::try_from(4).unwrap(), CanopusResult::Running);
+        assert_eq!(module_id_payload("hello").unwrap(), b"hello\0");
+    }
 }
