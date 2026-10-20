@@ -55,6 +55,8 @@ pub enum CanopusCommand {
     StageWrite = 16,
     StageFinish = 17,
     StageAbort = 18,
+    /// Leave safe mode at the next restart (payload: u32 `SafeModeExit`).
+    ExitSafeMode = 22,
 }
 
 impl TryFrom<u32> for CanopusCommand {
@@ -78,6 +80,7 @@ impl TryFrom<u32> for CanopusCommand {
             16 => CanopusCommand::StageWrite,
             17 => CanopusCommand::StageFinish,
             18 => CanopusCommand::StageAbort,
+            22 => CanopusCommand::ExitSafeMode,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
     }
@@ -363,6 +366,31 @@ pub async fn query_device(addr: &str) -> Result<Cpc2Response, String> {
         addr,
         CanopusCommand::QueryDevice,
         vec![],
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// What to do with the installed modules when safe mode is left. It is applied as
+/// next-boot intents, never as a load; the device then tries one normal start and
+/// returns to safe mode if that start does not stay up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[repr(u32)]
+pub enum SafeModeExit {
+    /// Keep every module as it is.
+    Keep = 0,
+    /// Turn every module off.
+    DisableAll = 1,
+    /// Ask every module that has an older generation to go back to it.
+    RollbackAll = 2,
+}
+
+pub async fn exit_safe_mode(addr: &str, action: SafeModeExit) -> Result<Cpc2Response, String> {
+    request(
+        addr,
+        CanopusCommand::ExitSafeMode,
+        (action as u32).to_le_bytes().to_vec(),
         std::time::Duration::from_secs(5),
     )
     .await
@@ -701,6 +729,23 @@ impl XiaomiSystemExt for CanopusSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_safe_mode_is_command_22_with_a_u32_action() {
+        assert_eq!(
+            CanopusCommand::try_from(22).unwrap(),
+            CanopusCommand::ExitSafeMode
+        );
+        let request = Cpc2Request::new(
+            CanopusCommand::ExitSafeMode,
+            7,
+            (SafeModeExit::DisableAll as u32).to_le_bytes().to_vec(),
+        )
+        .encode()
+        .unwrap();
+        assert_eq!(&request[16..20], &22u32.to_le_bytes());
+        assert_eq!(&request[CANOPUS_TRANSPORT_V2_HEADER_SIZE..], &1u32.to_le_bytes());
+    }
 
     #[test]
     fn ids_follow_adr_syntax() {
