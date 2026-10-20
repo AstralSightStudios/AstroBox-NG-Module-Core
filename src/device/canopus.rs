@@ -63,6 +63,8 @@ pub enum CanopusCommand {
     ConnectMessage = 21,
     /// Leave safe mode at the next restart (payload: u32 `SafeModeExit`).
     ExitSafeMode = 22,
+    QueryBoot = 23,
+    SetBoot = 24,
 }
 
 impl TryFrom<u32> for CanopusCommand {
@@ -90,6 +92,8 @@ impl TryFrom<u32> for CanopusCommand {
             20 => CanopusCommand::ConnectListen,
             21 => CanopusCommand::ConnectMessage,
             22 => CanopusCommand::ExitSafeMode,
+            23 => CanopusCommand::QueryBoot,
+            24 => CanopusCommand::SetBoot,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
     }
@@ -461,6 +465,54 @@ pub async fn exit_safe_mode(addr: &str, action: SafeModeExit) -> Result<Cpc2Resp
         std::time::Duration::from_secs(5),
     )
     .await
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BootPersistence {
+    pub supported: bool,
+    pub pinned: bool,
+}
+
+fn parse_boot_persistence(payload: &[u8]) -> Result<BootPersistence, String> {
+    let flags = u32::from_le_bytes(
+        payload.try_into().map_err(|_| "Invalid Canopus boot persistence response")?,
+    );
+    Ok(BootPersistence {
+        supported: flags & 1 != 0,
+        pinned: flags & 2 != 0,
+    })
+}
+
+pub async fn query_boot_persistence(addr: &str) -> Result<BootPersistence, String> {
+    let response = request(
+        addr,
+        CanopusCommand::QueryBoot,
+        vec![],
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    if response.result == CanopusResult::Rejected {
+        return Err("This Supervisor does not support boot persistence; install a newer Canopus framework".into());
+    }
+    if response.result != CanopusResult::Completed {
+        return Err(format!("Canopus boot persistence query returned {:?}", response.result));
+    }
+    parse_boot_persistence(&response.payload)
+}
+
+pub async fn set_boot_persistence(addr: &str, pinned: bool) -> Result<Cpc2Response, String> {
+    let response = request(
+        addr,
+        CanopusCommand::SetBoot,
+        u32::from(pinned).to_le_bytes().to_vec(),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    if response.result == CanopusResult::Rejected {
+        return Err("This Supervisor does not support boot persistence; install a newer Canopus framework".into());
+    }
+    Ok(response)
 }
 
 pub async fn trigger_scan(addr: &str) -> Result<Cpc2Response, String> {
