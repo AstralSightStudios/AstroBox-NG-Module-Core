@@ -8,6 +8,14 @@ pub struct InterconnectMessage {
     pub payload: Vec<u8>,
 }
 
+/// A message a Canopus module on the device sent to its listeners.
+#[derive(Debug, Clone)]
+pub struct CanopusConnectMessage {
+    pub device_addr: String,
+    pub module: String,
+    pub payload: crate::device::canopus::connect::ConnectPayload,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceStateChanged {
     pub device_addr: String,
@@ -16,6 +24,7 @@ pub struct DeviceStateChanged {
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
     InterconnectMessage(InterconnectMessage),
+    CanopusConnectMessage(CanopusConnectMessage),
     DeviceStateChanged(DeviceStateChanged),
 }
 

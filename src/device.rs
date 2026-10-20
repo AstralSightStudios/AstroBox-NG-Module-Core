@@ -250,7 +250,7 @@ where
                     WatchfaceSystem::new(device_id.clone()),
                     SyncComponent::new(),
                     SyncSystem::new(device_id.clone()),
-                    crate::device::canopus::CanopusSystem::new(),
+                    crate::device::canopus::CanopusSystem::new(device_id.clone()),
                 ));
                 #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
                 {
@@ -288,6 +288,12 @@ where
                 let auth_result = rx.await.context("Auth await response not received")?;
                 auth_result?;
             }
+
+            // 重连即新会话，手环会忘掉旧会话里的 CanopusConnect 监听；把插件仍在监听的补回去。
+            let addr_for_connect = addr.clone();
+            tk_handle.spawn(async move {
+                crate::device::canopus::connect::resync(&addr_for_connect).await;
+            });
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "xiaomi-network-stack"))]
             // 在Auth完成后同步网络状态以确保蓝牙联网可用

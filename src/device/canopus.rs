@@ -4,6 +4,7 @@
 //! WearPacket Layer 2 (0x43 / 'C') CPC2 RPC. Quick-app wrappers (.rpk) are
 //! completely eradicated.
 
+pub mod connect;
 pub mod package;
 
 /// ADR-CAN-003 module id syntax.
@@ -55,6 +56,11 @@ pub enum CanopusCommand {
     StageWrite = 16,
     StageFinish = 17,
     StageAbort = 18,
+    /// CanopusConnect (ADR-CAN-009), handled apart from the Manager commands.
+    ConnectSend = 19,
+    ConnectListen = 20,
+    /// Device -> phone EVENT only; never sent as a request.
+    ConnectMessage = 21,
     /// Leave safe mode at the next restart (payload: u32 `SafeModeExit`).
     ExitSafeMode = 22,
 }
@@ -80,6 +86,9 @@ impl TryFrom<u32> for CanopusCommand {
             16 => CanopusCommand::StageWrite,
             17 => CanopusCommand::StageFinish,
             18 => CanopusCommand::StageAbort,
+            19 => CanopusCommand::ConnectSend,
+            20 => CanopusCommand::ConnectListen,
+            21 => CanopusCommand::ConnectMessage,
             22 => CanopusCommand::ExitSafeMode,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
@@ -221,8 +230,7 @@ impl Cpc2Response {
             return Err(Cpc2CodecError::HeaderTooSmall(header_size));
         }
         let kind = u16::from_le_bytes(buf[6..8].try_into().unwrap());
-        if kind != 2 {
-            // RESPONSE = 2
+        if kind != CPC2_KIND_RESPONSE {
             return Err(Cpc2CodecError::InvalidKind(kind));
         }
         let major = u16::from_le_bytes(buf[8..10].try_into().unwrap());
@@ -258,22 +266,81 @@ impl Cpc2Response {
     }
 }
 
+/// An unsolicited device -> phone CPC2 record (message kind 3, request id 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cpc2Event {
+    pub opcode: u32,
+    pub payload: Vec<u8>,
+}
+
+impl Cpc2Event {
+    pub fn decode(buf: &[u8]) -> Result<Self, Cpc2CodecError> {
+        if buf.len() < CANOPUS_TRANSPORT_V2_HEADER_SIZE {
+            return Err(Cpc2CodecError::TooShort(buf.len()));
+        }
+        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if magic != CANOPUS_TRANSPORT_V2_MAGIC {
+            return Err(Cpc2CodecError::InvalidMagic(magic));
+        }
+        let header_size = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
+        if header_size < CANOPUS_TRANSPORT_V2_HEADER_SIZE {
+            return Err(Cpc2CodecError::HeaderTooSmall(header_size));
+        }
+        let kind = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if kind != CPC2_KIND_EVENT {
+            return Err(Cpc2CodecError::InvalidKind(kind));
+        }
+        let major = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        if major != CANOPUS_ABI_MAJOR {
+            return Err(Cpc2CodecError::UnsupportedAbiMajor(major));
+        }
+        let minor = u16::from_le_bytes(buf[10..12].try_into().unwrap());
+        if minor > CANOPUS_ABI_MINOR {
+            return Err(Cpc2CodecError::UnsupportedAbiMinor(minor));
+        }
+        let total_size = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let payload_size = u32::from_le_bytes(buf[32..36].try_into().unwrap()) as usize;
+        if total_size != buf.len()
+            || payload_size > CANOPUS_PROTO_MAX_PAYLOAD
+            || header_size + payload_size != total_size
+        {
+            return Err(Cpc2CodecError::LengthMismatch(
+                header_size + payload_size,
+                buf.len(),
+            ));
+        }
+        Ok(Self {
+            opcode: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            payload: buf[header_size..total_size].to_vec(),
+        })
+    }
+}
+
+const CPC2_KIND_RESPONSE: u16 = 2;
+const CPC2_KIND_EVENT: u16 = 3;
+
 /// ECS component that listens on `L2Channel::Canopus` and dispatches CPC2 responses
-/// to pending futures.
+/// to pending futures and CPC2 events to the core event bus.
 #[derive(Component, Default)]
 pub struct CanopusSystem {
+    owner_id: String,
     next_request_id: AtomicU32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
     install_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One CanopusConnect message in flight per device: the device queue is small
+    /// and a Manager request must never wait behind a burst of messages.
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CanopusSystem {
-    pub fn new() -> Self {
+    pub fn new(owner_id: String) -> Self {
         crate::device::xiaomi::system::register_xiaomi_system_ext_on_l2packet::<Self>();
         Self {
+            owner_id,
             next_request_id: AtomicU32::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -700,6 +767,20 @@ where
 impl XiaomiSystemExt for CanopusSystem {
     fn on_layer2_packet(&mut self, channel: L2Channel, _opcode: L2OpCode, payload: &[u8]) {
         if channel != L2Channel::Canopus {
+            return;
+        }
+
+        if payload.len() >= 8
+            && u16::from_le_bytes([payload[6], payload[7]]) == CPC2_KIND_EVENT
+        {
+            match Cpc2Event::decode(payload) {
+                Ok(event) => connect::on_event(&self.owner_id, event),
+                Err(err) => log::warn!(
+                    "[CanopusSystem] failed to decode CPC2 event ({} bytes): {}",
+                    payload.len(),
+                    err
+                ),
+            }
             return;
         }
 
