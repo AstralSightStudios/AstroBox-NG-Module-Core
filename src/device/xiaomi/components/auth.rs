@@ -81,11 +81,45 @@ impl AuthSystem {
         let result = rx.await.context("Auth await response not received")?;
         result
     }
+
+    /// 我们没在认证，设备却回了认证报文：同一条链路上有别的 App 刚认证过，设备的会话密钥
+    /// 已经换成它的。还没认证完的连接交给认证流程自己报错，这里只管已经连上的。
+    fn on_unsolicited_auth_reply(&self) {
+        let authed = with_device_component_mut::<AuthComponent, _, _>(
+            self.owner_id.clone(),
+            |comp| comp.is_authed,
+        )
+        .unwrap_or(false);
+        if !authed {
+            return;
+        }
+        let _ = with_device_component_mut::<XiaomiDevice, _, _>(self.owner_id.clone(), |dev| {
+            dev.sar
+                .lock()
+                .report_shared_link("an authentication reply to a login we never started");
+        });
+    }
+}
+
+fn is_device_auth_reply(packet: &WearPacket) -> bool {
+    matches!(
+        &packet.payload,
+        Some(pb::xiaomi::protocol::wear_packet::Payload::Account(pb::xiaomi::protocol::Account {
+            payload: Some(
+                pb::xiaomi::protocol::account::Payload::AuthDeviceVerify(_)
+                    | pb::xiaomi::protocol::account::Payload::AuthDeviceConfirm(_)
+            ),
+            ..
+        }))
+    )
 }
 
 impl L2PbExt for AuthSystem {
     fn on_pb_packet(&mut self, payload: WearPacket) {
         if !self.auth_wait.lock().as_ref().is_some_and(|waiter| !waiter.is_closed()) {
+            if is_device_auth_reply(&payload) {
+                self.on_unsolicited_auth_reply();
+            }
             return;
         }
         let packet_id = payload.id;
@@ -416,6 +450,23 @@ mod tests {
         let mut auth = AuthComponent::new(String::new());
         assert!(auth.confirm(true).is_err());
         assert!(!auth.is_authed);
+    }
+
+    #[test]
+    fn only_device_auth_replies_count_as_someone_elses_login() {
+        let account = |payload| WearPacket {
+            r#type: pb::xiaomi::protocol::wear_packet::Type::Account as i32,
+            id: pb::xiaomi::protocol::account::AccountId::AuthVerify as u32,
+            payload: Some(pb::xiaomi::protocol::wear_packet::Payload::Account(
+                pb::xiaomi::protocol::Account { payload: Some(payload) },
+            )),
+        };
+        use pb::xiaomi::protocol::account::Payload;
+        assert!(is_device_auth_reply(&account(Payload::AuthDeviceVerify(Default::default()))));
+        assert!(is_device_auth_reply(&account(Payload::AuthDeviceConfirm(Default::default()))));
+        // 我们自己发出去的认证报文、以及认证错误码都不算
+        assert!(!is_device_auth_reply(&build_auth_step_1(&[0; 16])));
+        assert!(!is_device_auth_reply(&account(Payload::ErrorCode(1))));
     }
 
     #[test]

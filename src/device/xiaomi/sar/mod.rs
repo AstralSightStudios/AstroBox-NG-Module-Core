@@ -29,6 +29,10 @@ pub use command_pool::CommandPool;
 const MAX_PACKET_RETRIES: u8 = 3;
 /// 等不到 L1StartRsp 时最多重发几次 L1StartReq。设备每收到一次都可能清空会话，不能无限重发。
 const MAX_START_REQ_RESENDS: u8 = 3;
+/// 本端每发一个 L1StartReq 最多换来一个 L1StartRsp；这么久还没对上的请求不再等它的应答。
+const OWN_START_RSP_WINDOW: Duration = Duration::from_secs(30);
+/// 紧跟在已接受的应答后面的多余应答当作设备重复回包，不算别人的握手。
+const DUPLICATE_START_RSP_GRACE: Duration = Duration::from_secs(2);
 
 /// 待发送的数据（已分配 seq）
 pub struct QueuedData {
@@ -152,6 +156,12 @@ pub struct SarController {
     /// 等 L1StartRsp 的截止时间，超时重发 L1StartReq
     start_req_deadline: Option<Instant>,
     start_req_resends: u8,
+    /// 已发出、还没对上应答的 L1StartReq 的发送时刻
+    unanswered_start_reqs: VecDeque<Instant>,
+    last_start_rsp_at: Option<Instant>,
+    /// 链路是否可能和手机里别的 App 共用（BLE）；只有这时才把对不上号的握手当成别人的
+    watch_shared_link: bool,
+    shared_link_reported: bool,
     /// 发送失败后序号可能已与设备失步，下次有数据要发时先重启会话
     needs_restart: bool,
     /// 每次丢弃在途数据（中止/重启会话）都会递增，上层据此判断等待的 seq 是否已作废
@@ -203,6 +213,10 @@ impl SarController {
             cmd_exchanged: false,
             start_req_deadline: None,
             start_req_resends: 0,
+            unanswered_start_reqs: VecDeque::new(),
+            last_start_rsp_at: None,
+            watch_shared_link: false,
+            shared_link_reported: false,
             needs_restart: false,
             session_epoch: 0,
             last_nak_retransmit: None,
@@ -356,8 +370,63 @@ impl SarController {
     fn send_start_req(&mut self) {
         let payload = self.build_start_cmd(CmdCode::CmdL1startReq);
         self.command_pool.push_cmd_front(payload);
-        self.start_req_deadline = Some(Instant::now() + self.send_timeout);
+        let now = Instant::now();
+        self.start_req_deadline = Some(now + self.send_timeout);
+        self.unanswered_start_reqs.push_back(now);
         self.try_run_next();
+    }
+
+    /// BLE 链路可能和手机里别的 App 共用（iOS 上所有 App 共用一条物理连接），打开后会把
+    /// 别人发起的握手、认证识别出来并上报。SPP 是独占通道，不打开。
+    pub fn set_shared_link_watch(&mut self, enabled: bool) {
+        self.watch_shared_link = enabled;
+    }
+
+    /// 设备把别人那条会话的回包也发给了我们：本端会话已作废，上报一次让上层断开并告诉用户。
+    pub fn report_shared_link(&mut self, signal: &str) {
+        if !self.watch_shared_link {
+            log::warn!(
+                "[SarController] Device {} sent {}; not a shared link, ignoring",
+                self.device_id,
+                signal
+            );
+            return;
+        }
+        if self.shared_link_reported {
+            return;
+        }
+        self.shared_link_reported = true;
+        log::warn!(
+            "[SarController] Device {} sent {}: another app on this phone is running the protocol over the same BLE link",
+            self.device_id,
+            signal
+        );
+        self.profiler.record(
+            "sar",
+            "shared_link",
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            Some(signal.to_string()),
+        );
+        crate::events::emit(crate::events::CoreEvent::SharedLinkDetected(
+            crate::events::SharedLinkDetected {
+                device_addr: self.device_id.clone(),
+            },
+        ));
+    }
+
+    /// 这个 L1StartRsp 是不是回给我们自己的 L1StartReq 的
+    fn claim_start_rsp(&mut self, now: Instant) -> bool {
+        self.unanswered_start_reqs
+            .retain(|sent| now.duration_since(*sent) <= OWN_START_RSP_WINDOW);
+        if self.unanswered_start_reqs.pop_front().is_some() {
+            return true;
+        }
+        self.last_start_rsp_at
+            .is_some_and(|at| now.duration_since(at) < DUPLICATE_START_RSP_GRACE)
     }
 
     /// 清空收发序号状态，回到会话初始（对齐官方 clearTranCtl）
@@ -662,6 +731,13 @@ impl SarController {
     }
 
     fn handle_start_rsp(&mut self, cmd: &L1CmdPacket) {
+        let now = Instant::now();
+        if !self.claim_start_rsp(now) && self.watch_shared_link {
+            // 设备清空了会话去应答别人的 L1StartReq；别人的窗口参数不能套到本端
+            self.report_shared_link("an L1StartRsp to a handshake we never started");
+            return;
+        }
+        self.last_start_rsp_at = Some(now);
         self.cmd_exchanged = true;
         self.start_req_deadline = None;
         if let Some(win) = cmd.get_tx_win() {
@@ -1194,5 +1270,80 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), waiter)
             .await
             .expect("ack_notifier was not notified upon abort");
+    }
+
+    fn shared_link_reports(
+        events: &mut tokio::sync::broadcast::Receiver<crate::events::CoreEvent>,
+        device_id: &str,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if let crate::events::CoreEvent::SharedLinkDetected(detected) = event {
+                if detected.device_addr == device_id {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn start_rsp_with_win(tx_win: u16) -> L1Packet {
+        let payload = L1CmdBuilder::new()
+            .cmd(CmdCode::CmdL1startRsp)
+            .tx_win(tx_win)
+            .build()
+            .unwrap()
+            .to_payload_bytes();
+        L1Packet::new(L1DataType::Cmd, false, 0, payload)
+    }
+
+    #[tokio::test]
+    async fn start_rsp_nobody_asked_for_reports_shared_ble_link_once() {
+        let mut events = crate::events::subscribe();
+        let (mut sar, _sent) = new_controller("test_shared_link", SarLinkParams::ble(244));
+        sar.set_shared_link_watch(true);
+        sar.on_l1_packet(&start_rsp());
+        assert_eq!(sar.tx_win, 16);
+        assert_eq!(shared_link_reports(&mut events, "test_shared_link"), 0);
+
+        // 别的 App 握手后设备回的应答：不能套用它的参数，并上报一次
+        sar.last_start_rsp_at = Some(Instant::now() - Duration::from_secs(5));
+        sar.on_l1_packet(&start_rsp_with_win(32));
+        assert_eq!(sar.tx_win, 16);
+        assert_eq!(shared_link_reports(&mut events, "test_shared_link"), 1);
+
+        sar.last_start_rsp_at = Some(Instant::now() - Duration::from_secs(5));
+        sar.on_l1_packet(&start_rsp_with_win(32));
+        assert_eq!(shared_link_reports(&mut events, "test_shared_link"), 0);
+    }
+
+    #[tokio::test]
+    async fn own_resent_and_duplicate_start_rsps_are_not_foreign() {
+        let mut events = crate::events::subscribe();
+        let (mut sar, _sent) = new_controller("test_own_start_rsp", SarLinkParams::ble(244));
+        sar.set_shared_link_watch(true);
+        // 等不到应答重发了一次：两个请求各回一个应答
+        sar.start_req_deadline = Some(Instant::now() - Duration::from_secs(1));
+        sar.check_timeouts_internal();
+        sar.on_l1_packet(&start_rsp());
+        sar.on_l1_packet(&start_rsp());
+        // 紧跟着的多余应答当作设备重复回包
+        sar.on_l1_packet(&start_rsp());
+        // 会话重启后的应答也是自己的
+        sar.restart_session();
+        sar.last_start_rsp_at = Some(Instant::now() - Duration::from_secs(5));
+        sar.on_l1_packet(&start_rsp());
+        assert_eq!(shared_link_reports(&mut events, "test_own_start_rsp"), 0);
+    }
+
+    #[tokio::test]
+    async fn spp_keeps_applying_unmatched_start_rsp() {
+        let mut events = crate::events::subscribe();
+        let (mut sar, _sent) = new_controller("test_spp_start_rsp", SarLinkParams::SPP);
+        sar.on_l1_packet(&start_rsp());
+        sar.last_start_rsp_at = Some(Instant::now() - Duration::from_secs(5));
+        sar.on_l1_packet(&start_rsp_with_win(32));
+        assert_eq!(sar.tx_win, 32);
+        assert_eq!(shared_link_reports(&mut events, "test_spp_start_rsp"), 0);
     }
 }

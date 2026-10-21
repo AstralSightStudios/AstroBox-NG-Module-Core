@@ -21,11 +21,20 @@ pub struct DeviceStateChanged {
     pub device_addr: String,
 }
 
+/// 手机里另有 App 在同一条 BLE 链路上和设备走同一套协议。iOS 上一台外设只有一条物理连接、
+/// 所有 App 共用（后台的小米运动健康一直连着），设备分不清是谁写的，只认最后一次握手和认证，
+/// 本端的会话已经作废。
+#[derive(Debug, Clone)]
+pub struct SharedLinkDetected {
+    pub device_addr: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
     InterconnectMessage(InterconnectMessage),
     CanopusConnectMessage(CanopusConnectMessage),
     DeviceStateChanged(DeviceStateChanged),
+    SharedLinkDetected(SharedLinkDetected),
 }
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;

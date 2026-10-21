@@ -159,7 +159,7 @@ impl XiaomiDevice {
         // BLE 按单次写入上限分档定窗口/超时（对齐 iOS 官方），SPP 沿用安卓官方参数
         let link = sar::SarLinkParams::for_transport(connect_type, config.transport.chunk_size_ble);
         // 创建 SAR 控制器，并传入设备名以便定时任务访问
-        let sar = sar::SarController::new(
+        let mut sar = sar::SarController::new(
             tk_handle.clone(),
             sender.clone(),
             base.addr().to_string(),
@@ -167,6 +167,7 @@ impl XiaomiDevice {
             config.sar.clone(),
             link,
         );
+        sar.set_shared_link_watch(connect_type == ConnectType::BLE);
 
         let dev = Self {
             device: base,
