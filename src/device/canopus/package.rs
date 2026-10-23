@@ -8,7 +8,7 @@ use std::{
 };
 
 pub const RECEIPT_SIZE: usize = 176;
-pub const ARTIFACT_MAX: usize = 384 * 1024;
+pub const ARTIFACT_MAX: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -177,7 +177,7 @@ pub fn prepare_install(data: &[u8], target_id: &str) -> Result<InstallPackage, S
         }
         let elf = verified_entry(&files, &artifact.path, &artifact.sha256)?;
         if !elf.starts_with(b"\x7fELF") || elf.len() > ARTIFACT_MAX {
-            return Err("Canopus artifact must be an ELF of at most 384 KiB".into());
+            return Err("Canopus artifact must be an ELF of at most 4 MiB".into());
         }
         let firmware_hash = hash_bytes(&artifact.firmware_sha256)?;
         let receipt = match (&artifact.receipt_path, &artifact.receipt_sha256) {
