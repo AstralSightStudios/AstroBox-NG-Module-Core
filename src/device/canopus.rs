@@ -55,6 +55,9 @@ pub enum CanopusCommand {
     StageWrite = 16,
     StageFinish = 17,
     StageAbort = 18,
+    ConnectSend = 19,
+    ConnectListen = 20,
+    ConnectMessage = 21,
 }
 
 impl TryFrom<u32> for CanopusCommand {
@@ -78,6 +81,9 @@ impl TryFrom<u32> for CanopusCommand {
             16 => CanopusCommand::StageWrite,
             17 => CanopusCommand::StageFinish,
             18 => CanopusCommand::StageAbort,
+            19 => CanopusCommand::ConnectSend,
+            20 => CanopusCommand::ConnectListen,
+            21 => CanopusCommand::ConnectMessage,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
     }
@@ -262,6 +268,16 @@ pub struct CanopusSystem {
     next_request_id: AtomicU32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
     install_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Receivers of CanopusConnect messages the device pushes (ADR-CAN-009).
+    connect_subscribers: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ConnectMessage>>>>,
+}
+
+/// One CanopusConnect message a module sent to the phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectMessage {
+    pub kind: u8,
+    pub module_id: String,
+    pub data: Vec<u8>,
 }
 
 impl CanopusSystem {
@@ -271,6 +287,7 @@ impl CanopusSystem {
             next_request_id: AtomicU32::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            connect_subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -414,6 +431,97 @@ pub async fn remove_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Respo
         std::time::Duration::from_secs(5),
     )
     .await
+}
+
+pub const CONNECT_TEXT: u8 = 1;
+pub const CONNECT_BINARY: u8 = 2;
+pub const CONNECT_DATA_MAX: usize = 480;
+
+fn connect_payload(kind: Option<u8>, module_id: &str, tail: &[u8]) -> Result<Vec<u8>, String> {
+    if !is_valid_module_id(module_id) {
+        return Err("Invalid Canopus module id".into());
+    }
+    let mut payload = Vec::with_capacity(2 + module_id.len() + tail.len());
+    if let Some(kind) = kind {
+        payload.push(kind);
+    }
+    payload.push(module_id.len() as u8);
+    payload.extend_from_slice(module_id.as_bytes());
+    payload.extend_from_slice(tail);
+    Ok(payload)
+}
+
+/// The status byte of a CONNECT_* response; 0 is delivered/registered.
+fn connect_status(response: &Cpc2Response) -> Result<u8, String> {
+    match response.result {
+        CanopusResult::Completed => Ok(response.payload.first().copied().unwrap_or(0)),
+        CanopusResult::Disallowed => Err(format!(
+            "module refused the message (status {})",
+            response.payload.first().copied().unwrap_or(0)
+        )),
+        CanopusResult::Rejected => Err("Supervisor does not support CanopusConnect".into()),
+        other => Err(format!("unexpected CanopusConnect result {other:?}")),
+    }
+}
+
+/// Delivers one message (at most 480 bytes) to the listener of `module_id`.
+pub async fn connect_send(addr: &str, module_id: &str, kind: u8, data: &[u8]) -> Result<(), String> {
+    if data.len() > CONNECT_DATA_MAX {
+        return Err("CanopusConnect message is longer than 480 bytes".into());
+    }
+    let payload = connect_payload(Some(kind), module_id, data)?;
+    let response = request(
+        addr,
+        CanopusCommand::ConnectSend,
+        payload,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+    connect_status(&response).map(|_| ())
+}
+
+/// Starts or stops the pushes of `module_id` to this phone session.
+pub async fn connect_listen(addr: &str, module_id: &str, enable: bool) -> Result<(), String> {
+    // listen payload is `enable u8 | id_len u8 | id`
+    let mut payload = vec![u8::from(enable)];
+    payload.extend_from_slice(&connect_payload(None, module_id, &[])?);
+    let response = request(
+        addr,
+        CanopusCommand::ConnectListen,
+        payload,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    connect_status(&response).map(|_| ())
+}
+
+/// A stream of the messages modules push to this phone session.
+pub fn connect_subscribe(
+    addr: &str,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<ConnectMessage>, String> {
+    use crate::ecs::access::with_device_component_mut;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), move |sys| {
+        sys.connect_subscribers.lock().unwrap().push(tx);
+    })
+    .map_err(|e| format!("Canopus component access failed: {e:?}"))?;
+    Ok(rx)
+}
+
+/// `kind u8 | id_len u8 | id | data` of a CONNECT_MESSAGE event.
+fn decode_connect_message(payload: &[u8]) -> Option<ConnectMessage> {
+    let (&kind, rest) = payload.split_first()?;
+    let (&id_len, rest) = rest.split_first()?;
+    let id_len = usize::from(id_len);
+    if rest.len() < id_len {
+        return None;
+    }
+    let (id, data) = rest.split_at(id_len);
+    Some(ConnectMessage {
+        kind,
+        module_id: String::from_utf8(id.to_vec()).ok()?,
+        data: data.to_vec(),
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -675,6 +783,21 @@ impl XiaomiSystemExt for CanopusSystem {
             return;
         }
 
+        // CONNECT_MESSAGE is an EVENT (message kind 3), not a response.
+        if payload.len() >= CANOPUS_TRANSPORT_V2_HEADER_SIZE
+            && u16::from_le_bytes([payload[6], payload[7]]) == 3
+            && u32::from_le_bytes(payload[16..20].try_into().unwrap())
+                == CanopusCommand::ConnectMessage as u32
+        {
+            let header = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+            if let Some(message) = payload.get(header..).and_then(decode_connect_message) {
+                self.connect_subscribers
+                    .lock()
+                    .unwrap()
+                    .retain(|tx| tx.send(message.clone()).is_ok());
+            }
+            return;
+        }
         match Cpc2Response::decode(payload) {
             Ok(resp) => {
                 log::debug!(
