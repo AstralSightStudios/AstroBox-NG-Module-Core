@@ -323,17 +323,33 @@ impl Cpc2Event {
 const CPC2_KIND_RESPONSE: u16 = 2;
 const CPC2_KIND_EVENT: u16 = 3;
 
+/// Device L2 RX and RPC TX queues hold 4 slots. At most 3 slots may be used by
+/// concurrent Connect DATA requests, leaving at least 1 slot for control/Manager RPCs.
+pub const MAX_DEVICE_RPC_SLOTS: usize = 4;
+pub const MAX_CONNECT_DATA_SLOTS: usize = 3;
+
 /// ECS component that listens on `L2Channel::Canopus` and dispatches CPC2 responses
 /// to pending futures and CPC2 events to the core event bus.
-#[derive(Component, Default)]
+#[derive(Component)]
 pub struct CanopusSystem {
     owner_id: String,
     next_request_id: AtomicU32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
     install_lock: Arc<tokio::sync::Mutex<()>>,
-    /// One CanopusConnect message in flight per device: the device queue is small
-    /// and a Manager request must never wait behind a burst of messages.
+    /// One conservative CanopusConnect message in flight per device for legacy/plugin callers.
     connect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Global CPC2 RPC budget across the device (4 slots total).
+    rpc_sem: Arc<tokio::sync::Semaphore>,
+    /// Connect DATA in-flight budget (at most 3 slots so 1 slot remains for control/Manager).
+    connect_data_sem: Arc<tokio::sync::Semaphore>,
+    /// Ordered writer lock for windowed Connect sessions so frames enter SAR in offset order.
+    connect_enqueue_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for CanopusSystem {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
 }
 
 impl CanopusSystem {
@@ -345,27 +361,90 @@ impl CanopusSystem {
             pending: Arc::new(Mutex::new(HashMap::new())),
             install_lock: Arc::new(tokio::sync::Mutex::new(())),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            rpc_sem: Arc::new(tokio::sync::Semaphore::new(MAX_DEVICE_RPC_SLOTS)),
+            connect_data_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECT_DATA_SLOTS)),
+            connect_enqueue_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
+    /// Allocates a unique non-zero request_id that is not currently in `pending`.
     pub fn next_id(&self) -> u32 {
-        let mut id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        }
-        id
+        let map = self.pending.lock().unwrap();
+        self.alloc_id_locked(&map)
     }
 
-    pub fn register_waiter(&self, request_id: u32) -> oneshot::Receiver<Cpc2Response> {
+    fn alloc_id_locked(&self, map: &HashMap<u32, oneshot::Sender<Cpc2Response>>) -> u32 {
+        for _ in 0..=u16::MAX as usize {
+            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 && !map.contains_key(&id) {
+                return id;
+            }
+        }
+        panic!("Canopus pending request_id space exhausted");
+    }
+
+    pub fn register_waiter(&self, request_id: u32) -> Result<oneshot::Receiver<Cpc2Response>, String> {
+        if request_id == 0 {
+            return Err("Canopus request_id must be non-zero".into());
+        }
+        let mut map = self.pending.lock().unwrap();
+        if map.contains_key(&request_id) {
+            return Err(format!("Canopus request_id {request_id} is already pending"));
+        }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(request_id, tx);
-        rx
+        map.insert(request_id, tx);
+        Ok(rx)
+    }
+
+    /// Atomically allocates a free non-zero `request_id` and registers its waiter.
+    pub fn allocate_waiter(&self) -> (u32, oneshot::Receiver<Cpc2Response>) {
+        let mut map = self.pending.lock().unwrap();
+        let request_id = self.alloc_id_locked(&map);
+        let (tx, rx) = oneshot::channel();
+        map.insert(request_id, tx);
+        (request_id, rx)
+    }
+
+    /// Fails all pending CPC2 waiters on disconnect and closes session semaphores.
+    /// Fails all in-flight waiters without disabling the component. SAR aborts are
+    /// recoverable in place (the L1 session restarts on the next enqueue), so the
+    /// permit semaphores must stay open for subsequent requests on the same entity.
+    pub fn fail_waiters(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+
+    pub(crate) fn concurrency_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Mutex<()>>,
+    ) {
+        (
+            Arc::clone(&self.pending),
+            Arc::clone(&self.rpc_sem),
+            Arc::clone(&self.connect_data_sem),
+            Arc::clone(&self.connect_enqueue_lock),
+        )
     }
 }
 
-struct PendingRequest {
+pub(crate) struct PendingRequest {
     request_id: u32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+}
+
+impl PendingRequest {
+    pub(crate) fn new(
+        request_id: u32,
+        pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
+    ) -> Self {
+        Self {
+            request_id,
+            pending,
+        }
+    }
 }
 
 impl Drop for PendingRequest {
@@ -383,17 +462,21 @@ pub async fn send_cpc2_request(
     use crate::ecs::access::with_device_component_mut;
 
     let request_id = req.request_id;
-    let (rx, _pending) =
+    let (rx, _pending, rpc_sem) =
         with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), move |sys| {
-            (
-                sys.register_waiter(request_id),
-                PendingRequest {
-                    request_id,
-                    pending: Arc::clone(&sys.pending),
-                },
-            )
+            let rx = sys.register_waiter(request_id)?;
+            Ok::<_, String>((
+                rx,
+                PendingRequest::new(request_id, Arc::clone(&sys.pending)),
+                Arc::clone(&sys.rpc_sem),
+            ))
         })
-        .map_err(|e| format!("Device component access failed: {:?}", e))?;
+        .map_err(|e| format!("Device component access failed: {:?}", e))??;
+
+    let _rpc_permit = tokio::time::timeout(timeout, rpc_sem.acquire_owned())
+        .await
+        .map_err(|_| "Canopus request timed out".to_string())?
+        .map_err(|_| "device_not_connected: Canopus session closed".to_string())?;
 
     let sar_version = with_device_component_mut::<XiaomiDevice, _, _>(addr.to_string(), |dev| dev.sar_version)
         .map_err(|e| format!("Device component access failed: {e:?}"))?;

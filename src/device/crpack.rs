@@ -13,7 +13,12 @@ pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_CHUNKS_PER_FILE: usize = 2_048;
 const MAX_ARCHIVE_ENTRIES: usize = 16_384;
-const THEME_ROOT: &str = "/data/quickapp/files/ng.lst.corona/themes/";
+// Native Corona installs themes under `/data/canopus/m.corona/themes/<themeId>/<gen>/`.
+// Reserve worst-case u32 generation directory length (`4294967295/`) so expanded native
+// paths stay within the 255 UTF-8 byte limit (excluding NUL).
+const NATIVE_THEME_ROOT_PREFIX: &str = "/data/canopus/m.corona/themes/";
+const MAX_GENERATION_SEGMENT_LEN: usize = 10 + 1;
+const MAX_NATIVE_PATH_BYTES: usize = 255;
 const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 const RESOURCE_PACK_FORMAT: &str = "canopus-resource-pack";
 const RESOURCE_PACK_VERSION: u64 = 1;
@@ -76,9 +81,126 @@ pub(crate) fn is_crpack_archive(data: &[u8]) -> bool {
     manifest_found
 }
 
+pub(crate) struct CrPackSummary {
+    pub(crate) theme_id: String,
+    pub(crate) file_count: usize,
+    pub(crate) total_unpacked_bytes: usize,
+}
+
 pub(crate) fn load_crpack(path: &Path) -> anyhow::Result<CrPack> {
     let file = File::open(path).context("failed to open CRPack")?;
     parse_crpack_archive(file)
+}
+
+pub(crate) fn inspect_crpack(path: &Path) -> anyhow::Result<CrPackSummary> {
+    let file = File::open(path).context("failed to open CRPack")?;
+    inspect_crpack_archive(file)
+}
+
+pub(crate) fn inspect_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPackSummary> {
+    let mut archive = ZipArchive::new(reader).context("CRPack must be a readable ZIP archive")?;
+    ensure!(
+        archive.len() <= MAX_ARCHIVE_ENTRIES,
+        "CRPack has too many ZIP entries"
+    );
+
+    let mut files = HashSet::new();
+    let mut dirs = HashSet::new();
+    let mut total_bytes = 0usize;
+    let mut manifest_bytes = None;
+    let mut max_relative_path = 0usize;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .context("invalid or encrypted ZIP entry")?;
+        let raw_path = entry.name().to_owned();
+        ensure!(
+            !raw_path.contains('\\'),
+            "invalid-path: ZIP paths must not contain backslashes"
+        );
+        let is_directory = entry.is_dir();
+        let relative_path = if is_directory {
+            raw_path
+                .strip_suffix('/')
+                .context("invalid directory entry path")?
+                .to_owned()
+        } else {
+            raw_path.clone()
+        };
+        ensure!(
+            valid_relative_path(&relative_path),
+            "invalid-path: {raw_path}"
+        );
+        ensure!(
+            is_allowed_entry_type(entry.unix_mode(), is_directory),
+            "ZIP symlinks and special entries are not allowed: {raw_path}"
+        );
+        ensure!(
+            !files.contains(&relative_path) && !dirs.contains(&relative_path),
+            "duplicate ZIP path: {relative_path}"
+        );
+        for ancestor in path_ancestors(&relative_path) {
+            ensure!(
+                !files.contains(ancestor),
+                "file-directory conflict in ZIP path: {relative_path}"
+            );
+            dirs.insert(ancestor.to_owned());
+        }
+        if is_directory {
+            dirs.insert(relative_path);
+            continue;
+        }
+
+        ensure!(
+            supported_compression(entry.compression()),
+            "unsupported ZIP compression method: {raw_path}"
+        );
+        ensure!(
+            relative_path != "mappings.tsv",
+            "CRPack v1 must not contain mappings.tsv"
+        );
+
+        let declared_size = entry.size();
+        let remaining_bytes = MAX_BYTES - total_bytes;
+        if is_manifest_path(&relative_path) {
+            ensure!(
+                manifest_bytes.is_none(),
+                "CRPack must contain exactly one root corona.json (legacy canora.json is also accepted)"
+            );
+            let entry_limit = remaining_bytes.min(MAX_MANIFEST_BYTES);
+            let data = read_entry_bounded(&mut entry, declared_size, entry_limit)
+                .with_context(|| format!("invalid or oversized ZIP entry: {relative_path}"))?;
+            total_bytes += data.len();
+            manifest_bytes = Some(data);
+        } else {
+            let len = verify_entry_stream(&mut entry, declared_size, remaining_bytes)
+                .with_context(|| format!("invalid or oversized ZIP entry: {relative_path}"))?;
+            total_bytes += len;
+        }
+
+        max_relative_path = max_relative_path.max(relative_path.len());
+        files.insert(relative_path);
+    }
+
+    let manifest_bytes = manifest_bytes.context("CRPack must contain a root corona.json")?;
+    let theme_id = parse_manifest_theme_id(&manifest_bytes)?;
+    ensure!(!files.is_empty(), "empty CRPack");
+    ensure!(
+        NATIVE_THEME_ROOT_PREFIX.len()
+            + theme_id.len()
+            + 1
+            + MAX_GENERATION_SEGMENT_LEN
+            + max_relative_path
+            <= MAX_NATIVE_PATH_BYTES,
+        "resource path exceeds the Manager limit"
+    );
+
+    Ok(CrPackSummary {
+        theme_id,
+        file_count: files.len(),
+        total_unpacked_bytes: total_bytes,
+    })
 }
 
 fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
@@ -163,9 +285,13 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
     let theme_id = parse_manifest_theme_id(&manifest_bytes)?;
     ensure!(!files.is_empty(), "empty CRPack");
     for file in &files {
-        let full_path = format!("{THEME_ROOT}{theme_id}/{}", file.path);
+        let full_len = NATIVE_THEME_ROOT_PREFIX.len()
+            + theme_id.len()
+            + 1
+            + MAX_GENERATION_SEGMENT_LEN
+            + file.path.len();
         ensure!(
-            full_path.len() < 256,
+            full_len <= MAX_NATIVE_PATH_BYTES,
             "resource path exceeds the Manager limit: {}",
             file.path
         );
@@ -176,6 +302,45 @@ fn parse_crpack_archive<R: Read + Seek>(reader: R) -> anyhow::Result<CrPack> {
         files,
         total_bytes,
     })
+}
+
+fn verify_entry_stream<R: Read>(
+    reader: R,
+    declared_size: u64,
+    max_bytes: usize,
+) -> anyhow::Result<usize> {
+    let declared_size = usize::try_from(declared_size).context("ZIP entry size is too large")?;
+    ensure!(
+        declared_size <= max_bytes,
+        "ZIP entry exceeds its size limit"
+    );
+    let read_limit = u64::try_from(max_bytes)
+        .context("ZIP entry limit is too large")?
+        .saturating_add(1);
+    let mut limited = reader.take(read_limit);
+    let mut buf = [0u8; 4096];
+    let mut actual = 0usize;
+    loop {
+        let n = limited.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        actual += n;
+        ensure!(
+            actual <= max_bytes,
+            "actual decompressed size exceeds its limit"
+        );
+    }
+    ensure!(
+        actual == declared_size,
+        "ZIP entry size does not match its contents"
+    );
+    Ok(actual)
+}
+
+fn path_ancestors(path: &str) -> impl Iterator<Item = &str> {
+    let mut indices = path.match_indices('/').map(|(idx, _)| idx);
+    std::iter::from_fn(move || indices.next().map(|idx| &path[..idx]))
 }
 
 fn read_entry_bounded<R: Read>(
@@ -212,6 +377,7 @@ fn valid_relative_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
         && !path.contains(['\\', '\0'])
+        && !bytes.iter().any(|b| b.is_ascii_control())
         && path
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")

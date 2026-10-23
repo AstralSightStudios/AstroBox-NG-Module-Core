@@ -228,6 +228,9 @@ pub async fn fail_all_device_slots(device_id: &str, err: anyhow::Error) {
             if let Some(comp) = world.get_mut::<components::mass::MassComponent>(entity) {
                 comp.fail_waiters();
             }
+            if let Some(sys) = world.get::<crate::device::canopus::CanopusSystem>(entity) {
+                sys.fail_waiters();
+            }
         });
     })
     .await;

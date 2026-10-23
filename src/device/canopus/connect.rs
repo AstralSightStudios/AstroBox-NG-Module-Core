@@ -14,14 +14,17 @@
 //! One message is one frame of at most [`DATA_MAX`] bytes.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use once_cell::sync::OnceCell;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::{
-    CanopusCommand, CanopusResult, CanopusSystem, Cpc2Event, Cpc2Response, is_valid_module_id,
-    request,
+    CanopusCommand, CanopusResult, CanopusSystem, Cpc2Event, Cpc2Request, Cpc2Response,
+    MAX_CONNECT_DATA_SLOTS, PendingRequest, is_valid_module_id, request,
 };
 
 pub const DATA_MAX: usize = 480;
@@ -148,6 +151,10 @@ fn interpret(module: &str, response: &Cpc2Response) -> Result<(), String> {
 
 /// Sends `payload` to the module and returns once the device handed it to the
 /// module's listener.
+///
+/// Kept serial by `connect_lock` for plugin compatibility: it must not compete for
+/// the CRPack data-window permits, or plugin sends would time out during a long
+/// resource-pack upload. Device queue bounds are still enforced by `rpc_sem`.
 pub async fn send(addr: &str, module: &str, payload: ConnectPayload) -> Result<(), String> {
     use crate::ecs::access::with_device_component_mut;
     let body = encode_send(module, &payload)?;
@@ -158,6 +165,242 @@ pub async fn send(addr: &str, module: &str, payload: ConnectPayload) -> Result<(
     let _guard = lock.lock().await;
     let response = request(addr, CanopusCommand::ConnectSend, body, TIMEOUT).await?;
     interpret(module, &response)
+}
+
+pub type InflightConnectFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+pub trait ConnectEnqueueBackend: Send + Sync {
+    fn enqueue_connect_send<'a>(
+        &'a self,
+        req: Cpc2Request,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+struct DeviceSarBackend {
+    addr: String,
+}
+
+impl ConnectEnqueueBackend for DeviceSarBackend {
+    fn enqueue_connect_send<'a>(
+        &'a self,
+        req: Cpc2Request,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::device::xiaomi::XiaomiDevice;
+
+            let addr_for_ver = self.addr.clone();
+            let sar_version = crate::ecs::with_rt_mut(move |rt| {
+                rt.component_ref::<XiaomiDevice>(&addr_for_ver)
+                    .map(|dev| dev.sar_version)
+                    .ok_or_else(|| "device_not_connected: XiaomiDevice not found".to_string())
+            })
+            .await?;
+            let cipher =
+                crate::device::xiaomi::packet::cipher::ensure_l2_cipher(&self.addr, sar_version)
+                    .await
+                    .ok_or("Canopus RPC requires an authenticated encrypted L2 session")?;
+            let l2_pkt = req
+                .to_l2_packet(Some(cipher.as_ref()))
+                .map_err(|e| format!("L2 packet build failed: {e:?}"))?;
+            let addr_for_enq = self.addr.clone();
+            crate::ecs::with_rt_mut(move |rt| {
+                let dev = rt
+                    .component_mut::<XiaomiDevice>(&addr_for_enq)
+                    .ok_or_else(|| "device_not_connected: XiaomiDevice not found".to_string())?;
+                dev.sar.lock().enqueue(l2_pkt.to_bytes());
+                Ok::<_, String>(())
+            })
+            .await
+        })
+    }
+}
+
+/// Bounded concurrent CanopusConnect sender for session-level protocols (such as Corona).
+///
+/// Separate from [`send`] so plugin calls keep their conservative serial contract while
+/// built-in windowed sessions can keep up to `max_rpc` (capped at [`MAX_CONNECT_DATA_SLOTS`], i.e. 3)
+/// DATA requests in flight simultaneously, leaving at least 1 device RPC slot for control/Manager commands.
+#[derive(Clone)]
+pub struct ConnectWindowSender {
+    addr: String,
+    module: String,
+    session_sem: Arc<tokio::sync::Semaphore>,
+    max_rpc: usize,
+    backend: Option<Arc<dyn ConnectEnqueueBackend>>,
+}
+
+impl ConnectWindowSender {
+    pub fn new(addr: impl Into<String>, module: impl Into<String>, max_rpc: usize) -> Result<Self, String> {
+        let module = module.into();
+        module_bytes(&module)?;
+        let capped = max_rpc.clamp(1, MAX_CONNECT_DATA_SLOTS);
+        Ok(Self {
+            addr: addr.into(),
+            module,
+            session_sem: Arc::new(tokio::sync::Semaphore::new(capped)),
+            max_rpc: capped,
+            backend: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn with_mock_backend(
+        addr: impl Into<String>,
+        module: impl Into<String>,
+        max_rpc: usize,
+        backend: Arc<dyn ConnectEnqueueBackend>,
+    ) -> Result<Self, String> {
+        let mut sender = Self::new(addr, module, max_rpc)?;
+        sender.backend = Some(backend);
+        Ok(sender)
+    }
+
+    pub fn max_rpc(&self) -> usize {
+        self.max_rpc
+    }
+
+    /// Sends a single control payload (HELLO/OPEN/QUERY/FINISH/CANCEL/LIST) using the reserved
+    /// control slot without consuming the DATA window semaphore, while still coordinating with
+    /// the device's global 4-slot CPC2 RPC semaphore and ordered enqueue lock.
+    pub async fn send_control(
+        &self,
+        payload: ConnectPayload,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let fut = self.enqueue_internal(payload, timeout, false).await?;
+        fut.await
+    }
+
+    /// Acquires a DATA window permit (bounded by both session `max_rpc` and device
+    /// `MAX_CONNECT_DATA_SLOTS` + global 4-slot RPC budget), registers the CPC2 waiter,
+    /// and enqueues the packet in strict caller order before returning the response Future.
+    ///
+    /// Because waiter registration and SAR enqueue complete before this method returns,
+    /// sequential calls to `submit_ordered` are guaranteed to enter the transport queue
+    /// in exact offset order without racing spawned tasks.
+    pub async fn submit_ordered(
+        &self,
+        payload: ConnectPayload,
+        timeout: Duration,
+    ) -> Result<InflightConnectFuture, String> {
+        self.enqueue_internal(payload, timeout, true).await
+    }
+
+    /// Enqueues a batch of payloads in strict slice order, bounding concurrency to `max_rpc`
+    /// and associating each response by `request_id`.
+    pub async fn send_many_ordered(
+        &self,
+        payloads: Vec<ConnectPayload>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        use tokio::task::JoinSet;
+        let mut inflight = JoinSet::new();
+        for payload in payloads {
+            while inflight.len() >= self.max_rpc {
+                match inflight.join_next().await {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(err))) => return Err(err),
+                    Some(Err(join_err)) => return Err(format!("Connect task panicked: {join_err}")),
+                    None => break,
+                }
+            }
+            let fut = self.submit_ordered(payload, timeout).await?;
+            inflight.spawn(fut);
+        }
+        while let Some(res) = inflight.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) => return Err(format!("Connect task panicked: {join_err}")),
+            }
+        }
+        Ok(())
+    }
+
+    async fn enqueue_internal(
+        &self,
+        payload: ConnectPayload,
+        timeout: Duration,
+        is_data: bool,
+    ) -> Result<InflightConnectFuture, String> {
+        let body = encode_send(&self.module, &payload)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        let session_permit: Option<OwnedSemaphorePermit> = if is_data {
+            Some(
+                tokio::time::timeout_at(deadline, Arc::clone(&self.session_sem).acquire_owned())
+                    .await
+                    .map_err(|_| "Canopus request timed out".to_string())?
+                    .map_err(|_| "device_not_connected: Connect session closed".to_string())?,
+            )
+        } else {
+            None
+        };
+
+        let addr_for_handles = self.addr.clone();
+        let (_, rpc_sem, data_sem, enqueue_lock) = crate::ecs::with_rt_mut(move |rt| {
+            rt.component_ref::<CanopusSystem>(&addr_for_handles)
+                .map(|sys| sys.concurrency_handles())
+                .ok_or_else(|| "device_not_connected: Canopus component not found".to_string())
+        })
+        .await?;
+
+        let data_permit: Option<OwnedSemaphorePermit> = if is_data {
+            Some(
+                tokio::time::timeout_at(deadline, data_sem.acquire_owned())
+                    .await
+                    .map_err(|_| "Canopus request timed out".to_string())?
+                    .map_err(|_| "device_not_connected: Canopus session closed".to_string())?,
+            )
+        } else {
+            None
+        };
+
+        let rpc_permit = tokio::time::timeout_at(deadline, rpc_sem.acquire_owned())
+            .await
+            .map_err(|_| "Canopus request timed out".to_string())?
+            .map_err(|_| "device_not_connected: Canopus session closed".to_string())?;
+
+        // Serialize request_id allocation + waiter registration + transport enqueue so
+        // packets are queued in the exact order callers invoke submit_ordered.
+        let _enqueue_guard = enqueue_lock.lock().await;
+        let addr_for_waiter = self.addr.clone();
+        let (request_id, rx, pending_guard) = crate::ecs::with_rt_mut(move |rt| {
+            let sys = rt
+                .component_mut::<CanopusSystem>(&addr_for_waiter)
+                .ok_or_else(|| "device_not_connected: Canopus component not found".to_string())?;
+            let (id, rx) = sys.allocate_waiter();
+            Ok::<_, String>((id, rx, PendingRequest::new(id, Arc::clone(&sys.pending))))
+        })
+        .await?;
+
+        let req = Cpc2Request::new(CanopusCommand::ConnectSend, request_id, body);
+        let backend: Arc<dyn ConnectEnqueueBackend> = match &self.backend {
+            Some(b) => Arc::clone(b),
+            None => Arc::new(DeviceSarBackend {
+                addr: self.addr.clone(),
+            }),
+        };
+        backend.enqueue_connect_send(req).await?;
+        drop(_enqueue_guard);
+
+        let module = self.module.clone();
+        Ok(Box::pin(async move {
+            let _session_permit = session_permit;
+            let _data_permit = data_permit;
+            let _rpc_permit = rpc_permit;
+            let _pending_guard = pending_guard;
+
+            let response = tokio::time::timeout_at(deadline, rx)
+                .await
+                .map_err(|_| "Canopus request timed out".to_string())?
+                .map_err(|_| "device_not_connected: Response channel closed".to_string())?;
+            if response.opcode != CanopusCommand::ConnectSend as u32 {
+                return Err("Canopus response opcode does not match the request".into());
+            }
+            interpret(&module, &response)
+        }))
+    }
 }
 
 async fn request_listen(addr: &str, module: &str, enable: bool) -> Result<(), String> {
@@ -433,5 +676,221 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].module, "echo");
         assert_eq!(seen[0].payload, ConnectPayload::Text("hi".into()));
+    }
+
+    struct RecordingBackend {
+        enqueued: Mutex<Vec<Cpc2Request>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                enqueued: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn take(&self) -> Vec<Cpc2Request> {
+            std::mem::take(&mut *self.enqueued.lock().unwrap())
+        }
+    }
+
+    impl ConnectEnqueueBackend for RecordingBackend {
+        fn enqueue_connect_send<'a>(
+            &'a self,
+            req: Cpc2Request,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.enqueued.lock().unwrap().push(req);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn resp_wire(request_id: u32, result: CanopusResult, payload: &[u8]) -> Vec<u8> {
+        let total = 36 + payload.len();
+        let mut wire = vec![0u8; total];
+        wire[0..4].copy_from_slice(&0x43504332u32.to_le_bytes());
+        wire[4..6].copy_from_slice(&36u16.to_le_bytes());
+        wire[6..8].copy_from_slice(&2u16.to_le_bytes());
+        wire[8..10].copy_from_slice(&1u16.to_le_bytes());
+        wire[10..12].copy_from_slice(&2u16.to_le_bytes());
+        wire[12..16].copy_from_slice(&(total as u32).to_le_bytes());
+        wire[16..20].copy_from_slice(&(CanopusCommand::ConnectSend as u32).to_le_bytes());
+        wire[20..24].copy_from_slice(&request_id.to_le_bytes());
+        wire[28..32].copy_from_slice(&(result as u32).to_le_bytes());
+        wire[32..36].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        wire[36..].copy_from_slice(payload);
+        wire
+    }
+
+    fn ensure_test_ecs() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            crate::ecs::init_runtime_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn window_sender_orders_enqueues_correlates_out_of_order_and_reserves_control_slot() {
+        use crate::device::xiaomi::packet::v2::layer2::{L2Channel, L2OpCode};
+        use crate::device::xiaomi::system::XiaomiSystemExt;
+
+        ensure_test_ecs();
+        let addr = "cc:win-order-test";
+        crate::ecs::with_rt_mut(move |rt| {
+            rt.spawn_device(addr.into(), (CanopusSystem::new(addr.into()),));
+        })
+        .await;
+
+        let backend = RecordingBackend::new();
+        let sender = ConnectWindowSender::with_mock_backend(addr, "corona", 3, backend.clone()).unwrap();
+        assert_eq!(sender.max_rpc(), 3);
+
+        // Submit 3 DATA payloads sequentially; they must enter the backend in exact offset order.
+        let fut0 = sender
+            .submit_ordered(ConnectPayload::Binary(vec![3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let fut1 = sender
+            .submit_ordered(ConnectPayload::Binary(vec![3, 0, 0, 0, 1, 0, 0, 0, 212, 1, 0, 0]), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let fut2 = sender
+            .submit_ordered(ConnectPayload::Binary(vec![3, 0, 0, 0, 1, 0, 0, 0, 168, 3, 0, 0]), Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // A 4th DATA request must block/time out because max_rpc = 3.
+        let fourth = sender
+            .submit_ordered(ConnectPayload::Binary(vec![3; 12]), Duration::from_millis(30))
+            .await;
+        assert!(fourth.is_err());
+
+        // Meanwhile, the reserved 4th device RPC slot is still available for control commands!
+        let ctrl_sender = sender.clone();
+        let ctrl_task = tokio::spawn(async move {
+            ctrl_sender
+                .send_control(ConnectPayload::Binary(vec![4, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0]), Duration::from_secs(2))
+                .await
+        });
+        for _ in 0..20 {
+            if backend.enqueued.lock().unwrap().len() == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let enqueued = backend.take();
+        assert_eq!(enqueued.len(), 4);
+        // Verify exact offset order in the first 3 DATA frames: 0, 468, 936.
+        let offsets: Vec<u32> = enqueued[..3]
+            .iter()
+            .map(|req| {
+                // ConnectSend frame has `kind(1) | id_len(1) | "corona"(6)` = 8 byte prefix, then 12B Corona header (`arg` at 8..12)
+                let corona_hdr = &req.payload[8..20];
+                u32::from_le_bytes(corona_hdr[8..12].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(offsets, vec![0, 468, 936]);
+
+        // Deliver CPC2 responses out of order: req2 (refused), req0 (ok), ctrl (ok), req1 (ok).
+        let id0 = enqueued[0].request_id;
+        let id1 = enqueued[1].request_id;
+        let id2 = enqueued[2].request_id;
+        let id_ctrl = enqueued[3].request_id;
+
+        crate::ecs::with_rt_mut(move |rt| {
+            let mut sys = rt.component_mut::<CanopusSystem>(addr).unwrap();
+            sys.on_layer2_packet(
+                L2Channel::Canopus,
+                L2OpCode::WriteEnc,
+                &resp_wire(id2, CanopusResult::Disallowed, &[STATUS_NOT_LISTENING]),
+            );
+            sys.on_layer2_packet(
+                L2Channel::Canopus,
+                L2OpCode::WriteEnc,
+                &resp_wire(id0, CanopusResult::Completed, &[0]),
+            );
+            sys.on_layer2_packet(
+                L2Channel::Canopus,
+                L2OpCode::WriteEnc,
+                &resp_wire(id_ctrl, CanopusResult::Completed, &[0]),
+            );
+            sys.on_layer2_packet(
+                L2Channel::Canopus,
+                L2OpCode::WriteEnc,
+                &resp_wire(id1, CanopusResult::Completed, &[0]),
+            );
+        })
+        .await;
+
+        assert!(fut0.await.is_ok());
+        assert!(fut1.await.is_ok());
+        assert!(fut2.await.unwrap_err().contains("not listening"));
+        assert!(ctrl_task.await.unwrap().is_ok());
+
+        crate::ecs::with_rt_mut(move |rt| {
+            rt.remove_device(addr);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn timeout_and_disconnect_release_permits_and_avoid_waiter_wraparound_collision() {
+        ensure_test_ecs();
+        let addr = "cc:win-timeout-test";
+        crate::ecs::with_rt_mut(move |rt| {
+            let sys = CanopusSystem::new(addr.into());
+            // Force next_request_id near u32::MAX to test wraparound and existing waiter skip.
+            sys.next_request_id.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            rt.spawn_device(addr.into(), (sys,));
+        })
+        .await;
+
+        let backend = RecordingBackend::new();
+        let sender = ConnectWindowSender::with_mock_backend(addr, "corona", 2, backend.clone()).unwrap();
+
+        // First request gets u32::MAX; hold it in-flight.
+        let fut_keep = sender
+            .submit_ordered(ConnectPayload::Binary(vec![1; 12]), Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Force wraparound back to u32::MAX while u32::MAX is still pending -> must skip u32::MAX and 0!
+        crate::ecs::with_rt_mut(move |rt| {
+            let sys = rt.component_ref::<CanopusSystem>(addr).unwrap();
+            sys.next_request_id.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+
+        // Second request times out quickly and must clean up its waiter + permit.
+        let fut_timeout = sender
+            .submit_ordered(ConnectPayload::Binary(vec![2; 12]), Duration::from_millis(25))
+            .await
+            .unwrap();
+        assert!(fut_timeout.await.unwrap_err().contains("timed out"));
+
+        let reqs = backend.take();
+        assert_eq!(reqs[0].request_id, u32::MAX);
+        assert_eq!(reqs[1].request_id, 1); // Skipped u32::MAX (in-use) and 0 (reserved)!
+
+        // Because fut_timeout released its permit on timeout, a new request can immediately acquire the 2nd slot.
+        let fut_after_timeout = sender
+            .submit_ordered(ConnectPayload::Binary(vec![3; 12]), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Now simulate device disconnect: fail_waiters() must wake all in-flight futures immediately.
+        crate::ecs::with_rt_mut(move |rt| {
+            let sys = rt.component_ref::<CanopusSystem>(addr).unwrap();
+            sys.fail_waiters();
+            assert_eq!(sys.pending.lock().unwrap().len(), 0);
+        })
+        .await;
+
+        assert!(fut_keep.await.is_err());
+        assert!(fut_after_timeout.await.is_err());
+
+        crate::ecs::with_rt_mut(move |rt| {
+            rt.remove_device(addr);
+        })
+        .await;
     }
 }

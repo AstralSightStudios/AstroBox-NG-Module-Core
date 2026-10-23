@@ -20,8 +20,15 @@ use crate::{
 };
 
 mod list;
+pub mod proto;
+pub mod session;
 pub use list::InstalledResourcePack;
 use list::ListCollector;
+pub use proto::CORONA_MODULE_ID;
+use session::{
+    CoronaTransport, LiveCoronaTransport, SessionConfig, prepare_archive_streaming,
+    run_install_session, run_list_session,
+};
 
 pub const MANAGER_PACKAGE: &str = "ng.lst.corona";
 const MAX_TEXT_CHARS: usize = 18_000;
@@ -97,9 +104,31 @@ pub struct ResourcePackProgress {
     pub resume: Option<ResumeToken>,
 }
 
-/// Query a complete installed snapshot without closing a user-opened Manager.
+/// Query a complete installed snapshot over CanopusConnect (`corona` module).
 /// The device session lock also prevents a query from interrupting an upload.
 pub async fn list_installed(addr: String) -> anyhow::Result<Vec<InstalledResourcePack>> {
+    let device_addr = addr.clone();
+    let session = crate::ecs::with_rt_mut(move |rt| {
+        rt.component_ref::<ResourcePackComponent>(&device_addr)
+            .map(|comp| comp.session.clone())
+            .context("res_pack is not supported by this device")
+    })
+    .await?;
+    let _guard = session
+        .clone()
+        .try_lock_owned()
+        .context("a resource pack session is already running")?;
+    let config = SessionConfig::default();
+    let mut transport = LiveCoronaTransport::new(addr, session, config.host_max_rpc as usize)?;
+    let result = run_list_session(&mut transport, config.control_timeout).await;
+    transport.close().await;
+    result
+}
+
+/// Legacy Interconnect list query kept for older quick-app compatibility switches.
+pub async fn list_installed_legacy_interconnect(
+    addr: String,
+) -> anyhow::Result<Vec<InstalledResourcePack>> {
     let device_addr = addr.clone();
     let session = crate::ecs::with_rt_mut(move |rt| {
         rt.component_ref::<ResourcePackComponent>(&device_addr)
@@ -118,15 +147,11 @@ pub async fn list_installed(addr: String) -> anyhow::Result<Vec<InstalledResourc
         events: crate::events::subscribe(),
         session,
     };
-    // A responsive Manager already belongs to the user. Do not navigate or
-    // claim its lifetime, even if the subsequent list query fails.
     if let Some(hello) = transport.handshake_for(MANAGER_PROBE_TIMEOUT).await? {
         transport.max_chars = parse_handshake_limits(&hello)?.0;
         return transport.list_installed().await;
     }
 
-    // A timeout does not prove the app was closed. Only a cold-start token
-    // acknowledged by Manager gives this check permission to send Q.
     let launch_token = new_request_id();
     let mut owned = false;
     let result = async {
@@ -137,8 +162,6 @@ pub async fn list_installed(addr: String) -> anyhow::Result<Vec<InstalledResourc
         transport.list_installed().await
     }
     .await;
-    // Unknown/legacy launch contexts, failed handshakes and an already-running
-    // Manager are left open. Retain the session lock through owned cleanup.
     if owned {
         if let Err(error) = transport.quit(&launch_token).await {
             log::debug!("[ResourcePack] Manager cleanup failed: {error:#}");
@@ -147,7 +170,45 @@ pub async fn list_installed(addr: String) -> anyhow::Result<Vec<InstalledResourc
     result
 }
 
+/// Install a CRPack over CanopusConnect (`corona` binary protocol) by streaming directly
+/// from `path` without copying the full archive into RAM.
 pub async fn install(
+    addr: String,
+    path: PathBuf,
+    resume: Option<ResumeToken>,
+    progress: impl Fn(ResourcePackProgress) + Send,
+) -> anyhow::Result<()> {
+    let device_addr = addr.clone();
+    let lock = crate::ecs::with_rt_mut(move |rt| {
+        rt.component_ref::<ResourcePackComponent>(&device_addr)
+            .map(|comp| comp.session.clone())
+            .context("res_pack is not supported by this device")
+    })
+    .await?;
+    let _guard = lock
+        .clone()
+        .try_lock_owned()
+        .context("a resource pack transfer is already running")?;
+    let inspect_path = path.clone();
+    let prepared = tokio::task::spawn_blocking(move || prepare_archive_streaming(&inspect_path))
+        .await
+        .context("CRPack preflight worker panicked")??;
+    if let Some(token) = &resume {
+        ensure!(
+            token.digest == prepared.digest_hex,
+            "res_pack changed; remove the old task and start a replacement"
+        );
+    }
+    let config = SessionConfig::default();
+    let mut transport = LiveCoronaTransport::new(addr, lock, config.host_max_rpc as usize)?;
+    let result =
+        run_install_session(&mut transport, &path, &prepared, resume, config, progress).await;
+    transport.close().await;
+    result
+}
+
+/// Legacy Interconnect CRPack installer kept only for old-device compatibility switches.
+pub async fn install_legacy_interconnect(
     addr: String,
     path: PathBuf,
     resume: Option<ResumeToken>,
@@ -825,7 +886,620 @@ fn base91(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{
+        collections::VecDeque,
+        io::Write,
+        sync::Mutex as StdMutex,
+    };
+
+    use crate::device::res_pack::proto::{
+        CoronaCode, CoronaOp, CoronaPhase, FrameHeader, HelloCaps, LIST_END_INDEX,
+        ProgressState, decode_frame, encode_frame,
+    };
+    use crate::device::res_pack::session::{
+        CoronaTransport, RpcFuture, SessionConfig, WindowTracker, prepare_archive_streaming,
+        run_install_session, run_list_session,
+    };
+    use sha2::{Digest, Sha256};
+    use tokio::sync::mpsc;
+
+    #[derive(Debug, Default)]
+    struct MockDeviceState {
+        connected: bool,
+        listen_count: usize,
+        hello_count: usize,
+        open_count: usize,
+        query_count: usize,
+        finish_count: usize,
+        cancel_count: usize,
+        token_high_water: u32,
+        active_token: u32,
+        last_open_nonce: Option<[u8; 8]>,
+        last_open_sha: Option<[u8; 32]>,
+        last_open_size: u32,
+        archive_bytes: u32,
+        received_offset: u32,
+        written_offset: u32,
+        durable_offset: u32,
+        buffer_used: u32,
+        frames_since_flush: u8,
+        phase: CoronaPhase,
+        detail: CoronaCode,
+        finish_polls_remaining: usize,
+        disk: Vec<u8>,
+        enqueued_data_offsets: Vec<u32>,
+        drop_acks_count: usize,
+        disconnect_at_offset: Option<u32>,
+        reverse_rpc_pairs: bool,
+        pending_rpc_replies: VecDeque<(u32, tokio::sync::oneshot::Sender<anyhow::Result<()>>)>,
+        caps: HelloCaps,
+    }
+
+    impl MockDeviceState {
+        fn new() -> Self {
+            Self {
+                connected: false,
+                listen_count: 0,
+                hello_count: 0,
+                open_count: 0,
+                query_count: 0,
+                finish_count: 0,
+                cancel_count: 0,
+                token_high_water: 0x100,
+                active_token: 0,
+                last_open_nonce: None,
+                last_open_sha: None,
+                last_open_size: 0,
+                archive_bytes: 0,
+                received_offset: 0,
+                written_offset: 0,
+                durable_offset: 0,
+                buffer_used: 0,
+                frames_since_flush: 0,
+                phase: CoronaPhase::Idle,
+                detail: CoronaCode::Ok,
+                finish_polls_remaining: 2,
+                disk: Vec::new(),
+                enqueued_data_offsets: Vec::new(),
+                drop_acks_count: 0,
+                disconnect_at_offset: None,
+                reverse_rpc_pairs: false,
+                pending_rpc_replies: VecDeque::new(),
+                caps: HelloCaps::default(),
+            }
+        }
+
+        fn flush_buffer(&mut self) {
+            self.written_offset = self.received_offset;
+            self.buffer_used = 0;
+            self.frames_since_flush = 0;
+            if self.written_offset - self.durable_offset >= self.caps.checkpoint_bytes
+                || self.written_offset == self.archive_bytes
+            {
+                self.durable_offset = self.written_offset;
+            }
+        }
+
+        fn progress(&self) -> ProgressState {
+            ProgressState {
+                token: self.active_token,
+                written_offset: self.written_offset,
+                durable_offset: self.durable_offset,
+                window_frames: self.caps.window_frames,
+                ack_every: self.caps.ack_every,
+                phase: self.phase,
+                detail: self.detail,
+            }
+        }
+    }
+
+    struct MockCoronaTransport {
+        state: Arc<StdMutex<MockDeviceState>>,
+        events_tx: mpsc::UnboundedSender<Vec<u8>>,
+        events_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        max_rpc: usize,
+        inflight_sem: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl MockCoronaTransport {
+        fn new(state: Arc<StdMutex<MockDeviceState>>) -> Self {
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            Self {
+                state,
+                events_tx,
+                events_rx,
+                max_rpc: 2,
+                inflight_sem: Arc::new(tokio::sync::Semaphore::new(2)),
+            }
+        }
+    }
+
+    impl CoronaTransport for MockCoronaTransport {
+        fn connect_and_listen<'a>(
+            &'a mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut st = self.state.lock().unwrap();
+                st.connected = true;
+                st.listen_count += 1;
+                Ok(())
+            })
+        }
+
+        fn set_max_rpc(&mut self, max_rpc: usize) {
+            self.max_rpc = max_rpc;
+            self.inflight_sem = Arc::new(tokio::sync::Semaphore::new(max_rpc));
+        }
+
+        fn send_control<'a>(
+            &'a mut self,
+            frame: Vec<u8>,
+            _timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let (hdr, payload) = decode_frame(&frame)?;
+                let op = CoronaOp::from_request_byte(hdr.op)?;
+                let mut st = self.state.lock().unwrap();
+                ensure!(st.connected, "device_not_connected");
+
+                match op {
+                    CoronaOp::Hello => {
+                        st.hello_count += 1;
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::Hello.response_byte(),
+                                code: CoronaCode::Ok as u8,
+                                seq: hdr.seq,
+                                token: 0,
+                                arg: 0,
+                            },
+                            &st.caps.encode_payload(),
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::Open => {
+                        st.open_count += 1;
+                        let mut sha = [0u8; 32];
+                        let mut nonce = [0u8; 8];
+                        sha.copy_from_slice(&payload[0..32]);
+                        nonce.copy_from_slice(&payload[32..40]);
+
+                        let same_content = st.last_open_sha == Some(sha) && st.last_open_size == hdr.arg;
+                        if st.last_open_nonce == Some(nonce) && same_content && st.active_token != 0 {
+                            // Idempotent retry of same OPEN
+                        } else {
+                            st.token_high_water += 1;
+                            st.active_token = st.token_high_water;
+                            st.last_open_nonce = Some(nonce);
+                            if !same_content {
+                                st.last_open_sha = Some(sha);
+                                st.last_open_size = hdr.arg;
+                                st.archive_bytes = hdr.arg;
+                                st.received_offset = 0;
+                                st.written_offset = 0;
+                                st.durable_offset = 0;
+                                st.buffer_used = 0;
+                                st.frames_since_flush = 0;
+                                st.disk = vec![0u8; hdr.arg as usize];
+                                st.phase = CoronaPhase::Receiving;
+                                st.detail = CoronaCode::Ok;
+                            } else {
+                                // Resume from written_offset (discarding uncommitted RAM tail)
+                                st.received_offset = st.written_offset;
+                                st.buffer_used = 0;
+                                st.frames_since_flush = 0;
+                                if matches!(st.detail, CoronaCode::Offset | CoronaCode::Busy) {
+                                    st.detail = CoronaCode::Ok;
+                                }
+                                if st.phase == CoronaPhase::Error && st.detail == CoronaCode::Ok {
+                                    st.phase = CoronaPhase::Receiving;
+                                }
+                            }
+                        }
+                        let prog = st.progress();
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::Open.response_byte(),
+                                code: CoronaCode::Ok as u8,
+                                seq: hdr.seq,
+                                token: st.active_token,
+                                arg: prog.written_offset,
+                            },
+                            &prog.encode_payload(),
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::Query => {
+                        st.query_count += 1;
+                        if hdr.token != st.active_token {
+                            let resp = encode_frame(
+                                FrameHeader {
+                                    op: CoronaOp::Query.response_byte(),
+                                    code: CoronaCode::Stale as u8,
+                                    seq: hdr.seq,
+                                    token: hdr.token,
+                                    arg: 0,
+                                },
+                                &[],
+                            )?;
+                            let _ = self.events_tx.send(resp);
+                            return Ok(());
+                        }
+                        if st.phase == CoronaPhase::Receiving {
+                            st.flush_buffer();
+                        } else if matches!(st.phase, CoronaPhase::Verifying | CoronaPhase::Installing) {
+                            if st.finish_polls_remaining > 1 {
+                                st.finish_polls_remaining -= 1;
+                                st.phase = CoronaPhase::Installing;
+                            } else {
+                                st.finish_polls_remaining = 0;
+                                st.phase = CoronaPhase::Installed;
+                            }
+                        }
+                        let prog = st.progress();
+                        let code = if st.phase == CoronaPhase::Error {
+                            st.detail
+                        } else {
+                            CoronaCode::Ok
+                        };
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::Query.response_byte(),
+                                code: code as u8,
+                                seq: hdr.seq,
+                                token: st.active_token,
+                                arg: prog.written_offset,
+                            },
+                            &prog.encode_payload(),
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::Finish => {
+                        st.finish_count += 1;
+                        st.flush_buffer();
+                        let mut hasher = Sha256::new();
+                        hasher.update(&st.disk);
+                        let disk_sha: [u8; 32] = hasher.finalize().into();
+                        if Some(disk_sha) != st.last_open_sha {
+                            st.phase = CoronaPhase::Error;
+                            st.detail = CoronaCode::Hash;
+                            let prog = st.progress();
+                            let resp = encode_frame(
+                                FrameHeader {
+                                    op: CoronaOp::Finish.response_byte(),
+                                    code: CoronaCode::Hash as u8,
+                                    seq: hdr.seq,
+                                    token: st.active_token,
+                                    arg: prog.written_offset,
+                                },
+                                &prog.encode_payload(),
+                            )?;
+                            let _ = self.events_tx.send(resp);
+                            return Ok(());
+                        }
+                        st.phase = CoronaPhase::Verifying;
+                        let prog = st.progress();
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::Finish.response_byte(),
+                                code: CoronaCode::Ok as u8,
+                                seq: hdr.seq,
+                                token: st.active_token,
+                                arg: prog.written_offset,
+                            },
+                            &prog.encode_payload(),
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::Cancel => {
+                        st.cancel_count += 1;
+                        st.phase = CoronaPhase::Canceled;
+                        st.detail = CoronaCode::Ok;
+                        let prog = st.progress();
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::Cancel.response_byte(),
+                                code: CoronaCode::Ok as u8,
+                                seq: hdr.seq,
+                                token: st.active_token,
+                                arg: prog.written_offset,
+                            },
+                            &prog.encode_payload(),
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::List => {
+                        let rev = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                        let code = if rev != 0 && rev != 1 {
+                            CoronaCode::Changed
+                        } else {
+                            CoronaCode::Ok
+                        };
+                        let mut out_payload = Vec::new();
+                        if code == CoronaCode::Ok {
+                            out_payload.extend_from_slice(&1u32.to_le_bytes()); // revision = 1
+                            out_payload.extend_from_slice(&1u32.to_le_bytes()); // total = 1
+                            out_payload.extend_from_slice(&LIST_END_INDEX.to_le_bytes());
+                            out_payload.push(0b011); // version + versionCode
+                            out_payload.push(4); // "dark"
+                            out_payload.push(4); // "Dark"
+                            out_payload.push(5); // "1.0.0"
+                            out_payload.push(0); // no author
+                            out_payload.push(0); // metadata ok
+                            out_payload.extend_from_slice(&7u64.to_le_bytes());
+                            out_payload.extend_from_slice(b"darkDark1.0.0");
+                        }
+                        let resp = encode_frame(
+                            FrameHeader {
+                                op: CoronaOp::List.response_byte(),
+                                code: code as u8,
+                                seq: hdr.seq,
+                                token: 0,
+                                arg: hdr.arg,
+                            },
+                            &out_payload,
+                        )?;
+                        let _ = self.events_tx.send(resp);
+                    }
+                    CoronaOp::Data => unreachable!(),
+                }
+                Ok(())
+            })
+        }
+
+        fn submit_data<'a>(
+            &'a mut self,
+            offset: u32,
+            frame: Vec<u8>,
+            _timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<RpcFuture>> + Send + 'a>> {
+            Box::pin(async move {
+                let permit = Arc::clone(&self.inflight_sem).acquire_owned().await?;
+                let (hdr, payload) = decode_frame(&frame)?;
+                let mut st = self.state.lock().unwrap();
+                ensure!(st.connected, "device_not_connected");
+
+                if st.disconnect_at_offset == Some(offset) {
+                    st.disconnect_at_offset = None;
+                    st.connected = false;
+                    // Discard un-flushed RAM buffer on disconnect/session drop, keeping written_offset.
+                    st.received_offset = st.written_offset;
+                    st.buffer_used = 0;
+                    st.frames_since_flush = 0;
+                    while let Some((_, tx)) = st.pending_rpc_replies.pop_front() {
+                        let _ = tx.send(Err(anyhow::anyhow!("device_not_connected")));
+                    }
+                    bail!("device_not_connected: simulated mid-stream disconnect");
+                }
+
+                st.enqueued_data_offsets.push(offset);
+                if hdr.token == st.active_token && st.phase == CoronaPhase::Receiving {
+                    let len = payload.len() as u32;
+                    if offset < st.received_offset {
+                        // Complete duplicate within received prefix is ignored.
+                        if offset + len > st.received_offset {
+                            st.phase = CoronaPhase::Error;
+                            st.detail = CoronaCode::Offset;
+                        }
+                    } else if offset == st.received_offset && offset + len <= st.archive_bytes {
+                        let start = offset as usize;
+                        let end = start + payload.len();
+                        st.disk[start..end].copy_from_slice(payload);
+                        st.received_offset += len;
+                        st.buffer_used += len;
+                        st.frames_since_flush += 1;
+                        // Single 4 KiB buffer invariant on device
+                        assert!(st.buffer_used <= 4096);
+                        if st.frames_since_flush >= st.caps.ack_every
+                            || st.received_offset == st.archive_bytes
+                        {
+                            st.flush_buffer();
+                            if st.drop_acks_count > 0 {
+                                st.drop_acks_count -= 1;
+                            } else {
+                                let prog = st.progress();
+                                let ack = encode_frame(
+                                    FrameHeader {
+                                        op: CoronaOp::Data.response_byte(),
+                                        code: 0,
+                                        seq: 0,
+                                        token: st.active_token,
+                                        arg: prog.written_offset,
+                                    },
+                                    &prog.encode_payload(),
+                                )?;
+                                let _ = self.events_tx.send(ack);
+                            }
+                        }
+                    } else {
+                        st.phase = CoronaPhase::Error;
+                        st.detail = CoronaCode::Offset;
+                    }
+                }
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if st.reverse_rpc_pairs {
+                    st.pending_rpc_replies.push_back((offset, tx));
+                    if st.pending_rpc_replies.len() >= 2
+                        || st.received_offset == st.archive_bytes
+                        || st.frames_since_flush == 0
+                    {
+                        // Deliver CPC2 responses in reverse order to verify request correlation!
+                        while let Some((_, reply_tx)) = st.pending_rpc_replies.pop_back() {
+                            let _ = reply_tx.send(Ok(()));
+                        }
+                    }
+                } else {
+                    let _ = tx.send(Ok(()));
+                }
+
+                Ok(Box::pin(async move {
+                    let _permit = permit;
+                    rx.await.context("mock RPC channel closed")?
+                }) as RpcFuture)
+            })
+        }
+
+        fn recv_frame<'a>(
+            &'a mut self,
+            deadline: Instant,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                match timeout_at(deadline, self.events_rx.recv()).await {
+                    Err(_) => Ok(None),
+                    Ok(Some(frame)) => Ok(Some(frame)),
+                    Ok(None) => bail!("mock event channel closed"),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn end_to_end_1mib_crpack_streaming_window_out_of_order_ack_loss_and_reconnect() {
+        let zip_path = std::env::temp_dir().join(format!(
+            "corona_e2e_1mib_{}.crpack",
+            std::process::id()
+        ));
+        let expected_zip_bytes = {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let stored = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("corona.json", stored).unwrap();
+            zip.write_all(MANIFEST).unwrap();
+            // Add a ~1 MiB asset so archive is > 1 MiB.
+            let mut payload = vec![0u8; 1024 * 1024];
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b = ((i * 31 + 17) & 0xff) as u8;
+            }
+            zip.start_file("assets/large_wallpaper.bin", stored).unwrap();
+            zip.write_all(&payload).unwrap();
+            zip.finish().unwrap();
+            std::fs::read(&zip_path).unwrap()
+        };
+        assert!(expected_zip_bytes.len() > 1024 * 1024);
+
+        let prepared = prepare_archive_streaming(&zip_path).unwrap();
+        assert_eq!(prepared.theme_id, "dark");
+        assert_eq!(prepared.archive_bytes as usize, expected_zip_bytes.len());
+
+        let state = Arc::new(StdMutex::new(MockDeviceState::new()));
+        {
+            let mut st = state.lock().unwrap();
+            st.caps.max_rpc = 3;
+            st.drop_acks_count = 2; // Drop 2 consecutive ACKs (8 frames = full window) to force QUERY barrier recovery
+            st.disconnect_at_offset = Some(468 * 25); // Disconnect mid-stream at frame 25
+            st.reverse_rpc_pairs = true; // Return CPC2 responses out-of-order
+        }
+
+        let mut transport = MockCoronaTransport::new(state.clone());
+        let config = SessionConfig {
+            host_max_rpc: 3,
+            control_timeout: Duration::from_millis(200),
+            data_rpc_timeout: Duration::from_millis(200),
+            ack_wait: Duration::from_millis(25),
+            finish_poll_interval: Duration::from_millis(5),
+            max_recovery_rounds: 6,
+            max_finish_polls: 10,
+        };
+
+        let phases = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let phases_cb = phases.clone();
+        run_install_session(
+            &mut transport,
+            &zip_path,
+            &prepared,
+            None,
+            config,
+            move |prog| {
+                let mut list = phases_cb.lock().unwrap();
+                if list.last() != Some(&prog.status) {
+                    list.push(prog.status);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&zip_path);
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.phase, CoronaPhase::Installed);
+        assert_eq!(st.written_offset, prepared.archive_bytes);
+        assert_eq!(st.disk, expected_zip_bytes);
+        // Reconnected after simulated disconnect -> at least 2 HELLO and 2 OPEN calls with new token!
+        assert!(st.hello_count >= 2);
+        assert!(st.open_count >= 2);
+        // Lost ACK triggered QUERY barrier recovery + FINISH polling!
+        assert!(st.query_count >= 3);
+        assert_eq!(st.finish_count, 1);
+
+        let seen_phases = phases.lock().unwrap().clone();
+        assert!(seen_phases.contains(&"uploading".to_string()));
+        assert!(seen_phases.contains(&"verifying".to_string()));
+        assert!(seen_phases.contains(&"installing".to_string()));
+        assert_eq!(seen_phases.last().map(String::as_str), Some("installed"));
+    }
+
+    #[tokio::test]
+    async fn corona_binary_list_paginates_and_validates_revision() {
+        let state = Arc::new(StdMutex::new(MockDeviceState::new()));
+        let mut transport = MockCoronaTransport::new(state);
+        let items = run_list_session(&mut transport, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].theme_id, "dark");
+        assert_eq!(items[0].name, "Dark");
+        assert_eq!(items[0].version.as_deref(), Some("1.0.0"));
+        assert_eq!(items[0].version_code, Some(7));
+        assert_eq!(items[0].metadata_status, "ok");
+    }
+
+    #[test]
+    fn window_tracker_enforces_byte_and_rpc_caps_and_ignores_stale_or_duplicate_acks() {
+        let caps = HelloCaps {
+            max_rpc: 2,
+            window_frames: 8,
+            ack_every: 4,
+            chunk_bytes: 468,
+            ..HelloCaps::default()
+        };
+        let init = ProgressState {
+            token: 10,
+            written_offset: 0,
+            durable_offset: 0,
+            window_frames: 8,
+            ack_every: 4,
+            phase: CoronaPhase::Receiving,
+            detail: CoronaCode::Ok,
+        };
+        let mut tracker = WindowTracker::new(&caps, &init, 5000, 2);
+        assert_eq!(tracker.window_limit(), 3744);
+        assert_eq!(tracker.next_chunk_range(), Some((0, 468)));
+        tracker.record_sent(468);
+        assert_eq!(tracker.next_chunk_range(), Some((468, 468)));
+        tracker.record_sent(468);
+        // 2 RPCs in flight -> blocked by max_rpc even though byte window has room
+        assert_eq!(tracker.next_chunk_range(), None);
+        tracker.record_rpc_completed();
+        assert_eq!(tracker.next_chunk_range(), Some((936, 468)));
+
+        // Duplicate ACK at 0 does not move window; ACK at 468 advances window to 468 + 3744 = 4212
+        assert!(!tracker.apply_progress(&init).unwrap());
+        let ack1 = ProgressState {
+            written_offset: 468,
+            ..init
+        };
+        assert!(tracker.apply_progress(&ack1).unwrap());
+        assert_eq!(tracker.acked_offset, 468);
+        assert_eq!(tracker.window_limit(), 4212);
+        // Smaller ACK is ignored without rewinding acked_offset
+        assert!(!tracker.apply_progress(&init).unwrap());
+        assert_eq!(tracker.acked_offset, 468);
+    }
 
     const MANIFEST: &[u8] = br#"{"format":"canopus-resource-pack","formatVersion":1,"themeId":"dark","name":"Dark","mappings":[]}"#;
 
