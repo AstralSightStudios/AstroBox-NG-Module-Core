@@ -150,7 +150,9 @@ pub fn prepare_install(data: &[u8], target_id: &str) -> Result<InstallPackage, S
         );
     }
     let (manifest, files) = read_archive(data)?;
-    if manifest.canopus_abi != "1" {
+    // Packages carry the Canopus public ABI major they were built for; the Supervisor refuses
+    // modules of another major, so a package of an older ABI is turned away here.
+    if manifest.canopus_abi != "2" {
         return Err(format!(
             "Unsupported Canopus package ABI: {}",
             manifest.canopus_abi
@@ -245,7 +247,7 @@ mod tests {
             receipt[24] += 1;
         }
         let manifest = serde_json::to_vec(&serde_json::json!({
-            "schema": 1, "module_id": "hello", "canopus_abi": "1", "lifecycle": "removable", "version_code": 7,
+            "schema": 1, "module_id": "hello", "canopus_abi": "2", "lifecycle": "removable", "version_code": 7,
             "native_app": { "resources": if resources { vec![serde_json::json!({"path":"icon.bin"})] } else { vec![] } },
             "artifacts": [{"target_id": target, "firmware_sha256": hex::encode([1;32]),
                 "path": "module.elf", "sha256": hex::encode(Sha256::digest(elf)),

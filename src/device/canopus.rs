@@ -32,8 +32,11 @@ use tokio::sync::oneshot;
 pub const CANOPUS_L2_CHANNEL: u8 = 0x43;
 pub const CANOPUS_TRANSPORT_V2_MAGIC: u32 = 0x43504332; // "CPC2"
 pub const CANOPUS_TRANSPORT_V2_HEADER_SIZE: usize = 36;
-pub const CANOPUS_ABI_MAJOR: u16 = 1;
-pub const CANOPUS_ABI_MINOR: u16 = 2;
+/// The Canopus public ABI the Supervisor speaks. Every CPC2 header carries it and the Supervisor
+/// drops (without answering) a request whose major differs from its own, so this follows the
+/// framework's `CANOPUS_ABI_MAJOR`: 2.0 with the native UI ABI 2.0 and its module lifecycle.
+pub const CANOPUS_ABI_MAJOR: u16 = 2;
+pub const CANOPUS_ABI_MINOR: u16 = 0;
 pub const CANOPUS_PROTO_MAX_PAYLOAD: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +330,10 @@ const CPC2_KIND_EVENT: u16 = 3;
 /// concurrent Connect DATA requests, leaving at least 1 slot for control/Manager RPCs.
 pub const MAX_DEVICE_RPC_SLOTS: usize = 4;
 pub const MAX_CONNECT_DATA_SLOTS: usize = 3;
+/// Plugin `canopusconnect.send` calls in flight at once. Their own window, apart from the CRPack
+/// data window, so a long resource-pack upload cannot starve a plugin (or the other way round);
+/// both still draw on the device's 4 RPC slots.
+pub const MAX_CONNECT_PLUGIN_SLOTS: usize = 3;
 
 /// ECS component that listens on `L2Channel::Canopus` and dispatches CPC2 responses
 /// to pending futures and CPC2 events to the core event bus.
@@ -336,8 +343,8 @@ pub struct CanopusSystem {
     next_request_id: AtomicU32,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
     install_lock: Arc<tokio::sync::Mutex<()>>,
-    /// One conservative CanopusConnect message in flight per device for legacy/plugin callers.
-    connect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Plugin CanopusConnect messages in flight ([`MAX_CONNECT_PLUGIN_SLOTS`]).
+    connect_plugin_sem: Arc<tokio::sync::Semaphore>,
     /// Global CPC2 RPC budget across the device (4 slots total).
     rpc_sem: Arc<tokio::sync::Semaphore>,
     /// Connect DATA in-flight budget (at most 3 slots so 1 slot remains for control/Manager).
@@ -360,7 +367,7 @@ impl CanopusSystem {
             next_request_id: AtomicU32::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             install_lock: Arc::new(tokio::sync::Mutex::new(())),
-            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            connect_plugin_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECT_PLUGIN_SLOTS)),
             rpc_sem: Arc::new(tokio::sync::Semaphore::new(MAX_DEVICE_RPC_SLOTS)),
             connect_data_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECT_DATA_SLOTS)),
             connect_enqueue_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -413,21 +420,23 @@ impl CanopusSystem {
         self.pending.lock().unwrap().clear();
     }
 
-    pub(crate) fn concurrency_handles(
-        &self,
-    ) -> (
-        Arc<Mutex<HashMap<u32, oneshot::Sender<Cpc2Response>>>>,
-        Arc<tokio::sync::Semaphore>,
-        Arc<tokio::sync::Semaphore>,
-        Arc<tokio::sync::Mutex<()>>,
-    ) {
-        (
-            Arc::clone(&self.pending),
-            Arc::clone(&self.rpc_sem),
-            Arc::clone(&self.connect_data_sem),
-            Arc::clone(&self.connect_enqueue_lock),
-        )
+    pub(crate) fn concurrency_handles(&self) -> ConcurrencyHandles {
+        ConcurrencyHandles {
+            rpc_sem: Arc::clone(&self.rpc_sem),
+            data_sem: Arc::clone(&self.connect_data_sem),
+            plugin_sem: Arc::clone(&self.connect_plugin_sem),
+            enqueue_lock: Arc::clone(&self.connect_enqueue_lock),
+        }
     }
+}
+
+/// The shared budgets a Connect send draws on, cloned out of the component so they can be awaited
+/// without holding the ECS.
+pub(crate) struct ConcurrencyHandles {
+    pub(crate) rpc_sem: Arc<tokio::sync::Semaphore>,
+    pub(crate) data_sem: Arc<tokio::sync::Semaphore>,
+    pub(crate) plugin_sem: Arc<tokio::sync::Semaphore>,
+    pub(crate) enqueue_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) struct PendingRequest {

@@ -23,8 +23,9 @@ use once_cell::sync::OnceCell;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::{
-    CanopusCommand, CanopusResult, CanopusSystem, Cpc2Event, Cpc2Request, Cpc2Response,
-    MAX_CONNECT_DATA_SLOTS, PendingRequest, is_valid_module_id, request,
+    CanopusCommand, CanopusResult, CanopusSystem, ConcurrencyHandles, Cpc2Event, Cpc2Request,
+    Cpc2Response, MAX_CONNECT_DATA_SLOTS, MAX_CONNECT_PLUGIN_SLOTS, PendingRequest,
+    is_valid_module_id, request,
 };
 
 pub const DATA_MAX: usize = 480;
@@ -152,19 +153,28 @@ fn interpret(module: &str, response: &Cpc2Response) -> Result<(), String> {
 /// Sends `payload` to the module and returns once the device handed it to the
 /// module's listener.
 ///
-/// Kept serial by `connect_lock` for plugin compatibility: it must not compete for
-/// the CRPack data-window permits, or plugin sends would time out during a long
-/// resource-pack upload. Device queue bounds are still enforced by `rpc_sem`.
+/// A plugin that issues several sends at once (an import streams a thousand frames) keeps up to
+/// [`MAX_CONNECT_PLUGIN_SLOTS`] of them on their way: each is queued to the transport in the order
+/// it was asked for, and holds a device RPC slot until the device has answered it, so the device's
+/// four-slot queue cannot overflow and a Manager request always has a slot left. The window is the
+/// plugins' own: it neither draws on the CRPack data window nor is starved by it. A caller that
+/// awaits each send before the next still sees strictly one message at a time.
 pub async fn send(addr: &str, module: &str, payload: ConnectPayload) -> Result<(), String> {
-    use crate::ecs::access::with_device_component_mut;
-    let body = encode_send(module, &payload)?;
-    let lock = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| {
-        std::sync::Arc::clone(&sys.connect_lock)
-    })
-    .map_err(|e| format!("Canopus component access failed: {e:?}"))?;
-    let _guard = lock.lock().await;
-    let response = request(addr, CanopusCommand::ConnectSend, body, TIMEOUT).await?;
-    interpret(module, &response)
+    ConnectWindowSender::plugin(addr, module)?
+        .submit(Lane::Plugin, payload, TIMEOUT)
+        .await?
+        .await
+}
+
+/// Which budget a send draws on, besides the device's 4 RPC slots.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Session control (HELLO/OPEN/QUERY/FINISH/CANCEL): the slot kept free of any data window.
+    Control,
+    /// A windowed session's DATA: the session's window and the device's data slots.
+    Data,
+    /// A plugin's `canopusconnect.send`: the device's plugin window.
+    Plugin,
 }
 
 pub type InflightConnectFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -267,7 +277,7 @@ impl ConnectWindowSender {
         payload: ConnectPayload,
         timeout: Duration,
     ) -> Result<(), String> {
-        let fut = self.enqueue_internal(payload, timeout, false).await?;
+        let fut = self.enqueue_internal(payload, timeout, Lane::Control).await?;
         fut.await
     }
 
@@ -283,7 +293,34 @@ impl ConnectWindowSender {
         payload: ConnectPayload,
         timeout: Duration,
     ) -> Result<InflightConnectFuture, String> {
-        self.enqueue_internal(payload, timeout, true).await
+        self.enqueue_internal(payload, timeout, Lane::Data).await
+    }
+
+    /// A sender for plugin messages to `module`: they draw on the device's plugin window, not on a
+    /// session window of their own (see [`send`]).
+    fn plugin(addr: &str, module: &str) -> Result<Self, String> {
+        Self::new(addr, module, MAX_CONNECT_PLUGIN_SLOTS)
+    }
+
+    #[cfg(test)]
+    fn plugin_with_mock_backend(
+        addr: &str,
+        module: &str,
+        backend: Arc<dyn ConnectEnqueueBackend>,
+    ) -> Result<Self, String> {
+        let mut sender = Self::plugin(addr, module)?;
+        sender.backend = Some(backend);
+        Ok(sender)
+    }
+
+    /// Queues `payload` on `lane` in call order and returns the future of the device's answer.
+    async fn submit(
+        &self,
+        lane: Lane,
+        payload: ConnectPayload,
+        timeout: Duration,
+    ) -> Result<InflightConnectFuture, String> {
+        self.enqueue_internal(payload, timeout, lane).await
     }
 
     /// Enqueues a batch of payloads in strict slice order, bounding concurrency to `max_rpc`
@@ -321,12 +358,12 @@ impl ConnectWindowSender {
         &self,
         payload: ConnectPayload,
         timeout: Duration,
-        is_data: bool,
+        lane: Lane,
     ) -> Result<InflightConnectFuture, String> {
         let body = encode_send(&self.module, &payload)?;
         let deadline = tokio::time::Instant::now() + timeout;
 
-        let session_permit: Option<OwnedSemaphorePermit> = if is_data {
+        let session_permit: Option<OwnedSemaphorePermit> = if lane == Lane::Data {
             Some(
                 tokio::time::timeout_at(deadline, Arc::clone(&self.session_sem).acquire_owned())
                     .await
@@ -338,22 +375,33 @@ impl ConnectWindowSender {
         };
 
         let addr_for_handles = self.addr.clone();
-        let (_, rpc_sem, data_sem, enqueue_lock) = crate::ecs::with_rt_mut(move |rt| {
+        let ConcurrencyHandles {
+            rpc_sem,
+            data_sem,
+            plugin_sem,
+            enqueue_lock,
+        } = crate::ecs::with_rt_mut(move |rt| {
             rt.component_ref::<CanopusSystem>(&addr_for_handles)
                 .map(|sys| sys.concurrency_handles())
                 .ok_or_else(|| "device_not_connected: Canopus component not found".to_string())
         })
         .await?;
 
-        let data_permit: Option<OwnedSemaphorePermit> = if is_data {
-            Some(
-                tokio::time::timeout_at(deadline, data_sem.acquire_owned())
+        // The lane's own window comes before the device RPC slot, so a lane that is waiting for
+        // its window never holds a slot another lane could use.
+        let window = match lane {
+            Lane::Control => None,
+            Lane::Data => Some(data_sem),
+            Lane::Plugin => Some(plugin_sem),
+        };
+        let data_permit: Option<OwnedSemaphorePermit> = match window {
+            Some(window) => Some(
+                tokio::time::timeout_at(deadline, window.acquire_owned())
                     .await
                     .map_err(|_| "Canopus request timed out".to_string())?
                     .map_err(|_| "device_not_connected: Canopus session closed".to_string())?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
 
         let rpc_permit = tokio::time::timeout_at(deadline, rpc_sem.acquire_owned())
@@ -362,7 +410,7 @@ impl ConnectWindowSender {
             .map_err(|_| "device_not_connected: Canopus session closed".to_string())?;
 
         // Serialize request_id allocation + waiter registration + transport enqueue so
-        // packets are queued in the exact order callers invoke submit_ordered.
+        // packets are queued in the exact order callers invoke submit_ordered / send.
         let _enqueue_guard = enqueue_lock.lock().await;
         let addr_for_waiter = self.addr.clone();
         let (request_id, rx, pending_guard) = crate::ecs::with_rt_mut(move |rt| {
@@ -631,8 +679,8 @@ mod tests {
         wire[0..4].copy_from_slice(&0x43504332u32.to_le_bytes());
         wire[4..6].copy_from_slice(&36u16.to_le_bytes());
         wire[6..8].copy_from_slice(&3u16.to_le_bytes());
-        wire[8..10].copy_from_slice(&1u16.to_le_bytes());
-        wire[10..12].copy_from_slice(&2u16.to_le_bytes());
+        wire[8..10].copy_from_slice(&crate::device::canopus::CANOPUS_ABI_MAJOR.to_le_bytes());
+        wire[10..12].copy_from_slice(&crate::device::canopus::CANOPUS_ABI_MINOR.to_le_bytes());
         wire[12..16].copy_from_slice(&((36 + payload.len()) as u32).to_le_bytes());
         wire[16..20].copy_from_slice(&opcode.to_le_bytes());
         wire[32..36].copy_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -710,8 +758,8 @@ mod tests {
         wire[0..4].copy_from_slice(&0x43504332u32.to_le_bytes());
         wire[4..6].copy_from_slice(&36u16.to_le_bytes());
         wire[6..8].copy_from_slice(&2u16.to_le_bytes());
-        wire[8..10].copy_from_slice(&1u16.to_le_bytes());
-        wire[10..12].copy_from_slice(&2u16.to_le_bytes());
+        wire[8..10].copy_from_slice(&crate::device::canopus::CANOPUS_ABI_MAJOR.to_le_bytes());
+        wire[10..12].copy_from_slice(&crate::device::canopus::CANOPUS_ABI_MINOR.to_le_bytes());
         wire[12..16].copy_from_slice(&(total as u32).to_le_bytes());
         wire[16..20].copy_from_slice(&(CanopusCommand::ConnectSend as u32).to_le_bytes());
         wire[20..24].copy_from_slice(&request_id.to_le_bytes());
@@ -826,6 +874,77 @@ mod tests {
         assert!(fut1.await.is_ok());
         assert!(fut2.await.unwrap_err().contains("not listening"));
         assert!(ctrl_task.await.unwrap().is_ok());
+
+        crate::ecs::with_rt_mut(move |rt| {
+            rt.remove_device(addr);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plugin_sends_keep_a_window_in_flight_in_call_order_and_leave_a_slot_for_control() {
+        use crate::device::xiaomi::packet::v2::layer2::{L2Channel, L2OpCode};
+        use crate::device::xiaomi::system::XiaomiSystemExt;
+
+        ensure_test_ecs();
+        let addr = "cc:plugin-window-test";
+        crate::ecs::with_rt_mut(move |rt| {
+            rt.spawn_device(addr.into(), (CanopusSystem::new(addr.into()),));
+        })
+        .await;
+
+        let backend = RecordingBackend::new();
+        let plugin = || ConnectWindowSender::plugin_with_mock_backend(addr, "lyra_player", backend.clone()).unwrap();
+        let data = |tag: u8| ConnectPayload::Binary(vec![0x11, tag, 0, 0, 0, 0]);
+
+        // Three frames are queued one after the other and all three are in flight.
+        let mut inflight = Vec::new();
+        for tag in 0..MAX_CONNECT_PLUGIN_SLOTS as u8 {
+            inflight.push(plugin().submit(Lane::Plugin, data(tag), Duration::from_secs(2)).await.unwrap());
+        }
+        // A fourth waits for the window instead of overflowing the device's queue.
+        assert!(plugin().submit(Lane::Plugin, data(9), Duration::from_millis(30)).await.is_err());
+        // The device's last RPC slot still takes a control request.
+        let control = ConnectWindowSender::with_mock_backend(addr, "lyra_player", 1, backend.clone()).unwrap();
+        let control_task = tokio::spawn(async move {
+            control.send_control(data(0xC0), Duration::from_secs(2)).await
+        });
+        for _ in 0..50 {
+            if backend.enqueued.lock().unwrap().len() == MAX_CONNECT_PLUGIN_SLOTS + 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let enqueued = backend.take();
+        assert_eq!(enqueued.len(), MAX_CONNECT_PLUGIN_SLOTS + 1);
+        // The frames reached the transport in the order they were sent: the payload follows the
+        // `kind | id_len | "lyra_player"` prefix (2 + 11 bytes).
+        let tags: Vec<u8> = enqueued[..3].iter().map(|req| req.payload[13 + 1]).collect();
+        assert_eq!(tags, vec![0, 1, 2]);
+
+        // Answers arrive in another order; each future gets its own request's answer.
+        let ids: Vec<u32> = enqueued.iter().map(|req| req.request_id).collect();
+        crate::ecs::with_rt_mut(move |rt| {
+            let mut sys = rt.component_mut::<CanopusSystem>(addr).unwrap();
+            for (position, id) in [(2usize, ids[2]), (3, ids[3]), (0, ids[0]), (1, ids[1])] {
+                let (result, status) = if position == 1 {
+                    (CanopusResult::Disallowed, STATUS_NOT_LISTENING)
+                } else {
+                    (CanopusResult::Completed, 0)
+                };
+                sys.on_layer2_packet(L2Channel::Canopus, L2OpCode::WriteEnc, &resp_wire(id, result, &[status]));
+            }
+        })
+        .await;
+        let mut inflight = inflight.into_iter();
+        assert!(inflight.next().unwrap().await.is_ok());
+        assert!(inflight.next().unwrap().await.unwrap_err().contains("not listening"));
+        assert!(inflight.next().unwrap().await.is_ok());
+        assert!(control_task.await.unwrap().is_ok());
+
+        // Answered frames gave their slots back: the window accepts a new frame at once.
+        let again = plugin().submit(Lane::Plugin, data(7), Duration::from_secs(2)).await;
+        assert!(again.is_ok());
 
         crate::ecs::with_rt_mut(move |rt| {
             rt.remove_device(addr);
