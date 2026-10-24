@@ -154,11 +154,12 @@ fn interpret(module: &str, response: &Cpc2Response) -> Result<(), String> {
 /// module's listener.
 ///
 /// A plugin that issues several sends at once (an import streams a thousand frames) keeps up to
-/// [`MAX_CONNECT_PLUGIN_SLOTS`] of them on their way: each is queued to the transport in the order
-/// it was asked for, and holds a device RPC slot until the device has answered it, so the device's
-/// four-slot queue cannot overflow and a Manager request always has a slot left. The window is the
-/// plugins' own: it neither draws on the CRPack data window nor is starved by it. A caller that
-/// awaits each send before the next still sees strictly one message at a time.
+/// [`MAX_CONNECT_PLUGIN_SLOTS`] of them on their way -- more on a device that reports a deeper
+/// request ring (see [`learn_window`]): each is queued to the transport in the order it was asked
+/// for, and holds a device RPC slot until the device has answered it, so the device's queue cannot
+/// overflow and a Manager request always has a slot left. The window is the plugins' own: it
+/// neither draws on the CRPack data window nor is starved by it. A caller that awaits each send
+/// before the next still sees strictly one message at a time.
 pub async fn send(addr: &str, module: &str, payload: ConnectPayload) -> Result<(), String> {
     ConnectWindowSender::plugin(addr, module)?
         .submit(Lane::Plugin, payload, TIMEOUT)
@@ -511,7 +512,40 @@ pub async fn subscribe(addr: &str, module: &str) -> Result<(), String> {
         request_listen(addr, module, true).await?;
     }
     adjust(addr, module, true);
+    // Listening precedes sending, so the windows are sized before the first message of a stream:
+    // widening them while frames queue could let a later frame overtake an earlier one.
+    learn_window(addr).await;
     Ok(())
+}
+
+/// Asks the device, once per session, how many requests its L2 transport holds, and widens this
+/// device's windows to match (see [`CanopusSystem::widen_rpc_window`]). Each message waits a
+/// Bluetooth round trip for its answer, so the window, not the link, sets the speed of a stream.
+/// A Supervisor that does not report it holds four requests, and the windows stay as they are.
+pub(crate) async fn learn_window(addr: &str) {
+    let first = crate::ecs::access::with_device_component_mut::<CanopusSystem, _, _>(
+        addr.to_string(),
+        |sys| !std::mem::replace(&mut sys.window_learned, true),
+    )
+    .unwrap_or(false);
+    if !first {
+        return;
+    }
+    match super::get_device_info(addr).await {
+        Ok(info) => {
+            let Some(slots) = info.request_slots else {
+                return;
+            };
+            let window = crate::ecs::access::with_device_component_mut::<CanopusSystem, _, _>(
+                addr.to_string(),
+                move |sys| sys.widen_rpc_window(slots as usize),
+            );
+            log::info!("[CanopusConnect] {addr} holds {slots} requests; window {window:?}");
+        }
+        Err(err) => {
+            log::warn!("[CanopusConnect] request depth of {addr} unknown, keeping 4: {err}")
+        }
+    }
 }
 
 /// Drops one listener; the device stops pushing when the last one is gone. The
@@ -549,6 +583,8 @@ pub async fn resync(addr: &str) {
             log::warn!("[CanopusConnect] could not re-listen to '{module}' on {addr}: {err}");
         }
     }
+    // A reconnect builds a new device entity with the default windows.
+    learn_window(addr).await;
 }
 
 /// The device pushed a CPC2 event.

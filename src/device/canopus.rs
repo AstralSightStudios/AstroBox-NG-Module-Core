@@ -341,14 +341,20 @@ impl Cpc2Event {
 const CPC2_KIND_RESPONSE: u16 = 2;
 const CPC2_KIND_EVENT: u16 = 3;
 
-/// Device L2 RX and RPC TX queues hold 4 slots. At most 3 slots may be used by
-/// concurrent Connect DATA requests, leaving at least 1 slot for control/Manager RPCs.
+/// Requests a device's L2 transport holds when it does not say otherwise: Supervisors before the
+/// request depth in QUERY_DEVICE had a ring of 4. At most 3 slots may be used by concurrent
+/// Connect DATA requests, leaving at least 1 slot for control/Manager RPCs.
 pub const MAX_DEVICE_RPC_SLOTS: usize = 4;
 pub const MAX_CONNECT_DATA_SLOTS: usize = 3;
 /// Plugin `canopusconnect.send` calls in flight at once. Their own window, apart from the CRPack
 /// data window, so a long resource-pack upload cannot starve a plugin (or the other way round);
-/// both still draw on the device's 4 RPC slots.
+/// both still draw on the device's RPC slots.
 pub const MAX_CONNECT_PLUGIN_SLOTS: usize = 3;
+/// The most request slots taken from a device's report (QUERY_DEVICE +84). A device with a
+/// deeper ring gets wider windows -- every message waits a Bluetooth round trip for its answer,
+/// so the window, not the link, sets the speed of a stream -- always one slot short of the
+/// ring, for the Manager.
+pub const MAX_NEGOTIATED_RPC_SLOTS: usize = 32;
 
 /// ECS component that listens on `L2Channel::Canopus` and dispatches CPC2 responses
 /// to pending futures and CPC2 events to the core event bus.
@@ -366,6 +372,11 @@ pub struct CanopusSystem {
     connect_data_sem: Arc<tokio::sync::Semaphore>,
     /// Ordered writer lock for windowed Connect sessions so frames enter SAR in offset order.
     connect_enqueue_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Requests the device holds, as the budgets above are sized: [`MAX_DEVICE_RPC_SLOTS`] until
+    /// the device reports more (see [`Self::widen_rpc_window`]).
+    rpc_slots: usize,
+    /// The device has been asked for its request depth in this session.
+    pub(crate) window_learned: bool,
 }
 
 impl Default for CanopusSystem {
@@ -386,7 +397,25 @@ impl CanopusSystem {
             rpc_sem: Arc::new(tokio::sync::Semaphore::new(MAX_DEVICE_RPC_SLOTS)),
             connect_data_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECT_DATA_SLOTS)),
             connect_enqueue_lock: Arc::new(tokio::sync::Mutex::new(())),
+            rpc_slots: MAX_DEVICE_RPC_SLOTS,
+            window_learned: false,
         }
+    }
+
+    /// Sizes the budgets for a device that holds `slots` requests (capped at
+    /// [`MAX_NEGOTIATED_RPC_SLOTS`]): the device budget takes all of them, the Connect windows all
+    /// but the one kept for the Manager. Only ever widens -- permits can be added to a budget that
+    /// is in use, not taken back -- and returns the size in effect.
+    pub fn widen_rpc_window(&mut self, slots: usize) -> usize {
+        let slots = slots.min(MAX_NEGOTIATED_RPC_SLOTS);
+        if slots > self.rpc_slots {
+            let extra = slots - self.rpc_slots;
+            self.rpc_sem.add_permits(extra);
+            self.connect_data_sem.add_permits(extra);
+            self.connect_plugin_sem.add_permits(extra);
+            self.rpc_slots = slots;
+        }
+        self.rpc_slots
     }
 
     /// Allocates a unique non-zero request_id that is not currently in `pending`.
@@ -682,6 +711,10 @@ pub struct CanopusDeviceInfo {
     pub scan_summary: u32,
     /// Absent on older supervisors; never guess a target from the device name.
     pub target_id: Option<String>,
+    /// Requests the device's L2 transport holds at once. Absent on older supervisors (and on
+    /// devices without the transport), which hold [`MAX_DEVICE_RPC_SLOTS`].
+    #[serde(default)]
+    pub request_slots: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -723,6 +756,10 @@ pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
     let error_code = u32::from_le_bytes(payload[24..28].try_into().unwrap());
     let flags = u32::from_le_bytes(payload[28..32].try_into().unwrap());
     let scan_summary = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+    let request_slots = payload
+        .get(84..88)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .filter(|slots| *slots != 0);
 
     Ok(CanopusDeviceInfo {
         framework_revision,
@@ -733,6 +770,7 @@ pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
         flags,
         scan_summary,
         target_id,
+        request_slots,
     })
 }
 
@@ -1079,6 +1117,25 @@ mod tests {
     }
 
     #[test]
+    fn widening_the_window_grows_every_budget_and_never_narrows_it() {
+        let mut sys = CanopusSystem::new("cc:widen-test".to_string());
+        assert_eq!(sys.rpc_sem.available_permits(), MAX_DEVICE_RPC_SLOTS);
+        assert_eq!(sys.widen_rpc_window(16), 16);
+        assert_eq!(sys.rpc_sem.available_permits(), 16);
+        // One slot stays the Manager's.
+        assert_eq!(sys.connect_plugin_sem.available_permits(), 15);
+        assert_eq!(sys.connect_data_sem.available_permits(), 15);
+        // A smaller report (an older Supervisor after a reconnect) cannot take permits back.
+        assert_eq!(sys.widen_rpc_window(4), 16);
+        assert_eq!(sys.rpc_sem.available_permits(), 16);
+        assert_eq!(sys.widen_rpc_window(1_000), MAX_NEGOTIATED_RPC_SLOTS);
+        assert_eq!(
+            sys.connect_plugin_sem.available_permits(),
+            MAX_NEGOTIATED_RPC_SLOTS - 1
+        );
+    }
+
+    #[test]
     fn test_parse_device_and_module_info() {
         // Construct mock CQD1 payload (36 bytes)
         let mut dev_payload = vec![0u8; 36];
@@ -1109,6 +1166,17 @@ mod tests {
                 .as_deref(),
             Some("xiaomi-band-11-1.1.139")
         );
+        assert_eq!(parse_device_info(&dev_payload).unwrap().request_slots, None);
+        // A Supervisor with the deep L2 ring says how many requests it holds.
+        dev_payload.resize(88, 0);
+        dev_payload[4..8].copy_from_slice(&88u32.to_le_bytes());
+        dev_payload[84..88].copy_from_slice(&16u32.to_le_bytes());
+        let deep = parse_device_info(&dev_payload).unwrap();
+        assert_eq!(deep.request_slots, Some(16));
+        assert_eq!(deep.target_id.as_deref(), Some("xiaomi-band-11-1.1.139"));
+        // Zero is "unknown", the same as absent.
+        dev_payload[84..88].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse_device_info(&dev_payload).unwrap().request_slots, None);
 
         // Construct mock CQM1 payload (64 bytes)
         let mut mod_payload = vec![0u8; 64];
