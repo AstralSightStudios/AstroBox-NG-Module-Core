@@ -393,6 +393,9 @@ pub fn prepare_install(data: &[u8], target_id: &str) -> Result<InstallPackage, S
             return Err("Canopus artifact must be an ELF of at most 4 MiB".into());
         }
         let firmware_hash = hash_bytes(&artifact.firmware_sha256)?;
+        // `verified_entry` above already pinned `elf` to this digest, so the
+        // receipt comparison reuses it instead of hashing the artifact twice.
+        let artifact_hash = hash_bytes(&artifact.sha256)?;
         let receipt = match (&artifact.receipt_path, &artifact.receipt_sha256) {
             (Some(path), Some(hash)) => verified_entry(&files, path, hash)?,
             _ => {
@@ -416,7 +419,7 @@ pub fn prepare_install(data: &[u8], target_id: &str) -> Result<InstallPackage, S
             || fixed_string(&receipt[32..64])? != manifest.module_id
             || fixed_string(&receipt[64..112])? != artifact.target_id
             || receipt[112..144] != firmware_hash
-            || receipt[144..176] != Sha256::digest(elf)[..]
+            || receipt[144..176] != artifact_hash
         {
             return Err(format!(
                 "Canopus receipt does not match artifact/manifest: {}",

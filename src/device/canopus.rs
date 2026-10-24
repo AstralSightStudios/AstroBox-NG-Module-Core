@@ -874,6 +874,18 @@ pub struct CanopusInstallOutcome {
     pub reboot_required: bool,
 }
 
+/// Coarse install phase reported alongside progress. The device streams no
+/// finer progress, so the UI labels the commit tail with this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanopusInstallPhase {
+    Transfer,
+    Commit,
+}
+
+/// Progress covers the byte stream (artifact + resources, weighted by bytes);
+/// the device-side verify/commit tail keeps the last slice.
+const TRANSFER_SHARE: f32 = 0.97;
+
 /// `StageResBegin` payload: `u8 name_len | name | u32 size | 32-byte SHA-256`.
 /// `name` is the flat extraction name; the device writes the verified stream
 /// to `/canopus/m.<module_id>/<name>` in the module data directory.
@@ -897,7 +909,7 @@ fn resource_begin_payload(resource: &package::InstallResource) -> Result<Vec<u8>
 pub async fn install_native_package(
     addr: &str,
     data: &[u8],
-    on_progress: Arc<dyn Fn(f32) + Send + Sync>,
+    on_progress: Arc<dyn Fn(f32, CanopusInstallPhase) + Send + Sync>,
 ) -> Result<CanopusInstallOutcome, String> {
     use crate::ecs::access::with_device_component_mut;
     let lock = with_device_component_mut::<CanopusSystem, _, _>(addr.to_string(), |sys| {
@@ -905,7 +917,7 @@ pub async fn install_native_package(
     })
     .map_err(|e| format!("Canopus component access failed: {e:?}"))?;
     let _guard = lock.lock().await;
-    on_progress(0.0);
+    on_progress(0.0, CanopusInstallPhase::Transfer);
     let info = get_device_info(addr).await?;
     let target_id = info
         .target_id
@@ -945,7 +957,7 @@ pub async fn install_native_package(
     ) {
         return Err(format!("Canopus install returned {:?}", response.result));
     }
-    on_progress(1.0);
+    on_progress(1.0, CanopusInstallPhase::Commit);
     Ok(CanopusInstallOutcome {
         module_id: package.module_id,
         target_id,
@@ -956,13 +968,16 @@ pub async fn install_native_package(
 async fn stage_package_with<F, Fut>(
     package: &package::InstallPackage,
     mut send: F,
-    on_progress: &(dyn Fn(f32) + Send + Sync),
+    on_progress: &(dyn Fn(f32, CanopusInstallPhase) + Send + Sync),
 ) -> Result<(), String>
 where
     F: FnMut(CanopusCommand, Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Cpc2Response, String>>,
 {
     require_completed(&send(CanopusCommand::StageBegin, package.receipt.clone()).await?)?;
+    let resource_total: usize = package.resources.iter().map(|r| r.data.len()).sum();
+    let total = package.artifact.len() + resource_total;
+    let mut transferred = 0usize;
     for (index, chunk) in package
         .artifact
         .chunks(CANOPUS_PROTO_MAX_PAYLOAD - 4)
@@ -972,15 +987,17 @@ where
         let mut payload = (offset as u32).to_le_bytes().to_vec();
         payload.extend_from_slice(chunk);
         require_completed(&send(CanopusCommand::StageWrite, payload).await?)?;
-        on_progress(0.95 * (offset + chunk.len()) as f32 / package.artifact.len() as f32);
+        transferred += chunk.len();
+        on_progress(
+            TRANSFER_SHARE * transferred as f32 / total as f32,
+            CanopusInstallPhase::Transfer,
+        );
     }
     require_completed(&send(CanopusCommand::StageFinish, vec![]).await?)?;
     // One stream per resource inside the same staging transaction: ordered
     // chunks, per-resource completion, and flat extraction on the device. A
     // device that cannot deliver them rejects the stream instead of dropping
     // the files, so nothing is ever installed without its resources.
-    let resource_total: usize = package.resources.iter().map(|r| r.data.len()).sum();
-    let mut resource_done = 0usize;
     for resource in &package.resources {
         let begin = resource_begin_payload(resource)?;
         require_completed(&send(CanopusCommand::StageResBegin, begin).await?)?;
@@ -993,12 +1010,15 @@ where
             let mut payload = (offset as u32).to_le_bytes().to_vec();
             payload.extend_from_slice(chunk);
             require_completed(&send(CanopusCommand::StageResWrite, payload).await?)?;
-            resource_done += chunk.len();
-            on_progress(0.95 + 0.02 * resource_done as f32 / resource_total as f32);
+            transferred += chunk.len();
+            on_progress(
+                TRANSFER_SHARE * transferred as f32 / total as f32,
+                CanopusInstallPhase::Transfer,
+            );
         }
         require_completed(&send(CanopusCommand::StageResFinish, vec![]).await?)?;
     }
-    on_progress(0.97);
+    on_progress(TRANSFER_SHARE, CanopusInstallPhase::Commit);
     Ok(())
 }
 
@@ -1217,7 +1237,7 @@ mod tests {
                     payload: vec![],
                 }))
             },
-            &|_| {},
+            &|_, _| {},
         )
         .await
         .unwrap();
@@ -1246,7 +1266,7 @@ mod tests {
                     payload: vec![],
                 }))
             },
-            &|_| {},
+            &|_, _| {},
         )
         .await;
         assert!(result.is_err());
@@ -1288,7 +1308,7 @@ mod tests {
                     payload: vec![],
                 }))
             },
-            &|_| {},
+            &|_, _| {},
         )
         .await
         .unwrap();
