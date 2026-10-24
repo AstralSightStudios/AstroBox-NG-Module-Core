@@ -161,6 +161,14 @@ fn interpret(module: &str, response: &Cpc2Response) -> Result<(), String> {
 /// neither draws on the CRPack data window nor is starved by it. A caller that awaits each send
 /// before the next still sees strictly one message at a time.
 pub async fn send(addr: &str, module: &str, payload: ConnectPayload) -> Result<(), String> {
+    // A locally registered listener can outlive a failed reconnect replay. Do not send a
+    // request whose reply the device would discard as NOT_LISTENING.
+    if count(addr, module) != 0 && resync_needed(addr) {
+        let _guard = subscription_lock().lock().await;
+        if resync_needed(addr) {
+            resync_locked(addr).await?;
+        }
+    }
     ConnectWindowSender::plugin(addr, module)?
         .submit(Lane::Plugin, payload, TIMEOUT)
         .await?
@@ -564,27 +572,46 @@ pub async fn unsubscribe(addr: &str, module: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Tells a freshly authenticated device what the plugins listen to; a device
-/// forgets its listeners with the phone session. Best effort: a device without
-/// CanopusConnect only logs.
-pub async fn resync(addr: &str) {
+fn resync_needed(addr: &str) -> bool {
+    crate::ecs::access::with_device_component_mut::<CanopusSystem, _, _>(
+        addr.to_string(),
+        |sys| sys.connect_resync_needed,
+    )
+    .unwrap_or(false)
+}
+
+/// Replays the local registrations while holding subscription_lock. Only a successful replay
+/// clears the per-session dirty bit; a failure is retried by the next plugin send, not a timer.
+async fn resync_locked(addr: &str) -> Result<(), String> {
     let modules: Vec<String> = listeners()
         .lock()
         .unwrap()
         .get(addr)
         .map(|modules| modules.keys().cloned().collect())
         .unwrap_or_default();
-    if modules.is_empty() {
-        return;
+    for module in &modules {
+        request_listen(addr, module, true)
+            .await
+            .map_err(|err| format!("Cannot restore CanopusConnect listener '{module}': {err}"))?;
     }
+    if !modules.is_empty() {
+        // A reconnect builds a new device entity with the default windows.
+        learn_window(addr).await;
+    }
+    let _ = crate::ecs::access::with_device_component_mut::<CanopusSystem, _, _>(
+        addr.to_string(),
+        |sys| sys.connect_resync_needed = false,
+    );
+    Ok(())
+}
+
+/// Tells a freshly authenticated device what the plugins listen to. Authentication can finish
+/// before the Supervisor starts: keep an unsuccessful replay pending for the next plugin send.
+pub async fn resync(addr: &str) {
     let _guard = subscription_lock().lock().await;
-    for module in modules {
-        if let Err(err) = request_listen(addr, &module, true).await {
-            log::warn!("[CanopusConnect] could not re-listen to '{module}' on {addr}: {err}");
-        }
+    if let Err(err) = resync_locked(addr).await {
+        log::warn!("[CanopusConnect] listener replay on {addr} pending: {err}");
     }
-    // A reconnect builds a new device entity with the default windows.
-    learn_window(addr).await;
 }
 
 /// The device pushed a CPC2 event.

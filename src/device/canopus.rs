@@ -377,6 +377,9 @@ pub struct CanopusSystem {
     rpc_slots: usize,
     /// The device has been asked for its request depth in this session.
     pub(crate) window_learned: bool,
+    /// Reconnection may authenticate before the Supervisor starts. Keep failed listener replay
+    /// pending so the next plugin send restores it before asking the module for a reply.
+    pub(crate) connect_resync_needed: bool,
 }
 
 impl Default for CanopusSystem {
@@ -399,6 +402,7 @@ impl CanopusSystem {
             connect_enqueue_lock: Arc::new(tokio::sync::Mutex::new(())),
             rpc_slots: MAX_DEVICE_RPC_SLOTS,
             window_learned: false,
+            connect_resync_needed: true,
         }
     }
 
