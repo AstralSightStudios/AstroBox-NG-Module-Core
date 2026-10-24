@@ -68,6 +68,18 @@ pub enum CanopusCommand {
     ExitSafeMode = 22,
     QueryBoot = 23,
     SetBoot = 24,
+    // 25 is the device-side CANOPUS_CMD_START_BOOT (loader-internal; the
+    // phone never sends it).
+    /// Native .canopus delivery: one resource stream per package resource,
+    /// staged inside the same staging transaction after the artifact and
+    /// extracted on the device into `/canopus/m.<module_id>/<name>` (flat
+    /// basename). `StageResBegin` payload: `u8 name_len | name | u32 size |
+    /// 32-byte SHA-256`; `StageResWrite` payload: `u32 offset | 1..508 data`
+    /// (the same ordered chunk framing as the ELF stream); `StageResFinish`
+    /// is empty and completes one resource. `StageAbort` cancels both streams.
+    StageResBegin = 26,
+    StageResWrite = 27,
+    StageResFinish = 28,
 }
 
 impl TryFrom<u32> for CanopusCommand {
@@ -97,6 +109,9 @@ impl TryFrom<u32> for CanopusCommand {
             22 => CanopusCommand::ExitSafeMode,
             23 => CanopusCommand::QueryBoot,
             24 => CanopusCommand::SetBoot,
+            26 => CanopusCommand::StageResBegin,
+            27 => CanopusCommand::StageResWrite,
+            28 => CanopusCommand::StageResFinish,
             _ => return Err(Cpc2CodecError::UnknownCommand(v)),
         })
     }
@@ -821,6 +836,24 @@ pub struct CanopusInstallOutcome {
     pub reboot_required: bool,
 }
 
+/// `StageResBegin` payload: `u8 name_len | name | u32 size | 32-byte SHA-256`.
+/// `name` is the flat extraction name; the device writes the verified stream
+/// to `/canopus/m.<module_id>/<name>` in the module data directory.
+fn resource_begin_payload(resource: &package::InstallResource) -> Result<Vec<u8>, String> {
+    if resource.name.is_empty() || resource.name.len() > u8::MAX as usize {
+        return Err(format!("Invalid Canopus resource name: {:?}", resource.name));
+    }
+    if resource.sha256.len() != 32 {
+        return Err("Invalid Canopus resource SHA-256 length".into());
+    }
+    let mut payload = Vec::with_capacity(37 + resource.name.len());
+    payload.push(resource.name.len() as u8);
+    payload.extend_from_slice(resource.name.as_bytes());
+    payload.extend_from_slice(&(resource.data.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&resource.sha256);
+    Ok(payload)
+}
+
 /// One staging transaction at a time per ECS device. Each chunk is acknowledged
 /// before the next; no Mass/quick-app transfer and no optimistic success.
 pub async fn install_native_package(
@@ -904,6 +937,29 @@ where
         on_progress(0.95 * (offset + chunk.len()) as f32 / package.artifact.len() as f32);
     }
     require_completed(&send(CanopusCommand::StageFinish, vec![]).await?)?;
+    // One stream per resource inside the same staging transaction: ordered
+    // chunks, per-resource completion, and flat extraction on the device. A
+    // device that cannot deliver them rejects the stream instead of dropping
+    // the files, so nothing is ever installed without its resources.
+    let resource_total: usize = package.resources.iter().map(|r| r.data.len()).sum();
+    let mut resource_done = 0usize;
+    for resource in &package.resources {
+        let begin = resource_begin_payload(resource)?;
+        require_completed(&send(CanopusCommand::StageResBegin, begin).await?)?;
+        for (index, chunk) in resource
+            .data
+            .chunks(CANOPUS_PROTO_MAX_PAYLOAD - 4)
+            .enumerate()
+        {
+            let offset = index * (CANOPUS_PROTO_MAX_PAYLOAD - 4);
+            let mut payload = (offset as u32).to_le_bytes().to_vec();
+            payload.extend_from_slice(chunk);
+            require_completed(&send(CanopusCommand::StageResWrite, payload).await?)?;
+            resource_done += chunk.len();
+            on_progress(0.95 + 0.02 * resource_done as f32 / resource_total as f32);
+        }
+        require_completed(&send(CanopusCommand::StageResFinish, vec![]).await?)?;
+    }
     on_progress(0.97);
     Ok(())
 }
@@ -986,6 +1042,7 @@ mod tests {
         let enc = req.encode().unwrap();
         assert_eq!(enc.len(), CANOPUS_TRANSPORT_V2_HEADER_SIZE + 4);
         assert_eq!(&enc[0..4], &CANOPUS_TRANSPORT_V2_MAGIC.to_le_bytes());
+        assert_eq!(&enc[8..12], &[2, 0, 0, 0]); // ABI 2.0, little endian.
 
         // Construct response wire frame
         let mut resp_wire = vec![0u8; CANOPUS_TRANSPORT_V2_HEADER_SIZE + 2];
@@ -1007,6 +1064,18 @@ mod tests {
         assert_eq!(decoded.request_id, 0x4301);
         assert_eq!(decoded.result, CanopusResult::Completed);
         assert_eq!(decoded.payload, vec![0xaa, 0xbb]);
+
+        resp_wire[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            Cpc2Response::decode(&resp_wire),
+            Err(Cpc2CodecError::UnsupportedAbiMajor(1))
+        );
+        resp_wire[8..10].copy_from_slice(&2u16.to_le_bytes());
+        resp_wire[10..12].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            Cpc2Response::decode(&resp_wire),
+            Err(Cpc2CodecError::UnsupportedAbiMinor(1))
+        );
     }
 
     #[test]
@@ -1066,6 +1135,7 @@ mod tests {
             module_id: "hello".into(),
             receipt: vec![0; 176],
             artifact: vec![42; 1020],
+            resources: vec![],
         };
         let calls = Mutex::new(Vec::new());
         stage_package_with(
@@ -1116,5 +1186,72 @@ mod tests {
         assert_eq!(CanopusResult::try_from(1).unwrap(), CanopusResult::Rejected);
         assert_eq!(CanopusResult::try_from(4).unwrap(), CanopusResult::Running);
         assert_eq!(module_id_payload("hello").unwrap(), b"hello\0");
+    }
+
+    #[tokio::test]
+    async fn resource_staging_is_one_stream_per_resource_after_the_artifact() {
+        let sha = vec![7u8; 32];
+        let package = package::InstallPackage {
+            module_id: "hello".into(),
+            receipt: vec![0; 176],
+            artifact: vec![42; 1020],
+            resources: vec![
+                package::InstallResource {
+                    name: "logo.bin".into(),
+                    sha256: sha.clone(),
+                    data: vec![9; 600],
+                },
+                package::InstallResource {
+                    name: "small.bin".into(),
+                    sha256: sha.clone(),
+                    data: vec![1; 3],
+                },
+            ],
+        };
+        let calls = Mutex::new(Vec::new());
+        stage_package_with(
+            &package,
+            |command, payload| {
+                calls.lock().unwrap().push((command, payload));
+                std::future::ready(Ok(Cpc2Response {
+                    opcode: command as u32,
+                    request_id: 1,
+                    result: CanopusResult::Completed,
+                    payload: vec![],
+                }))
+            },
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(
+            calls.iter().map(|(cmd, _)| *cmd as u32).collect::<Vec<_>>(),
+            vec![15, 16, 16, 16, 17, 26, 27, 27, 28, 26, 27, 28]
+        );
+        assert_eq!(CanopusCommand::try_from(26).unwrap(), CanopusCommand::StageResBegin);
+        assert_eq!(CanopusCommand::try_from(27).unwrap(), CanopusCommand::StageResWrite);
+        assert_eq!(CanopusCommand::try_from(28).unwrap(), CanopusCommand::StageResFinish);
+        assert_eq!(CanopusCommand::try_from(25), Err(Cpc2CodecError::UnknownCommand(25)));
+        // StageResBegin: u8 name_len | name | u32 size | 32-byte SHA-256.
+        let begin = &calls[5].1;
+        assert_eq!(begin[0] as usize, "logo.bin".len());
+        assert_eq!(&begin[1..9], b"logo.bin");
+        assert_eq!(u32::from_le_bytes(begin[9..13].try_into().unwrap()), 600);
+        assert_eq!(begin[13..45], sha[..]);
+        assert_eq!(begin.len(), 45);
+        assert_eq!(calls[9].1.len(), 1 + "small.bin".len() + 4 + 32);
+        assert_eq!(&calls[9].1[1..10], b"small.bin");
+        assert_eq!(u32::from_le_bytes(calls[9].1[10..14].try_into().unwrap()), 3);
+        // StageResWrite reuses the ELF stream's u32 offset chunk framing.
+        for (index, (_, payload)) in calls[6..8].iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(payload[..4].try_into().unwrap()),
+                (index * 508) as u32
+            );
+            assert!(payload.len() <= 512);
+        }
+        assert!(calls[8].1.is_empty()); // StageResFinish
+        assert!(calls[11].1.is_empty());
     }
 }
