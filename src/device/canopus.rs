@@ -693,6 +693,22 @@ pub async fn set_module_enabled(
     .await
 }
 
+/// Activate an installed, enabled module through the native Supervisor.
+/// A queued or failed request does not establish that the module is active.
+pub async fn activate_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Response, String> {
+    let response = request(
+        addr,
+        CanopusCommand::Activate,
+        module_id_payload(module_id)?,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    if response.result != CanopusResult::Completed {
+        return Err(format!("Canopus activation returned {:?}", response.result));
+    }
+    Ok(response)
+}
+
 pub async fn remove_module_cpc2(addr: &str, module_id: &str) -> Result<Cpc2Response, String> {
     request(
         addr,
