@@ -422,6 +422,23 @@ impl CanopusSystem {
         self.rpc_slots
     }
 
+    /// [`Self::widen_rpc_window`], but only while no request is waiting on or holding a budget.
+    /// Permits added under a waiting stream wake several of its frames at once, and a later frame
+    /// could then reach SAR before an earlier one; CanopusConnect widens before its first frame for
+    /// the same reason. Returns the size in effect.
+    pub fn widen_rpc_window_if_idle(&mut self, slots: usize) -> usize {
+        let full = self.rpc_slots - 1;
+        let idle = self.pending.lock().unwrap().is_empty()
+            && self.rpc_sem.available_permits() == self.rpc_slots
+            && self.connect_data_sem.available_permits() == full
+            && self.connect_plugin_sem.available_permits() == full;
+        if idle {
+            self.widen_rpc_window(slots)
+        } else {
+            self.rpc_slots
+        }
+    }
+
     /// Allocates a unique non-zero request_id that is not currently in `pending`.
     pub fn next_id(&self) -> u32 {
         let map = self.pending.lock().unwrap();
@@ -735,6 +752,10 @@ pub struct CanopusDeviceInfo {
     /// devices without the transport), which hold [`MAX_DEVICE_RPC_SLOTS`].
     #[serde(default)]
     pub request_slots: Option<u32>,
+    /// Requests this host lets the device have in flight (its RPC budget, see
+    /// [`CanopusSystem::widen_rpc_window_if_idle`]). Filled by [`get_device_info`], not the wire.
+    #[serde(default)]
+    pub host_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -791,6 +812,7 @@ pub fn parse_device_info(payload: &[u8]) -> Result<CanopusDeviceInfo, String> {
         scan_summary,
         target_id,
         request_slots,
+        host_window: None,
     })
 }
 
@@ -836,7 +858,21 @@ pub async fn get_device_info(addr: &str) -> Result<CanopusDeviceInfo, String> {
     if resp.result != CanopusResult::Completed {
         return Err(format!("Device query returned {:?}", resp.result));
     }
-    parse_device_info(&resp.payload)
+    let mut info = parse_device_info(&resp.payload)?;
+    // Any caller learns the ring, not only CanopusConnect: a frontend staging upload keeps up to
+    // `host_window` chunks in flight, and a wider budget is only useful if it is in place.
+    let slots = info.request_slots;
+    info.host_window = crate::ecs::access::with_device_component_mut::<CanopusSystem, _, _>(
+        addr.to_string(),
+        move |sys| {
+            if let Some(slots) = slots {
+                sys.widen_rpc_window_if_idle(slots as usize);
+            }
+            sys.rpc_slots as u32
+        },
+    )
+    .ok();
+    Ok(info)
 }
 
 pub async fn query_module(addr: &str, slot: u32) -> Result<Option<CanopusDeviceModule>, String> {
@@ -1173,6 +1209,25 @@ mod tests {
             sys.connect_plugin_sem.available_permits(),
             MAX_NEGOTIATED_RPC_SLOTS - 1
         );
+    }
+
+    #[test]
+    fn idle_widening_waits_until_no_request_holds_a_budget() {
+        let mut sys = CanopusSystem::new("cc:idle-widen-test".to_string());
+        let held = Arc::clone(&sys.rpc_sem).try_acquire_owned().unwrap();
+        assert_eq!(sys.widen_rpc_window_if_idle(16), MAX_DEVICE_RPC_SLOTS);
+        drop(held);
+        let rx = sys.register_waiter(7).unwrap();
+        assert_eq!(sys.widen_rpc_window_if_idle(16), MAX_DEVICE_RPC_SLOTS);
+        drop(rx);
+        sys.pending.lock().unwrap().clear();
+        let lane = Arc::clone(&sys.connect_data_sem).try_acquire_owned().unwrap();
+        assert_eq!(sys.widen_rpc_window_if_idle(16), MAX_DEVICE_RPC_SLOTS);
+        drop(lane);
+        assert_eq!(sys.widen_rpc_window_if_idle(16), 16);
+        assert_eq!(sys.rpc_sem.available_permits(), 16);
+        // Idle again at the new size: the full budgets are now one short of 16.
+        assert_eq!(sys.widen_rpc_window_if_idle(32), 32);
     }
 
     #[test]
