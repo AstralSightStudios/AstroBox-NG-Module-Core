@@ -98,24 +98,57 @@ impl SarLinkParams {
     }
 }
 
+/// 一批要写出的帧，外加其中要等 ACK 的数据帧（发送时的会话代数，序号）。
+struct OutboundBatch {
+    frames: Vec<Vec<u8>>,
+    data: Vec<(u32, u8)>,
+}
+
+/// 一个数据帧真正写完（交给蓝牙/串口）的时刻。
+struct WrittenFrame {
+    generation: u32,
+    seq: u8,
+    at: Instant,
+}
+
+/// 有序发送任务写完一批后在这里记一笔，超时检查时取走。
+type WriteLog = Arc<parking_lot::Mutex<Vec<WrittenFrame>>>;
+
+/// 写出记录最多攒这么多条（正常每 500ms 就被超时检查取走，这只是防止没人取时无限增长）。
+const WRITE_LOG_CAP: usize = 1024;
+
 /// 有序发送队列：数据、重传、ACK/NAK、命令帧全部按入队顺序由同一个任务写出（对齐官方单一写队列）。
 /// 以前每次发送各 spawn 一个任务，多线程运行时下谁先抢到发送锁不确定，设备就会看到序号跳变而回 NAK。
 struct Outbound {
-    tx: mpsc::UnboundedSender<Vec<Vec<u8>>>,
+    tx: mpsc::UnboundedSender<OutboundBatch>,
 }
 
 impl Outbound {
-    fn spawn(sender: SendFn, device_id: String, tk_handle: Handle) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Vec<u8>>>();
+    fn spawn(sender: SendFn, device_id: String, tk_handle: Handle, written: WriteLog) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<OutboundBatch>();
         spawn_with_handle(
             async move {
-                while let Some(mut frames) = rx.recv().await {
+                while let Some(mut batch) = rx.recv().await {
                     // 把已经排着的帧并成一次写出，少过几次发送锁
                     while let Ok(more) = rx.try_recv() {
-                        frames.extend(more);
+                        batch.frames.extend(more.frames);
+                        batch.data.extend(more.data);
                     }
-                    if let Err(err) = (sender)(frames).await {
-                        SarController::on_send_failure(&device_id, err).await;
+                    match (sender)(batch.frames).await {
+                        Ok(()) => {
+                            if !batch.data.is_empty() {
+                                let at = Instant::now();
+                                let mut log = written.lock();
+                                log.extend(batch.data.into_iter().map(|(generation, seq)| {
+                                    WrittenFrame { generation, seq, at }
+                                }));
+                                if log.len() > WRITE_LOG_CAP {
+                                    let excess = log.len() - WRITE_LOG_CAP;
+                                    log.drain(..excess);
+                                }
+                            }
+                        }
+                        Err(err) => SarController::on_send_failure(&device_id, err).await,
                     }
                 }
             },
@@ -125,8 +158,12 @@ impl Outbound {
     }
 
     fn send(&self, frames: Vec<Vec<u8>>) {
+        self.send_tracked(frames, Vec::new());
+    }
+
+    fn send_tracked(&self, frames: Vec<Vec<u8>>, data: Vec<(u32, u8)>) {
         if !frames.is_empty() {
-            let _ = self.tx.send(frames);
+            let _ = self.tx.send(OutboundBatch { frames, data });
         }
     }
 }
@@ -134,6 +171,10 @@ impl Outbound {
 /// 管理 SAR L1/L2 发送状态的核心控制器，实现窗口、超时与累积确认逻辑。
 pub struct SarController {
     outbound: Outbound,
+    /// 有序发送任务记下的「数据帧真正写出去的时刻」，用来把重传计时改成从写完开始算
+    written: WriteLog,
+    /// 发送序号每归零一次（中止/重启会话）就 +1，作废之前那一代的写出记录
+    tx_generation: u32,
     tk_handle: Handle,
     device_id: String,
     pub command_pool: CommandPool,
@@ -190,8 +231,16 @@ impl SarController {
             link.send_timeout_ms
         );
 
+        let written: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut ctrl = Self {
-            outbound: Outbound::spawn(sender, device_id.clone(), tk_handle.clone()),
+            outbound: Outbound::spawn(
+                sender,
+                device_id.clone(),
+                tk_handle.clone(),
+                written.clone(),
+            ),
+            written,
+            tx_generation: 0,
             tk_handle,
             device_id: device_id.clone(),
             command_pool: CommandPool::new(),
@@ -432,6 +481,7 @@ impl SarController {
     /// 清空收发序号状态，回到会话初始（对齐官方 clearTranCtl）
     fn reset_sequence_state(&mut self) {
         self.tx_queue.clear();
+        self.tx_generation = self.tx_generation.wrapping_add(1);
         self.tx_next_seq = 0;
         self.tx_base = 0;
         self.rx_expect_seq = 0;
@@ -586,6 +636,8 @@ impl SarController {
             }
         }
 
+        self.apply_write_completions();
+
         // 对齐官方：只有队头（最老的待确认帧）超时才算数，超时就把窗口内所有待确认帧整体重传
         let Some(base) = self.tx_queue.front() else {
             return;
@@ -620,6 +672,31 @@ impl SarController {
         self.try_run_next();
     }
 
+    /// 对齐官方：重传计时从这一帧真正写完才开始（官方在 L0 写循环结束后才挂定时器）。
+    /// 入队时设的截止时间保留作兜底，这里只会把它往后推，不会提前，也不会取消——写出去
+    /// 一直卡着不返回时照样按入队时的截止时间超时。
+    /// 以前只按入队时刻算：BLE 写得慢时（窗口里 8 帧、每帧十几次写入，系统还要等
+    /// 「可以继续写」），排在后面的帧还没写出去就开始计时，链路一慢就误判超时、整窗重传、
+    /// 再超时，三次后中止成「SAR retransmission limit exceeded」。
+    fn apply_write_completions(&mut self) {
+        let written = std::mem::take(&mut *self.written.lock());
+        for frame in written {
+            if frame.generation != self.tx_generation {
+                continue;
+            }
+            let refreshed = frame.at + self.send_timeout;
+            if let Some(item) = self
+                .tx_queue
+                .iter_mut()
+                .find(|item| item.wait_ack && item.packet.seq == frame.seq)
+            {
+                if item.deadline < refreshed {
+                    item.deadline = refreshed;
+                }
+            }
+        }
+    }
+
     /// 丢弃所有在途/排队的数据并让等待者立刻失败。序号状态留到下次真正发数据时随会话重启一起归零，
     /// 这样链路已断时不会反复发 L1StartReq。
     pub fn abort_all_pending(&mut self, err: anyhow::Error) {
@@ -628,6 +705,7 @@ impl SarController {
             self.device_id
         );
         self.tx_queue.clear();
+        self.tx_generation = self.tx_generation.wrapping_add(1);
         self.command_pool = CommandPool::new();
         self.session_epoch = self.session_epoch.wrapping_add(1);
         self.needs_restart = true;
@@ -903,6 +981,10 @@ impl SarController {
             cmd_count += 1;
         }
 
+        // 要等 ACK 的数据帧：写完后据此刷新重传截止时间
+        let generation = self.tx_generation;
+        let mut tracked = Vec::new();
+
         // 再按序号顺序把所有被标记的帧一次补发（以前一次只补一帧，剩下的要等下一轮才发）
         let mut retransmit_count = 0u32;
         for item in self.tx_queue.iter_mut() {
@@ -911,6 +993,7 @@ impl SarController {
                 item.wait_ack = true;
                 item.deadline = deadline;
                 frames.push(item.packet.to_bytes());
+                tracked.push((generation, item.packet.seq));
                 retransmit_count += 1;
             }
         }
@@ -923,6 +1006,7 @@ impl SarController {
             };
             let pkt = L1Packet::new(L1DataType::Data, false, qd.seq, qd.payload);
             frames.push(pkt.to_bytes());
+            tracked.push((generation, qd.seq));
             self.tx_queue.push_back(SendItem {
                 packet: pkt,
                 wait_ack: true,
@@ -978,7 +1062,7 @@ impl SarController {
                 )),
             );
         }
-        self.outbound.send(frames);
+        self.outbound.send_tracked(frames, tracked);
     }
 }
 
@@ -1031,6 +1115,12 @@ mod tests {
             .iter()
             .map(|bytes| L1Packet::from_bytes(bytes).unwrap())
             .collect()
+    }
+
+    /// 模拟队头等 ACK 等到超时：先把已经写出的记录吃掉（否则会被顺延），再把截止时间拨到过去。
+    fn expire_base(sar: &mut SarController) {
+        sar.apply_write_completions();
+        sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
     }
 
     fn start_rsp() -> L1Packet {
@@ -1094,11 +1184,110 @@ mod tests {
         flushed(&sent).await;
         sent.lock().unwrap().clear();
 
-        sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+        expire_base(&mut sar);
         sar.check_timeouts_internal();
         let seqs: Vec<u8> = flushed(&sent).await.into_iter().map(|p| p.seq).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3]);
         assert_eq!(sar.tx_queue[0].retries, 1);
+    }
+
+    #[tokio::test]
+    async fn retransmit_timer_counts_from_when_the_frame_was_written() {
+        // 写出口被卡住：模拟 BLE 一帧要写十几次、系统迟迟不给继续写
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sender: SendFn = {
+            let gate = gate.clone();
+            Arc::new(move |_frames| {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    gate.acquire().await.unwrap().forget();
+                    Ok(())
+                })
+            })
+        };
+        let mut sar = SarController::new(
+            tokio::runtime::Handle::current(),
+            sender,
+            "test_write_timer".to_string(),
+            TransportProfilerHandle::new(),
+            SarConfig::default(),
+            SarLinkParams::ble(244),
+        );
+        sar.on_l1_packet(&start_rsp());
+        sar.enqueue(vec![L2Channel::Pb as u8, 1]);
+        let enqueue_deadline = sar.tx_queue[0].deadline;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // 写了 300ms 才写完
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sar.apply_write_completions();
+        assert_eq!(sar.tx_queue[0].deadline, enqueue_deadline, "还没写完，不能动截止时间");
+        let released_at = Instant::now();
+        gate.add_permits(1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        sar.apply_write_completions();
+        let deadline = sar.tx_queue[0].deadline;
+        assert!(deadline >= released_at + sar.send_timeout);
+        assert!(deadline > enqueue_deadline);
+    }
+
+    #[tokio::test]
+    async fn written_frame_is_not_retransmitted_before_its_own_timeout() {
+        let (mut sar, sent) = new_controller("test_written_not_expired", SarLinkParams::ble(244));
+        sar.on_l1_packet(&start_rsp());
+        sar.enqueue_batch((0..3u8).map(|i| vec![L2Channel::Pb as u8, i]));
+        flushed(&sent).await;
+        sent.lock().unwrap().clear();
+
+        // 按入队时刻算已经到点了，但帧刚写完：不该重传
+        sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+        sar.check_timeouts_internal();
+        assert!(flushed(&sent).await.is_empty());
+        assert_eq!(sar.tx_queue[0].retries, 0);
+        assert!(sar.tx_queue[0].wait_ack);
+    }
+
+    #[tokio::test]
+    async fn write_records_from_a_previous_session_are_ignored() {
+        let (mut sar, sent) = new_controller("test_stale_write_log", SarLinkParams::ble(244));
+        sar.on_l1_packet(&start_rsp());
+        let seq = sar.enqueue(vec![L2Channel::Pb as u8, 1]);
+        flushed(&sent).await;
+        sent.lock().unwrap().clear();
+
+        expire_base(&mut sar);
+        sar.written.lock().push(WrittenFrame {
+            generation: sar.tx_generation.wrapping_sub(1),
+            seq,
+            at: Instant::now(),
+        });
+        sar.check_timeouts_internal();
+        let seqs: Vec<u8> = flushed(&sent).await.into_iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![seq]);
+        assert_eq!(sar.tx_queue[0].retries, 1);
+    }
+
+    #[tokio::test]
+    async fn retransmission_restarts_the_timer_when_rewritten() {
+        let (mut sar, sent) = new_controller("test_rewrite_timer", SarLinkParams::ble(244));
+        sar.on_l1_packet(&start_rsp());
+        sar.enqueue_batch((0..2u8).map(|i| vec![L2Channel::Pb as u8, i]));
+        flushed(&sent).await;
+
+        expire_base(&mut sar);
+        sar.check_timeouts_internal();
+        assert_eq!(sar.tx_queue[0].retries, 1);
+        let before_rewrite = Instant::now();
+        flushed(&sent).await;
+        sar.apply_write_completions();
+        for item in sar.tx_queue.iter() {
+            assert!(item.deadline >= before_rewrite + sar.send_timeout);
+        }
     }
 
     #[tokio::test]
@@ -1116,7 +1305,7 @@ mod tests {
         let epoch = sar.session_epoch();
 
         for expected_retries in 1..=MAX_PACKET_RETRIES {
-            sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+            expire_base(&mut sar);
             sar.check_timeouts_internal();
             assert_eq!(sar.tx_queue[0].retries, expected_retries);
             assert!(sar.tx_queue[0].wait_ack);
@@ -1127,7 +1316,7 @@ mod tests {
         sent.lock().unwrap().clear();
 
         // 第 4 次超时：丢弃在途数据并重新握手，序号从 0 重新开始
-        sar.tx_queue[0].deadline = Instant::now() - Duration::from_secs(1);
+        expire_base(&mut sar);
         sar.check_timeouts_internal();
         assert_eq!(sar.tx_queue.len(), 0);
         assert_ne!(sar.session_epoch(), epoch);
