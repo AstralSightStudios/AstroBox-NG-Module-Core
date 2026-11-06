@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use crate::asyncrt::{Duration, timeout, universal_block_on};
 use crate::device::xiaomi::components::{
     info::InfoSystem,
-    mass::{SendMassCallbackData, send_file_for_owner},
+    mass::{SendMassCallbackData, send_file_for_owner_with_slice_hint},
     resource::ResourceSystem,
 };
 use crate::device::xiaomi::config::{InstallConfig, ResConfig};
@@ -35,8 +35,40 @@ pub struct InstallSystem {
 
 struct InstallWaiters {
     data_type: MassDataType,
-    prepare_tx: Option<oneshot::Sender<Result<i32>>>,
+    prepare_tx: Option<oneshot::Sender<Result<PrepareAck>>>,
     result_tx: Option<oneshot::Sender<Result<InstallResultEvent>>>,
+}
+
+/// 设备对「准备安装」的答复：状态，外加设备顺带告诉我们的分片长度（有的话）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrepareAck {
+    status: i32,
+    expected_slice_length: Option<u32>,
+}
+
+impl PrepareAck {
+    fn status_only(status: i32) -> Self {
+        Self {
+            status,
+            expected_slice_length: None,
+        }
+    }
+}
+
+/// 表盘的「准备安装」有两种回法：只回一个 `prepare_status`，或回一个带 id 和分片长度的
+/// `prepare_reply`。官方 App 两种都认（日志里的 prepareStatus1 / prepareStatus2、3），
+/// 以前这里只认前一种，设备用后一种回的时候就要干等 30 秒，最后报「等不到安装准备回复」。
+fn watchface_prepare_ack(payload: &protocol::watch_face::Payload) -> Option<PrepareAck> {
+    match payload {
+        protocol::watch_face::Payload::PrepareStatus(status) => {
+            Some(PrepareAck::status_only(*status))
+        }
+        protocol::watch_face::Payload::PrepareReply(reply) => Some(PrepareAck {
+            status: reply.prepare_status,
+            expected_slice_length: reply.expected_slice_length,
+        }),
+        _ => None,
+    }
 }
 
 enum InstallResultEvent {
@@ -98,7 +130,7 @@ impl InstallSystem {
                 .map_err(|err| anyhow_site!("failed to set watchface id: {}", err))?;
         }
 
-        let (prepare_tx, prepare_rx) = oneshot::channel::<Result<i32>>();
+        let (prepare_tx, prepare_rx) = oneshot::channel::<Result<PrepareAck>>();
         let (result_tx_opt, result_rx_opt) = match r#type {
             MassDataType::NotificationIcon => (None, None),
             MassDataType::Music => {
@@ -201,10 +233,17 @@ impl InstallSystem {
 
         let fut = async move {
             let result = async {
-                let prepare_status = timeout(prepare_timeout, prepare_rx)
+                let prepare = timeout(prepare_timeout, prepare_rx)
                     .await
                     .map_err(|_| anyhow_site!("timed out waiting for install prepare response"))?
                     .map_err(|_| anyhow_site!("prepare response channel closed unexpectedly"))??;
+                let prepare_status = prepare.status;
+                log::info!(
+                    "[Install] prepare answered: type={} status={} expected_slice_length={:?}",
+                    u8::from(r#type),
+                    prepare_status,
+                    prepare.expected_slice_length
+                );
 
                 let prepare_enum = protocol::PrepareStatus::try_from(prepare_status)
                     .map_err(|_| anyhow_site!("unknown prepare status: {prepare_status}"))?;
@@ -213,9 +252,13 @@ impl InstallSystem {
                     bail_site!("install prepare failed with status: {:?}", prepare_enum);
                 }
 
-                send_file_for_owner(owner_for_future.clone(), file_data, r#type, move |d| {
-                    (progress_cb_future)(d)
-                })
+                send_file_for_owner_with_slice_hint(
+                    owner_for_future.clone(),
+                    file_data,
+                    r#type,
+                    prepare.expected_slice_length.map(|len| len as usize),
+                    move |d| (progress_cb_future)(d),
+                )
                 .await
                 .context("failed to send MASS payload")?;
 
@@ -268,17 +311,19 @@ impl L2PbExt for InstallSystem {
                     Some(protocol::wear_packet::Payload::WatchFace(wf)) => {
                         if let MassDataType::Watchface = waiters.data_type {
                             match wf.payload {
-                                Some(protocol::watch_face::Payload::PrepareStatus(status)) => {
-                                    if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(Ok(status));
-                                    }
-                                }
                                 Some(protocol::watch_face::Payload::InstallResult(result)) => {
                                     if let Some(tx) = waiters.result_tx.take() {
                                         let _ = tx.send(Ok(InstallResultEvent::Watchface(result)));
                                     }
                                 }
-                                _ => {}
+                                Some(other) => {
+                                    if let Some(ack) = watchface_prepare_ack(&other) {
+                                        if let Some(tx) = waiters.prepare_tx.take() {
+                                            let _ = tx.send(Ok(ack));
+                                        }
+                                    }
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -287,7 +332,10 @@ impl L2PbExt for InstallSystem {
                             match ta.payload {
                                 Some(protocol::thirdparty_app::Payload::InstallResponse(resp)) => {
                                     if let Some(tx) = waiters.prepare_tx.take() {
-                                        let _ = tx.send(Ok(resp.prepare_status));
+                                        let _ = tx.send(Ok(PrepareAck {
+                                            status: resp.prepare_status,
+                                            expected_slice_length: resp.expected_slice_length,
+                                        }));
                                     }
                                 }
                                 Some(protocol::thirdparty_app::Payload::InstallResult(result)) => {
@@ -305,7 +353,10 @@ impl L2PbExt for InstallSystem {
                                 sys.payload
                             {
                                 if let Some(tx) = waiters.prepare_tx.take() {
-                                    let _ = tx.send(Ok(resp.prepare_status));
+                                    let _ = tx.send(Ok(PrepareAck {
+                                        status: resp.prepare_status,
+                                        expected_slice_length: resp.expected_slice_length,
+                                    }));
                                 } else if let Some(tx) = waiters.result_tx.take() {
                                     let _ = tx.send(Ok(InstallResultEvent::Firmware(resp)));
                                 }
@@ -318,7 +369,10 @@ impl L2PbExt for InstallSystem {
                                 nc.payload
                             {
                                 if let Some(tx) = waiters.prepare_tx.take() {
-                                    let _ = tx.send(Ok(resp.prepare_status));
+                                    let _ = tx.send(Ok(PrepareAck {
+                                        status: resp.prepare_status,
+                                        expected_slice_length: resp.expected_slice_length,
+                                    }));
                                 }
                             }
                         }
@@ -591,6 +645,80 @@ mod tests {
         assert_eq!(
             resolve_watchface_install_id(&[], &config, Some(id)).unwrap(),
             id
+        );
+    }
+
+    #[test]
+    fn watchface_prepare_status_and_prepare_reply_both_answer_the_prepare() {
+        let ready = protocol::PrepareStatus::Ready as i32;
+        assert_eq!(
+            watchface_prepare_ack(&protocol::watch_face::Payload::PrepareStatus(ready)),
+            Some(PrepareAck::status_only(ready))
+        );
+
+        let reply = protocol::watch_face::Payload::PrepareReply(protocol::PrepareReply {
+            id: "167210065".to_string(),
+            prepare_status: ready,
+            select_compress_mode: None,
+            expected_slice_length: Some(4096),
+        });
+        assert_eq!(
+            watchface_prepare_ack(&reply),
+            Some(PrepareAck {
+                status: ready,
+                expected_slice_length: Some(4096),
+            })
+        );
+
+        let busy = protocol::PrepareStatus::Busy as i32;
+        let busy_reply = protocol::watch_face::Payload::PrepareReply(protocol::PrepareReply {
+            id: "167210065".to_string(),
+            prepare_status: busy,
+            select_compress_mode: None,
+            expected_slice_length: None,
+        });
+        assert_eq!(
+            watchface_prepare_ack(&busy_reply),
+            Some(PrepareAck::status_only(busy))
+        );
+
+        // 别的表盘消息不能被当成准备回复（比如安装结果、列表）。
+        assert_eq!(
+            watchface_prepare_ack(&protocol::watch_face::Payload::Success(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn watchface_prepare_reply_survives_the_wire_roundtrip() {
+        // 设备发来的是编码后的 WearPacket：编码、解码一遍后仍要认得出是准备回复。
+        use prost::Message;
+        let ready = protocol::PrepareStatus::Ready as i32;
+        let pkt = protocol::WearPacket {
+            r#type: protocol::wear_packet::Type::WatchFace as i32,
+            id: protocol::watch_face::WatchFaceId::PrepareInstallWatchFace as u32,
+            payload: Some(protocol::wear_packet::Payload::WatchFace(protocol::WatchFace {
+                payload: Some(protocol::watch_face::Payload::PrepareReply(
+                    protocol::PrepareReply {
+                        id: "abc".to_string(),
+                        prepare_status: ready,
+                        select_compress_mode: None,
+                        expected_slice_length: Some(2048),
+                    },
+                )),
+            })),
+        };
+        let decoded = protocol::WearPacket::decode(pkt.encode_to_vec().as_slice()).unwrap();
+        let Some(protocol::wear_packet::Payload::WatchFace(wf)) = decoded.payload else {
+            panic!("decoded packet lost its watch face payload");
+        };
+        let ack = wf.payload.as_ref().and_then(watchface_prepare_ack);
+        assert_eq!(
+            ack,
+            Some(PrepareAck {
+                status: ready,
+                expected_slice_length: Some(2048),
+            })
         );
     }
 }

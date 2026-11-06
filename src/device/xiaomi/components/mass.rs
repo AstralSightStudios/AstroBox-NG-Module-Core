@@ -358,10 +358,41 @@ fn build_mass_prepare_request(
     }
 }
 
+/// 设备哪儿都没说分片长度时用的值，和官方 App 一致（它缺省也是 4096）。
+const FALLBACK_SLICE_LENGTH: usize = 4096;
+
+/// 定分片长度：MASS Prepare 回包里给了就用它（一直以来的行为）；没给就用业务层「准备安装」
+/// 回包里带的那个（官方 App 实际用的就是这一个）；两边都没有，按官方缺省 4096。
+/// 以前两边都没有时直接报错放弃。
+fn resolve_mass_slice_length(from_mass_prepare: u32, hint: Option<usize>) -> usize {
+    if from_mass_prepare > 0 {
+        return from_mass_prepare as usize;
+    }
+    match hint {
+        Some(len) if len > 0 => len,
+        _ => FALLBACK_SLICE_LENGTH,
+    }
+}
+
 pub async fn send_file_for_owner<F>(
     owner_id: String,
     file_data: Vec<u8>,
     data_type: MassDataType,
+    progress_cb: F,
+) -> Result<()>
+where
+    F: Fn(SendMassCallbackData) + Send + Sync,
+{
+    send_file_for_owner_with_slice_hint(owner_id, file_data, data_type, None, progress_cb).await
+}
+
+/// 同 [`send_file_for_owner`]，另外带上业务层「准备安装」回包里设备给的分片长度，
+/// MASS Prepare 回包没给分片长度时用它。
+pub async fn send_file_for_owner_with_slice_hint<F>(
+    owner_id: String,
+    file_data: Vec<u8>,
+    data_type: MassDataType,
+    slice_length_hint: Option<usize>,
     progress_cb: F,
 ) -> Result<()>
 where
@@ -463,7 +494,24 @@ where
             )),
         );
     }
-    let expected_slice_length = prepare_resp.expected_slice_length() as usize;
+    let expected_slice_length =
+        resolve_mass_slice_length(prepare_resp.expected_slice_length(), slice_length_hint);
+    if prepare_resp.expected_slice_length() == 0 {
+        log::warn!(
+            "[Mass] prepare response carried no slice length; using {} (hint from install prepare: {:?})",
+            expected_slice_length,
+            slice_length_hint
+        );
+    } else if let Some(hint) = slice_length_hint
+        && hint > 0
+        && hint != expected_slice_length
+    {
+        log::info!(
+            "[Mass] slice length differs: MASS prepare={} install prepare={}; using the MASS one",
+            expected_slice_length,
+            hint
+        );
+    }
 
     let sent_length = (prepare_resp.remained_data_length() as usize).min(file_len);
     if sent_length > 0 {
@@ -1076,4 +1124,26 @@ where
     }
 
     Ok(consumed)
+}
+
+#[cfg(test)]
+mod slice_length_tests {
+    use super::*;
+
+    #[test]
+    fn mass_prepare_slice_length_wins_when_present() {
+        assert_eq!(resolve_mass_slice_length(1024, Some(4096)), 1024);
+        assert_eq!(resolve_mass_slice_length(1024, None), 1024);
+    }
+
+    #[test]
+    fn install_prepare_hint_fills_in_when_mass_prepare_has_none() {
+        assert_eq!(resolve_mass_slice_length(0, Some(2048)), 2048);
+    }
+
+    #[test]
+    fn falls_back_to_official_default_instead_of_giving_up() {
+        assert_eq!(resolve_mass_slice_length(0, None), FALLBACK_SLICE_LENGTH);
+        assert_eq!(resolve_mass_slice_length(0, Some(0)), FALLBACK_SLICE_LENGTH);
+    }
 }
