@@ -170,7 +170,13 @@ impl InstallSystem {
                     )
                     .map_err(|err| anyhow_site!("failed to access resource config: {:?}", err))?;
                     let id = resolve_watchface_install_id(&file_data, &res_config, watchface_id)?;
-                    build_watchface_install_request(&id, file_data.len())
+                    let version_code = resutils::get_watchface_version_code(&file_data);
+                    log::info!("[Install] watchface {id} package version_code={version_code:?}");
+                    build_watchface_install_request(
+                        &id,
+                        file_data.len(),
+                        version_code.unwrap_or(FALLBACK_WATCHFACE_VERSION_CODE),
+                    )
                 }
                 MassDataType::Firmare => build_firmware_install_request(
                     "99.99.99".to_string(),
@@ -543,11 +549,22 @@ fn resolve_watchface_install_id(
     }
 }
 
-pub fn build_watchface_install_request(id: &str, package_size: usize) -> protocol::WearPacket {
+/// 读不出表盘包版本时报给手环的版本号：1.0.0（官方表盘工具的默认版本）。
+const FALLBACK_WATCHFACE_VERSION_CODE: u32 = 0x01_00_00;
+
+/// `version_code` 必须是表盘包自己的版本（见 [`resutils::get_watchface_version_code`]）：
+/// 手环只拿它和已装同 ID 表盘的版本比大小，严格更大才允许原地覆盖。以前这里写死 1.0.0，
+/// 而绝大多数表盘装上后在手环上记的也是 1.0.0 及以上，于是任何同 ID 的更新都被判成
+/// DOWNGRADE，只能先卸载再装。
+pub fn build_watchface_install_request(
+    id: &str,
+    package_size: usize,
+    version_code: u32,
+) -> protocol::WearPacket {
     let prepare_info = protocol::PrepareInfo {
         id: id.to_string(),
         size: package_size as u32,
-        version_code: Some(65536),
+        version_code: Some(u64::from(version_code)),
         support_compress_mode: None,
         verification: None,
     };
@@ -687,6 +704,21 @@ mod tests {
             watchface_prepare_ack(&protocol::watch_face::Payload::Success(true)),
             None
         );
+    }
+
+    #[test]
+    fn watchface_install_request_reports_the_package_version() {
+        // 1.2.3 的表盘包：手环拿这个值和已装同 ID 表盘的版本比，必须原样带上，不能写死。
+        let pkt = build_watchface_install_request("abcdefghijkl", 4096, 0x01_02_03);
+        let Some(protocol::wear_packet::Payload::WatchFace(protocol::WatchFace {
+            payload: Some(protocol::watch_face::Payload::PrepareInfo(info)),
+        })) = pkt.payload
+        else {
+            panic!("install request is not a watch face PrepareInfo");
+        };
+        assert_eq!(info.id, "abcdefghijkl");
+        assert_eq!(info.size, 4096);
+        assert_eq!(info.version_code, Some(0x01_02_03));
     }
 
     #[test]

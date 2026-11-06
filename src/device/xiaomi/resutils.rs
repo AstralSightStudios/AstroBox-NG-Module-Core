@@ -145,6 +145,12 @@ fn get_mwz_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     }
 
     // 3. 尝试从内部的 .bin 文件中读取
+    let bin_buf = read_mwz_inner_bin(&mut zip)?;
+    get_bin_watchface_id(&bin_buf, config)
+}
+
+/// mwz 里设备真正要装的那份 bin：优先根目录下的 `.bin`，没有再取任意一个。
+fn read_mwz_inner_bin(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Option<Vec<u8>> {
     let mut root_bin: Option<usize> = None;
     let mut any_bin: Option<usize> = None;
     for i in 0..zip.len() {
@@ -163,7 +169,37 @@ fn get_mwz_watchface_id(data: &[u8], config: &ResConfig) -> Option<String> {
     let mut entry = zip.by_index(bin_idx).ok()?;
     let mut bin_buf = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut bin_buf).ok()?;
-    get_bin_watchface_id(&bin_buf, config)
+    Some(bin_buf)
+}
+
+/// 小米表盘 bin 的文件头魔数。
+const XIAOMI_WATCHFACE_MAGIC: [u8; 4] = [0x5a, 0xa5, 0x34, 0x12];
+/// 表盘 bin 文件头里版本号的位置：小端 u32，低三字节是 `major<<16 | minor<<8 | patch`。
+const WATCHFACE_VERSION_OFFSET: usize = 4;
+
+/// 表盘包自己声明的版本号（mwz 取里面的 bin）。读不出时返回 `None`。
+///
+/// 这正是手环用来判断「能不能覆盖同 ID 表盘」的那个值：手环固件（p67 v3.101.043，
+/// `app_watchface_check_update_version`）在准备安装时拿请求里的 `version_code` 和已装同 ID
+/// 表盘的版本比，已装的 **大于等于** 请求的就回 DOWNGRADE；而已装表盘的版本是手环从
+/// 表盘文件头的这个位置读出来的（`binary_parse_get_watchface_info`），请求里的值并不落盘。
+pub fn get_watchface_version_code(data: &[u8]) -> Option<u32> {
+    if is_zip(data) {
+        let mut zip = zip::ZipArchive::new(Cursor::new(data)).ok()?;
+        let bin = read_mwz_inner_bin(&mut zip)?;
+        return get_bin_watchface_version_code(&bin);
+    }
+    get_bin_watchface_version_code(data)
+}
+
+fn get_bin_watchface_version_code(data: &[u8]) -> Option<u32> {
+    let end = WATCHFACE_VERSION_OFFSET + 4;
+    if data.len() < end || data[..4] != XIAOMI_WATCHFACE_MAGIC {
+        return None;
+    }
+    Some(u32::from_le_bytes(
+        data[WATCHFACE_VERSION_OFFSET..end].try_into().ok()?,
+    ))
 }
 
 pub fn set_watchface_id(data: &mut [u8], config: &ResConfig, new_id: &str) -> Result<(), String> {
@@ -959,6 +995,61 @@ mod tests {
         assert_eq!(get_file_type(&data), FileType::Firmware);
     }
 
+    fn watchface_header(version: [u8; 4]) -> Vec<u8> {
+        let mut bin = vec![0u8; 64];
+        bin[..4].copy_from_slice(&XIAOMI_WATCHFACE_MAGIC);
+        bin[4..8].copy_from_slice(&version);
+        bin
+    }
+
+    #[test]
+    fn watchface_version_code_is_read_from_the_bin_header() {
+        // 文件头 offset 4 起是小端 u32：patch, minor, major, 0。
+        assert_eq!(
+            get_watchface_version_code(&watchface_header([0, 0, 1, 0])),
+            Some(0x01_00_00)
+        );
+        assert_eq!(
+            get_watchface_version_code(&watchface_header([3, 2, 1, 0])),
+            Some(0x01_02_03)
+        );
+        // 与手环一致按完整 u32 读，最高字节也算进去。
+        assert_eq!(
+            get_watchface_version_code(&watchface_header([0, 0, 0, 1])),
+            Some(0x01_00_00_00)
+        );
+    }
+
+    #[test]
+    fn watchface_version_code_reads_the_bin_inside_an_mwz() {
+        let bin = watchface_header([1, 0, 2, 0]);
+        let mwz = zip_with_entries(&[
+            ("preview/cover.bin", &watchface_header([9, 9, 9, 0])),
+            ("manifest.xml", b"<Watchface id=\"123456789\"></Watchface>"),
+            ("123456789.bin", &bin),
+        ]);
+        // 根目录下那份才是要装的 bin，子目录里的不算。
+        assert_eq!(get_watchface_version_code(&mwz), Some(0x02_00_01));
+    }
+
+    #[test]
+    fn watchface_version_code_is_none_for_anything_else() {
+        assert_eq!(get_watchface_version_code(&[]), None);
+        // 魔数对但文件头不完整。
+        assert_eq!(
+            get_watchface_version_code(&watchface_header([0, 0, 1, 0])[..6]),
+            None
+        );
+        // 不是小米表盘 bin（例如 vivo 表盘的 rpk / 随便一段数据）。
+        let mut not_watchface = watchface_header([0, 0, 1, 0]);
+        not_watchface[0] = 0;
+        assert_eq!(get_watchface_version_code(&not_watchface), None);
+        assert_eq!(
+            get_watchface_version_code(&zip_with_entries(&[("manifest.json", b"{}")])),
+            None
+        );
+    }
+
     #[test]
     fn test_get_and_set_watchface_id_mwz() {
         let config = test_config();
@@ -1194,7 +1285,7 @@ pub fn get_file_type(data: &[u8]) -> FileType {
     }
 
     // 3. 检查小米表盘魔数 5a a5 34 12
-    if data.len() >= 4 && &data[..4] == [0x5a, 0xa5, 0x34, 0x12] {
+    if data.len() >= 4 && data[..4] == XIAOMI_WATCHFACE_MAGIC {
         return FileType::WatchFace;
     }
 
